@@ -1,0 +1,10 @@
+# LUT-based VQ inference: fast for large out_features (e.g. lm_head).
+#
+# Phase 1: build LUT via one cuBLAS GEMM per forward pass.
+# Phase 2: gather output via custom CUDA kernel (scalar lookups, no dot4).
+# Falls back to WMMA GEMM when M > 16 (prefill path unchanged).
+#
+# Best for: token-generation with large-vocab models (vocab >> NC).
+# Use cuda_wmma.yaml for comparison.
+
+vq_backend: cuda_lut

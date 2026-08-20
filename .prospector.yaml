@@ -1,0 +1,43 @@
+strictness: medium
+doc-warnings: false
+test-warnings: false
+
+# ruff already handles pycodestyle and pyflakes
+without-tools:
+  - pycodestyle
+  - pyflakes
+
+ignore-patterns:
+  - .venv
+
+mccabe:
+  options:
+    # GPTQ and hessian methods are inherently complex multi-branch algorithms.
+    max-complexity: 20
+
+pylint:
+  options:
+    # Scientific / ML code naturally has many parameters and local variables.
+    max-args: 10
+    max-locals: 28
+    max-branches: 20
+    # Allow extension-pkg access (torch._C, torch.cuda, etc.)
+    extension-pkg-allow-list:
+      - torch
+
+  disable:
+    # Lazy / conditional imports are intentional in this codebase
+    # (OffloadedTensor, datasets, GranularityType, os, …).
+    - import-outside-toplevel
+    # Hook callbacks must match PyTorch signatures; unused args are structural.
+    - unused-argument
+    # Accessing _clone_weights / _LinAlgError on peer classes is intentional.
+    - protected-access
+    # torch.linalg.cholesky is callable; pylint static analysis is wrong.
+    - not-callable
+    # torch._C members are C-extension; unavailable at static analysis time.
+    - c-extension-no-member
+    # Project does not use Django.
+    - django-not-available
+    # Scientific APIs naturally have more than 5 positional parameters.
+    - too-many-positional-arguments

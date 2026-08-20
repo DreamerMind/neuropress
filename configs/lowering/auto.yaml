@@ -1,0 +1,9 @@
+# All-auto lowering: let the runtime pick the best available backend.
+#
+# vq_backend: auto       → CUDA JIT when nvcc is found, compile otherwise
+# linear_backend: auto   → gemlite when available, compile otherwise
+# embedding_backend: auto → compile
+
+vq_backend: auto
+linear_backend: auto
+embedding_backend: auto

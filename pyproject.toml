@@ -1,0 +1,150 @@
+[project]
+name = "neuropress"
+version = "0.1.0"
+description = "Graph-aware neural network quantization framework targeting NNEF export"
+readme = "README.md"
+requires-python = ">=3.13"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = ["quantization", "gptq", "vptq", "nnef", "llm", "compression"]
+authors = [{ name = "epi", email = "julien.balian@protonmail.com" }]
+
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+dependencies = [
+    "torch",
+    # >=0.24.7: earlier releases call DynamicCache.from_legacy_cache, which
+    # transformers 5.x removed, breaking NNEF export of causal LMs.
+    "torch-to-nnef>=0.24.7",
+    "pydantic>=2.0",
+    "safetensors>=0.7.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "prospector>=1.14",
+    "ruff>=0.11",
+    "ty>=0.0.1a6",
+]
+llm = [
+    "datasets>=2.0",
+]
+eval = [
+    "lm-eval>=0.4",
+    "datasets>=2.0",
+    "transformers>=5.14",  # qwen3_5 / gemma4 architectures require 5.x
+    "accelerate>=0.26",  # lm_eval.models.huggingface imports accelerate at module load
+    "rich>=13.0",
+    "hf-transfer>=0.1",  # Rust-based multi-threaded HuggingFace downloader (5-10x faster)
+    # torch_to_nnef.llm_tract (LLMExporter) moved into a separate distribution in
+    # torch-to-nnef 0.24; it is needed to export causal LMs to NNEF.
+    "torch-to-nnef[llm-tract]>=0.24.7",
+]
+audio = [
+    "datasets>=2.0",
+    "soundfile>=0.12",
+]
+gemlite = [
+    "gemlite>=0.4",
+]
+vptq = [
+    "scikit-learn>=1.3",
+]
+cloud = [
+    "vastai-sdk>=0.5",
+    "rich>=13.0",
+    "textual>=0.50",
+]
+
+[project.scripts]
+neuropress-eval = "neuropress.eval.llm_cli:main"
+neuropress-cloud = "neuropress.cloud.vast_runner:main"
+neuropress-vq-probe = "neuropress.tools.vq_probe:main"
+neuropress-bench = "neuropress.tools.bench:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["neuropress"]
+# Never ship research-only modules, even when building from a tree that has them.
+# registry.py / vast_runner.py import them under try/except, so their absence is
+# a supported configuration.
+exclude = ["**/research_registry.py", "**/research_jobs.py"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "**/research_registry.py",
+    "**/research_jobs.py",
+    "/reports",
+    "/plans",
+    "/docs",
+    "/papers",
+    "/sweeps",
+    "/.public-manifest",
+    "/scripts/sync_public.sh",
+    "/scripts/qwen35_*.py",
+    "/scripts/gemma4_*.py",
+]
+
+[tool.uv]
+package = true
+
+[tool.ruff]
+target-version = "py313"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "C4", "RUF", "D"]
+ignore = [
+    "RUF002",  # allow en-dash in docstrings
+    "D105",    # magic-method docstrings optional
+    "D107",    # __init__ docstring goes in class docstring (Google style)
+    "D401",    # "imperative mood" — too prescriptive
+    # `ruff format` owns line width (line-length above) and reflows everything it
+    # safely can.  E501 only fires on what the formatter deliberately leaves
+    # intact: string literals, aligned table headers, and long registry keys.
+    # Per ruff's formatter guidance, keep the formatter authoritative here.
+    "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B011", "D"]   # no docstring enforcement in test files
+"scripts/**" = ["D", "T201"]  # scripts: no docstring enforcement, print() is fine
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: slow end-to-end tests requiring HuggingFace models and network access (gate: RUN_INTEGRATION=1)",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-benchmark>=4.0",
+]
+
+[tool.benchmark]
+# Run benchmarks separately: uv run pytest benchmarks/ --benchmark-only
+# Compare runs:              uv run pytest benchmarks/ --benchmark-compare
+disable_gc = true
+warmup = true
+
+[project.urls]
+Homepage = "https://github.com/DreamerMind/neuropress"
+Repository = "https://github.com/DreamerMind/neuropress"
+Issues = "https://github.com/DreamerMind/neuropress/issues"

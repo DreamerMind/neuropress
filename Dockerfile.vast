@@ -1,0 +1,82 @@
+# Dockerfile.vast — pre-baked base image for neuropress vast.ai GPU jobs.
+#
+# Cuts cold-start time from ~15 min to ~3 min by pre-warming the uv package
+# cache inside the image layer.  On a fresh instance, uv sync only needs to
+# install the neuropress source itself (a few seconds), not re-download torch
+# or any other dependency.
+#
+# Build and push once:
+#
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.vast -t <user>/neuropress-base:latest .
+#   docker push <user>/neuropress-base:latest
+#
+# Subsequent rebuilds after a pyproject.toml change are fast (~30 s) because
+# BuildKit caches the downloaded packages on the build host.  The first build
+# still downloads everything (~9 min).
+#
+# Then tell neuropress-vast to use it:
+#
+#   export NEUROPRESS_DOCKER_IMAGE=<user>/neuropress-base:latest
+#   neuropress-vast --job neuropress-eval-compare ...
+#
+# The image must be public (vast.ai pulls without auth by default).
+# Re-build any time pyproject.toml dependencies change.
+
+# Slim CUDA 12.4 runtime — ~800 MB compressed vs ~5 GB for pytorch/pytorch.
+# PyTorch is installed via uv from PyPI below, so we don't need it in the base.
+FROM nvidia/cuda:13.0.2-cudnn-runtime-ubuntu24.04
+
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# System tools needed by setup commands:
+#   tmux     — disconnect-resilient job executor
+#   build-essential — g++/make for torch-to-nnef C++ extension
+#   ninja-build — required by torch.utils.cpp_extension for CUDA JIT kernels
+#   cuda-nvcc — nvcc compiler for CUDA JIT (runtime images lack it)
+#   curl     — uv installer
+#   git      — some HuggingFace libs call git
+#
+# Cache mounts keep downloaded .deb files on the build host so subsequent
+# builds skip re-downloading them.  The mounts are not part of the image
+# layer, so no rm -rf /var/lib/apt/lists/* is needed.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
+        tmux build-essential ninja-build cuda-nvcc curl ca-certificates git
+
+# Install uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+ENV UV_CACHE_DIR=/root/.cache/uv
+
+# Pre-install Python 3.13.
+# Cache mount keeps the CPython tarball on the build host; the installed
+# binary goes to ~/.local/share/uv/python (baked into the image layer).
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv python install 3.13
+
+# ── Pre-warm the uv package cache ────────────────────────────────────────────
+# Copy only the dependency manifest (not the source) so this layer is rebuilt
+# only when dependencies change, not on every code change.
+WORKDIR /tmp/neuropress-seed
+COPY pyproject.toml ./
+# hatchling needs a minimal package layout to resolve the project
+RUN mkdir -p neuropress && \
+    printf '"""neuropress."""\n' > neuropress/__init__.py && \
+    touch README.md
+
+# Download packages to the BuildKit cache (/tmp/uv-cache, preserved on the
+# build host between runs).  On first build this takes ~9 min; on subsequent
+# rebuilds after a dependency change uv resolves from cache in ~30 s.
+# After sync, cp bakes the populated cache into UV_CACHE_DIR (image layer) so
+# that `uv sync` on a fresh vast.ai instance needs no network downloads.
+RUN --mount=type=cache,target=/tmp/uv-cache,sharing=locked \
+    UV_CACHE_DIR=/tmp/uv-cache \
+    uv sync --extra llm --extra eval --extra dev && \
+    rm -rf .venv && \
+    mkdir -p "$UV_CACHE_DIR" && \
+    cp -a /tmp/uv-cache/. "$UV_CACHE_DIR/"
+
+WORKDIR /workspace

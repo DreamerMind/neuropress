@@ -1,0 +1,100 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+wheels/
+MANIFEST
+pip-wheel-metadata/
+share/python-wheels/
+
+# === Virtual environments ===
+.venv/
+venv/
+env/
+.env/
+
+# === uv / pip ===
+uv.lock
+pip-selfcheck.json
+
+# === Testing & coverage ===
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+
+# === Type checkers ===
+.mypy_cache/
+.pyright/
+.dmypy.json
+pyrightconfig.json
+
+# === PyTorch artefacts ===
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+
+# === ONNX / NNEF artefacts ===
+*.onnx
+*.nnef
+*.nnef.tar
+*.rgg
+
+# === Jupyter ===
+.ipynb_checkpoints/
+*.ipynb
+
+# === IDEs ===
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+*.code-workspace
+*.iml
+.metals/
+.bloop/
+
+# === macOS ===
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# === Linux ===
+*~
+.fuse_hidden*
+.Trash-*
+
+# === Windows ===
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# === Logs & temp ===
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# === neuropress output ===
+/data/
+vast_output/
+.ruff_cache/
+.ty_cache/
+papers/
+.cachesize
+.tmp_inst.json

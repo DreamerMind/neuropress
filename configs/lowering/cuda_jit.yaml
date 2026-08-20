@@ -1,0 +1,11 @@
+# Force CUDA JIT kernels for all quantization paths that support it.
+#
+# Use this on hosts where nvcc is installed but auto-detection fails —
+# e.g. vast.ai instances with the cuda-nvcc-13.x apt package, where nvcc
+# lands outside the subprocess PATH.
+#
+# vq_backend: cuda       → fused index-unpack + centroid-gather + matmul
+# linear_backend: auto   → gemlite when available, compile otherwise
+# embedding_backend: auto → compile
+
+vq_backend: cuda

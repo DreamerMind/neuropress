@@ -1,0 +1,10 @@
+# Force WMMA CUDA kernel for VQ inference (GEMV/GEMM auto-dispatch via tensor cores).
+#
+# Requires sm_75+ (Turing and newer) and nvcc available for JIT compilation.
+# Falls back to cuda_wmma backend regardless of auto-detection.
+#
+# vq_backend: cuda_wmma  → WMMA-based GEMV (M≤8) / GEMM (M>8) dispatch
+# linear_backend: auto   → gemlite when available, compile otherwise
+# embedding_backend: auto → compile
+
+vq_backend: cuda_wmma

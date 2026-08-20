@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# run — developer task runner for neuropress
+# Usage: ./run <command>
+set -euo pipefail
+
+CMD="${1:-help}"
+
+case "$CMD" in
+  test)
+    echo "Running tests (excluding integration)..."
+    uv run pytest --ignore=tests/integration -q "${@:2}"
+    ;;
+
+  check)
+    echo "Running ruff check..."
+    uv run ruff check .
+    echo "Running ruff format check..."
+    uv run ruff format --check .
+    # --- Advisory below this line ------------------------------------------
+    # ruff (above) is the hard gate.  ty is pre-1.0 and reports hundreds of
+    # diagnostics that are torch stub gaps rather than defects, and prospector's
+    # remaining messages are cyclic-import warnings for the deliberate deferred
+    # imports plus complexity metrics.  Both still catch real bugs, so keep
+    # running them and print the counts -- just don't fail the build on them.
+    # Use './run check --strict' to make them blocking.
+    STRICT="${2:-}"
+    advisory() {
+      local label="$1"; shift
+      echo "Running $label (advisory)..."
+      if "$@"; then
+        echo "  $label: clean"
+      else
+        echo "  $label: reported findings (advisory, not blocking)"
+        if [ "$STRICT" = "--strict" ]; then
+          echo "  --strict given: treating $label findings as failure." >&2
+          exit 1
+        fi
+      fi
+    }
+    advisory "ty" uv run ty check
+    advisory "prospector (neuropress/)" uv run prospector neuropress/
+    advisory "prospector (tests/)" uv run prospector tests/
+    echo "All blocking checks passed."
+    ;;
+
+  format)
+    echo "Running ruff format..."
+    uv run ruff format .
+    echo "Running ruff check --fix..."
+    uv run ruff check --fix .
+    echo "Format complete."
+    ;;
+
+  public-check)
+    echo "Building public tree and running the leak gate..."
+    DEST="${2:-${TMPDIR:-/tmp}/neuropress-public}"
+    scripts/sync_public.sh "$DEST"
+    ;;
+
+  help | --help | -h)
+    echo "Usage: ./run <command>"
+    echo ""
+    echo "Commands:"
+    echo "  test     Run the test suite (excludes integration tests)"
+    echo "  check    Run linters and type checkers."
+    echo "           ruff blocks; ty and prospector are advisory."
+    echo "           Pass --strict to make the advisory tools blocking too."
+    echo "  format   Auto-format and auto-fix the codebase with ruff"
+    echo "  public-check [dest]"
+    echo "           Build the public tree (see .public-manifest) and run the leak gate"
+    echo "  help     Show this help message"
+    ;;
+
+  *)
+    echo "Unknown command: $CMD" >&2
+    echo "Run './run help' for available commands." >&2
+    exit 1
+    ;;
+esac

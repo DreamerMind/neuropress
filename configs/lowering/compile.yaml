@@ -1,0 +1,10 @@
+# Force torch.compile for VQ inference — no CUDA JIT kernel.
+#
+# Use this to benchmark the compile backend directly, bypassing the
+# vq_linear.cu CUDA kernel even when nvcc is available.
+#
+# vq_backend: compile   → unpack + gather + F.linear via torch.compile
+# linear_backend: auto  → gemlite when available, compile otherwise
+# embedding_backend: auto → compile
+
+vq_backend: compile
