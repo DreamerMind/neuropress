@@ -145,7 +145,7 @@ from neuropress.t2n import NEUROPRESS_COMPRESSION
 # Use with torch_to_nnef LLMExporter
 exporter.prepare(
     compression_method="open_text_c4_gptq_q4_0",
-    compression_registry="neuropress.compress.NEUROPRESS_COMPRESSION",
+    compression_registry="neuropress.t2n.NEUROPRESS_COMPRESSION",
 )
 ```
 

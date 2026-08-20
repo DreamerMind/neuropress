@@ -51,11 +51,6 @@ case "$CMD" in
     echo "Format complete."
     ;;
 
-  public-check)
-    echo "Building public tree and running the leak gate..."
-    DEST="${2:-${TMPDIR:-/tmp}/neuropress-public}"
-    scripts/sync_public.sh "$DEST"
-    ;;
 
   help | --help | -h)
     echo "Usage: ./run <command>"
@@ -66,8 +61,6 @@ case "$CMD" in
     echo "           ruff blocks; ty and prospector are advisory."
     echo "           Pass --strict to make the advisory tools blocking too."
     echo "  format   Auto-format and auto-fix the codebase with ruff"
-    echo "  public-check [dest]"
-    echo "           Build the public tree (see .public-manifest) and run the leak gate"
     echo "  help     Show this help message"
     ;;
 
