@@ -5,7 +5,19 @@ A graph-aware neural network quantization framework targeting NNEF export via
 
 ## Installation
 
-Python 3.13, managed with [uv](https://docs.astral.sh/uv/).
+Requires Python 3.13 or newer.
+
+```bash
+pip install neuropress
+pip install "neuropress[eval]"   # + lm-evaluation-harness
+```
+
+Extras: `llm` (HuggingFace datasets for C4 calibration), `eval`
+(lm-evaluation-harness), `cloud` (vast.ai GPU runner), `audio`, `gemlite`, `vptq`.
+
+### From source
+
+Managed with [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync                      # core dependencies
@@ -133,7 +145,7 @@ from neuropress.t2n import NEUROPRESS_COMPRESSION
 # Use with torch_to_nnef LLMExporter
 exporter.prepare(
     compression_method="open_text_c4_gptq_q4_0",
-    compression_registry="neuropress.compress.NEUROPRESS_COMPRESSION",
+    compression_registry="neuropress.t2n.NEUROPRESS_COMPRESSION",
 )
 ```
 

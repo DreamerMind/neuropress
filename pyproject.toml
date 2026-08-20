@@ -68,7 +68,7 @@ cloud = [
 
 [project.scripts]
 neuropress-eval = "neuropress.eval.llm_cli:main"
-neuropress-cloud = "neuropress.cloud.vast_runner:main"
+neuropress-cloud = "neuropress.cloud.cli:main"
 neuropress-vq-probe = "neuropress.tools.vq_probe:main"
 neuropress-bench = "neuropress.tools.bench:main"
 
