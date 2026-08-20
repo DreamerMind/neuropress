@@ -55,14 +55,29 @@ jobs:
       - name: Tag must match the built version
         if: github.event_name == 'release'
         run: |
+          # Compare as versions, not as strings: a wheel filename is always
+          # PEP 440-normalized, so `version = "1.0.0-rc1"` builds as 1.0.0rc1
+          # and would never string-match the natural tag v1.0.0-rc1.
           set -euo pipefail
           built=$(basename "$(ls dist/*.whl)" | cut -d- -f2)
-          tag="${GITHUB_REF_NAME#v}"
-          if [ "$built" != "$tag" ]; then
-            echo "::error::release tag $GITHUB_REF_NAME does not match built version $built — bump version in pyproject.toml"
-            exit 1
-          fi
-          echo "publishing neuropress $built"
+          uv run --no-project --with packaging python - "$built" "${GITHUB_REF_NAME#v}" <<'PY'
+          import sys
+
+          from packaging.version import InvalidVersion, Version
+
+          built, tag = sys.argv[1], sys.argv[2]
+          try:
+              match = Version(built) == Version(tag)
+          except InvalidVersion:
+              match = False
+          if not match:
+              print(
+                  f"::error::release tag {tag!r} and the built version {built!r} disagree — "
+                  "correct whichever is wrong (the tag, or `version` in pyproject.toml)"
+              )
+              raise SystemExit(1)
+          print(f"publishing neuropress {built}")
+          PY
 
       - name: Artifacts must carry no research-only material
         run: |
@@ -73,11 +88,20 @@ jobs:
           # Build the listing before grepping it: `unzip -l ... | grep` inside an
           # `if` swallows a failing unzip, and a check that cannot read the
           # artifact must not report it clean.
+          #
+          # `unzip -Z1` lists bare paths. `unzip -l` pads each name into a
+          # right-hand column, which leaves a top-level `reports/` preceded by
+          # spaces rather than by start-of-line, so the anchor below could never
+          # match it and the wheel half of this check would be dead code.
           set -euo pipefail
           wheel=$(ls dist/*.whl)
           sdist=$(ls dist/*.tar.gz)
-          listing=$(unzip -l "$wheel"; tar -tzf "$sdist")
-          pattern='research_registry|research_jobs|(^|/)(reports|plans|papers|sweeps)/'
+          listing=$(unzip -Z1 "$wheel"; tar -tzf "$sdist")
+          # Scoped to scripts/: a bare `_diag\.py` also matches shipped modules
+          # such as neuropress/calibration/probe/hessian_diag.py.
+          pattern='research_registry|research_jobs|sync_public|public-manifest'
+          pattern="$pattern"'|(^|/)scripts/(qwen35|gemma4)_'
+          pattern="$pattern"'|(^|/)(reports|plans|docs|papers|sweeps)/'
           if grep -Ei "$pattern" <<<"$listing"; then
             echo "::error::research-only paths found in the distribution artifacts"
             exit 1
@@ -121,14 +145,19 @@ jobs:
           "$GITHUB_WORKSPACE/.venv/bin/python" - <<'PY'
           from importlib.metadata import version
 
+          import importlib.util
+
           import neuropress
           from neuropress.t2n import NEUROPRESS_COMPRESSION as registry
 
           print(f"neuropress {version('neuropress')} from {neuropress.__file__}")
           assert registry, "compression registry is empty"
-          leaked = sorted(k for k in registry if "eval_targeted" in k)
-          assert not leaked, f"research entries reached the wheel: {leaked[:5]}"
-          print(f"{len(registry)} compression entries, none research-only")
+
+          # The invariant is that the research module is absent, not that its
+          # entries happen to share a key prefix — a prefix nothing enforces.
+          spec = importlib.util.find_spec("neuropress.t2n.research_registry")
+          assert spec is None, f"research module reached the wheel: {spec.origin}"
+          print(f"{len(registry)} compression entries, research module absent")
           PY
 
   publish:
@@ -149,3 +178,6 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           repository-url: ${{ github.event_name == 'release' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
+          # Rehearsals re-upload the same version repeatedly; a real release
+          # must still fail loudly if that version is already on PyPI.
+          skip-existing: ${{ github.event_name != 'release' }}
