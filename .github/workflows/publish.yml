@@ -1,0 +1,151 @@
+name: publish
+
+# Build neuropress and upload it to PyPI.
+#
+#   release (published)  ->  PyPI      (the tag must match the package version)
+#   workflow_dispatch    ->  TestPyPI  (rehearsal; no tag check)
+#
+# Authentication is PyPI Trusted Publishing (OIDC). No API token is stored in
+# this repository, so there is nothing to rotate or leak. One-time setup, on
+# both pypi.org and test.pypi.org, before the first upload:
+#
+#   Your projects -> Publishing -> Add a pending publisher
+#     PyPI project name : neuropress
+#     Owner             : DreamerMind
+#     Repository        : neuropress
+#     Workflow name     : publish.yml
+#     Environment       : pypi        (use "testpypi" on test.pypi.org)
+#
+# Cutting a release:
+#   1. bump `version` in pyproject.toml and commit it
+#   2. gh release create v<version> --generate-notes
+#
+# PyPI is append-only: a version number can never be reused, not even after the
+# file is deleted. Rehearse with "Run workflow" against TestPyPI first.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build and verify artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Validate package metadata
+        run: uvx twine check --strict dist/*
+
+      - name: Tag must match the built version
+        if: github.event_name == 'release'
+        run: |
+          set -euo pipefail
+          built=$(basename "$(ls dist/*.whl)" | cut -d- -f2)
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$built" != "$tag" ]; then
+            echo "::error::release tag $GITHUB_REF_NAME does not match built version $built — bump version in pyproject.toml"
+            exit 1
+          fi
+          echo "publishing neuropress $built"
+
+      - name: Artifacts must carry no research-only material
+        run: |
+          # Defence in depth. pyproject.toml already excludes these from both
+          # build targets, so a hit means an exclude pattern regressed. Uploads
+          # are permanent, so fail closed rather than warn.
+          #
+          # Build the listing before grepping it: `unzip -l ... | grep` inside an
+          # `if` swallows a failing unzip, and a check that cannot read the
+          # artifact must not report it clean.
+          set -euo pipefail
+          wheel=$(ls dist/*.whl)
+          sdist=$(ls dist/*.tar.gz)
+          listing=$(unzip -l "$wheel"; tar -tzf "$sdist")
+          pattern='research_registry|research_jobs|(^|/)(reports|plans|papers|sweeps)/'
+          if grep -Ei "$pattern" <<<"$listing"; then
+            echo "::error::research-only paths found in the distribution artifacts"
+            exit 1
+          fi
+          echo "artifacts clean: $wheel $sdist"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  smoke:
+    name: built wheel installs and imports
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install the wheel with base dependencies only
+        run: |
+          uv venv --python 3.13 .venv
+          # torch's default PyPI wheel bundles CUDA (~2.5 GB) and fills the
+          # runner disk. The CPU build is all an import check needs.
+          uv pip install --python .venv torch --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --python .venv dist/*.whl
+
+      - name: Import from outside the workspace
+        run: |
+          # Never run this from a directory containing neuropress/: python puts
+          # the working directory on sys.path, so the import would resolve to
+          # the source tree and prove nothing about the wheel.
+          mkdir -p "$RUNNER_TEMP/smoke"
+          cd "$RUNNER_TEMP/smoke"
+          "$GITHUB_WORKSPACE/.venv/bin/python" - <<'PY'
+          from importlib.metadata import version
+
+          import neuropress
+          from neuropress.t2n import NEUROPRESS_COMPRESSION as registry
+
+          print(f"neuropress {version('neuropress')} from {neuropress.__file__}")
+          assert registry, "compression registry is empty"
+          leaked = sorted(k for k in registry if "eval_targeted" in k)
+          assert not leaked, f"research entries reached the wheel: {leaked[:5]}"
+          print(f"{len(registry)} compression entries, none research-only")
+          PY
+
+  publish:
+    name: upload to ${{ github.event_name == 'release' && 'PyPI' || 'TestPyPI' }}
+    needs: [build, smoke]
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event_name == 'release' && 'pypi' || 'testpypi' }}
+      url: ${{ github.event_name == 'release' && 'https://pypi.org/p/neuropress' || 'https://test.pypi.org/p/neuropress' }}
+    permissions:
+      id-token: write # mints the OIDC token trusted publishing exchanges for an upload token
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: ${{ github.event_name == 'release' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
