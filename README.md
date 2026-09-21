@@ -159,6 +159,49 @@ See all keys with `neuropress-eval list`.  Built-in entries:
 | `open_text_c4_gptq_panel_q4q2_linear_256samples` | GPTQ mixed Q4/Q2 linear (3.0 avg bpw) |
 | `speech_librispeech_gptq_q4_0_256samples` | GPTQ Q4_0 (LibriSpeech, 256 samples) |
 
+### Ternary PTQ for vLLM
+
+NeuroPress includes a Bonsai-style path that combines blockwise signed
+Hadamard preprocessing, strict ternary GPTQ, group-128 FP16 scales, and export
+to the [`prism_ternary`](https://github.com/fraserprice/bonsai-vllm) vLLM
+checkpoint layout.
+
+```python
+from neuropress import QuantizationPipeline, QuantizationRecipeConfig
+from neuropress.formats import export_prism_ternary_checkpoint
+
+recipe = QuantizationRecipeConfig.model_validate(
+    {
+        "calibration": {"dataset": "c4", "seq_len": 2048, "n_samples": 128},
+        "preprocessing": [
+            {"type": "ternary_hadamard", "block_size": 1024, "seed": 1234}
+        ],
+        "estimator": {
+            "type": "ternary_gptq",
+            "group_size": 128,
+            "threshold_ratio": 0.4,
+        },
+        "kernel_lowering": None,
+    }
+).build()
+
+quantized = QuantizationPipeline(recipe).run(model, calibration_batches)
+export_prism_ternary_checkpoint(
+    quantized,
+    "./model-ternary-vllm",
+    base_config="./base-hf-checkpoint",
+)
+```
+
+The exported checkpoint stores codes `0/1/2` as 16 two-bit lanes per int32,
+uses one FP16 scale for every 128 columns, and embeds the shared sign vectors
+in `config.json`. Code `3` is reserved and never emitted. Install the vLLM
+plugin before serving the result. The exporter deliberately refuses ordinary
+2-bit affine weights; its input must already be strict ternary after GPTQ.
+The `0.4` threshold is an empirical Bonsai-format match, not a published Prism
+hyperparameter; use `0.5` for conventional nearest-level ternary rounding and
+sweep this value against perplexity for a new architecture.
+
 ---
 
 ## Cloud GPU runner (`neuropress-cloud`)

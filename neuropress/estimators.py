@@ -47,6 +47,7 @@ from .methods.correction_mode import CorrectionMode
 from .methods.gptq import GPTQCalibration
 from .methods.gptq_panel import GPTQMixedPrecisionCalibration
 from .methods.hqq import HQQCalibration
+from .methods.ternary import TernaryGPTQCalibration, TernaryScaleCalibration
 from .methods.zp_scale_calib import NormZpScaleCalibration
 from .plan import QuantizationPlan
 from .qscheme.descriptor import Granularity
@@ -120,6 +121,7 @@ def _gptq_layer(
     symmetric: bool,
     damp_percent: float,
     damp_auto_increment: float,
+    ternary_threshold_ratio: float | None = None,
 ) -> None:
     """Apply GPTQ to *mod*, updating its weight in-place to dequantized floats.
 
@@ -136,6 +138,8 @@ def _gptq_layer(
         symmetric: Whether to use symmetric quantization.
         damp_percent: Initial Hessian dampening fraction.
         damp_auto_increment: Dampening increment on Cholesky failure.
+        ternary_threshold_ratio: Enable strict ternary quantization with this
+            zero/non-zero threshold, or use affine quantization when ``None``.
     """
     in_features = mod.weight.shape[1]
     if in_features >= group_size and in_features % group_size == 0:
@@ -143,14 +147,29 @@ def _gptq_layer(
     else:
         gran = Granularity.per_channel()
 
-    calib = GPTQCalibration(
-        granularity=gran,
-        possible_quantizers=[
-            NormZpScaleCalibration(nbits=nbits, symmetric=symmetric, granularity=gran)
-        ],
-        damp_percent=damp_percent,
-        damp_auto_increment=damp_auto_increment,
-    )
+    if ternary_threshold_ratio is None:
+        calib = GPTQCalibration(
+            granularity=gran,
+            possible_quantizers=[
+                NormZpScaleCalibration(
+                    nbits=nbits, symmetric=symmetric, granularity=gran
+                )
+            ],
+            damp_percent=damp_percent,
+            damp_auto_increment=damp_auto_increment,
+        )
+    else:
+        calib = TernaryGPTQCalibration(
+            granularity=gran,
+            possible_quantizers=[
+                TernaryScaleCalibration(
+                    granularity=gran,
+                    threshold_ratio=ternary_threshold_ratio,
+                )
+            ],
+            damp_percent=damp_percent,
+            damp_auto_increment=damp_auto_increment,
+        )
     _w = mod.weight
     assert isinstance(_w, torch.Tensor)
     calib.weight_tensor = _w
@@ -203,6 +222,7 @@ class GPTQEstimator(QuantizationParamEstimator):
     symmetric: bool = True
     damp_percent: float = 0.01
     damp_auto_increment: float = 0.0025
+    ternary_threshold_ratio: float | None = None
 
     # Set by prepare() - not part of the public construction interface.
     _target_modules: dict[str, nn.Module] = field(
@@ -331,6 +351,7 @@ class GPTQEstimator(QuantizationParamEstimator):
                             symmetric=self.symmetric,
                             damp_percent=self.damp_percent,
                             damp_auto_increment=self.damp_auto_increment,
+                            ternary_threshold_ratio=self.ternary_threshold_ratio,
                         )
                 except Exception as exc:
                     LOGGER.error("GPTQ failed for '%s': %s - skipping", name, exc)
