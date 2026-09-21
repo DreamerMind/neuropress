@@ -272,6 +272,8 @@ def test_ternary_estimator_shares_and_offloads_hessians(tmp_path, monkeypatch):
     model = Layer()
     apply_ternary_hadamard(model, block_size=8)
     estimator = TernaryGptqEstimatorConfig().build()
+    scopes = {stage.name: stage.scope for stage in estimator.cache_stages()}
+    estimator.set_cache(DiskCacheManager(tmp_path / "cache", "cal", "recipe", scopes))
     estimator.prepare(model)
     requests = estimator.declare_statistics()
 
@@ -302,13 +304,13 @@ def test_ternary_estimator_shares_and_offloads_hessians(tmp_path, monkeypatch):
         offload_paths.append(hessian.offload_path)
 
     reload_counts: dict[str, int] = {}
-    original_reload = OffloadedTensor.reload
+    original_reload = OffloadedTensor._reload_unmanaged
 
     def counted_reload(self, *args, **kwargs):
         reload_counts[self._name] = reload_counts.get(self._name, 0) + 1
         return original_reload(self, *args, **kwargs)
 
-    monkeypatch.setattr(OffloadedTensor, "reload", counted_reload)
+    monkeypatch.setattr(OffloadedTensor, "_reload_unmanaged", counted_reload)
     estimator.estimate(None, registry, None)
     assert len(reload_counts) == len(requests)
     assert set(reload_counts.values()) == {1}
