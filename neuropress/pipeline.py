@@ -101,6 +101,7 @@ class QuantizationPipeline:
         requests = estimator.declare_statistics()
         registry = StatisticsRegistry()
         registry.register_requests(requests)
+        estimator.configure_statistics_registry(registry)
 
         # -- Step 4: Global calibration (single lazy pass) -----------------
         LOGGER.info("Step 4: Running global calibration")
@@ -119,7 +120,10 @@ class QuantizationPipeline:
 
         # -- Step 5: Estimate QSchemes -------------------------------------
         LOGGER.info("Step 5: Estimating QSchemes")
-        plan: QuantizationPlan = estimator.estimate(graph, registry, self.recipe)
+        try:
+            plan: QuantizationPlan = estimator.estimate(graph, registry, self.recipe)
+        finally:
+            registry.release_all()
         LOGGER.info(
             "Plan: %d weight assignments, %d activation assignments",
             len(plan.weight_assignments),

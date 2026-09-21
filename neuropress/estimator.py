@@ -89,6 +89,15 @@ class QuantizationParamEstimator(ABC):
         """
         ...
 
+    def configure_statistics_registry(self, registry: StatisticsRegistry) -> None:
+        """Configure collectors after requests have been registered.
+
+        The default implementation is a no-op.  Estimators can override this
+        hook when a statistic needs a specialised collector, for example a
+        disk-backed Hessian accumulator.
+        """
+        return None
+
     @abstractmethod
     def declare_statistics(self) -> list[StatisticRequest]:
         """Return the list of statistics needed for estimation."""

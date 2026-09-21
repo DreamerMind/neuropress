@@ -75,6 +75,16 @@ class TernaryScaleCalibration(ZpScaleCalibration):
 class TernaryGPTQCalibration(GPTQCalibration):
     """GPTQ calibration that retains strict ternary global schemes."""
 
+    possible_quantizers: list[ZpScaleCalibration] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        """Install a ternary quantizer when constructed through the registry."""
+        if not self.possible_quantizers:
+            self.possible_quantizers = [
+                TernaryScaleCalibration(granularity=self.granularity)
+            ]
+        super().__post_init__()
+
     def build_global_tensor_qscheme(
         self, qschemes: list[ZpScaleScheme], n_cols: int
     ) -> TernaryScaleScheme:

@@ -221,8 +221,8 @@ class TernaryGptqEstimatorConfig(EstimatorConfig):
     """Bonsai-style strict ternary GPTQ with per-group scales."""
 
     type: Literal["ternary_gptq"] = "ternary_gptq"
-    target: str = "linear"
-    group_size: int = 128
+    target: Literal["linear"] = "linear"
+    group_size: Literal[128] = 128
     threshold_ratio: float = 0.4
     damp_percent: float = 0.01
     damp_auto_increment: float = 0.0025
@@ -240,6 +240,8 @@ class TernaryGptqEstimatorConfig(EstimatorConfig):
             damp_percent=self.damp_percent,
             damp_auto_increment=self.damp_auto_increment,
             ternary_threshold_ratio=self.threshold_ratio,
+            share_hessians=True,
+            offload_hessians=True,
         )
 
 

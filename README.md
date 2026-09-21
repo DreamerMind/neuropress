@@ -202,6 +202,14 @@ The `0.4` threshold is an empirical Bonsai-format match, not a published Prism
 hyperparameter; use `0.5` for conventional nearest-level ternary rounding and
 sweep this value against perplexity for a new architecture.
 
+For large models, the ternary recipe shares Hessians between sibling
+projections with identical inputs and offloads each unique Hessian between
+calibration updates. This bounds resident memory, but quantizing a 27B-class
+model still requires substantial temporary disk space (roughly the sum of the
+unique FP32 Hessian sizes). Point the system temporary directory at a volume
+with enough free space. Export is transactional and packs weights in row
+chunks, so a failed validation does not leave a partial checkpoint.
+
 ---
 
 ## Cloud GPU runner (`neuropress-cloud`)

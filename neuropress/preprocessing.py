@@ -309,7 +309,7 @@ class TernaryHadamardStepConfig(PreprocessingStepConfig):
     """Serializable config for :class:`TernaryHadamardStep`."""
 
     type: Literal["ternary_hadamard"] = "ternary_hadamard"
-    block_size: int = 1024
+    block_size: Literal[1024] = 1024
     seed: int = 1234
     module_suffixes: list[str] | None = None
 

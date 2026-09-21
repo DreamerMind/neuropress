@@ -4,10 +4,12 @@ import base64
 import copy
 import json
 
+import pytest
 import torch
 from safetensors import safe_open
 from torch import nn
 
+from neuropress.calibration.probe import HessianAccumulator, StatisticsRegistry
 from neuropress.estimator_configs import TernaryGptqEstimatorConfig
 from neuropress.formats.prism_ternary import (
     export_prism_ternary_checkpoint,
@@ -15,8 +17,9 @@ from neuropress.formats.prism_ternary import (
     pack_ternary_weight,
     unpack_ternary_weight,
 )
+from neuropress.methods import METHOD_REGISTRY
 from neuropress.methods.ternary import TernaryGPTQCalibration, TernaryScaleCalibration
-from neuropress.preprocessing import TernaryHadamardStep
+from neuropress.preprocessing import TernaryHadamardStep, TernaryHadamardStepConfig
 from neuropress.qscheme import Granularity, TernaryScaleScheme
 from neuropress.transforms.ternary_hadamard import (
     TernaryHadamardInputLinear,
@@ -152,12 +155,21 @@ def test_recipe_targets_only_plugin_supported_wrappers():
 
     model = TinyModel()
     TernaryHadamardStep(block_size=8).apply(model, [])
-    estimator = TernaryGptqEstimatorConfig(group_size=8).build()
+    estimator = TernaryGptqEstimatorConfig().build()
     estimator.prepare(model)
 
     assert isinstance(model.q_proj, TernaryHadamardInputLinear)
     assert isinstance(model.state_proj, nn.Linear)
     assert list(estimator._target_modules) == ["q_proj.linear"]
+
+
+def test_recipe_rejects_plugin_incompatible_constants():
+    with pytest.raises(ValueError):
+        TernaryGptqEstimatorConfig(target="conv2d")
+    with pytest.raises(ValueError):
+        TernaryGptqEstimatorConfig(group_size=64)
+    with pytest.raises(ValueError):
+        TernaryHadamardStepConfig(block_size=512)
 
 
 def test_pack_roundtrip_and_sign_layout():
@@ -174,6 +186,119 @@ def test_pack_roundtrip_and_sign_layout():
     assert base64.b64decode(
         pack_signs(torch.tensor([-1, 1, -1, 1, 1, 1, 1, 1]))
     ) == bytes([0xA0])
+
+
+@pytest.mark.parametrize(
+    "signs", [torch.tensor([1.0, 0.0]), torch.tensor([1.0, float("nan")])]
+)
+def test_pack_signs_rejects_invalid_values(signs):
+    with pytest.raises(ValueError, match=r"only -1 and \+1"):
+        pack_signs(signs)
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+def test_pack_rejects_nonfinite_weights(bad_value):
+    weight = torch.zeros(2, 16)
+    weight[0, 0] = bad_value
+    with pytest.raises(ValueError, match="non-finite"):
+        pack_ternary_weight(weight, group_size=8)
+
+
+def test_pack_is_identical_across_row_chunk_sizes():
+    levels = torch.randint(-1, 2, (9, 32), dtype=torch.int64).float()
+    scales = torch.linspace(0.125, 1.0, 9)[:, None]
+    weight = levels * scales
+
+    expected = pack_ternary_weight(weight, group_size=16, row_chunk_size=64)
+    actual = pack_ternary_weight(weight, group_size=16, row_chunk_size=1)
+
+    torch.testing.assert_close(actual[0], expected[0])
+    torch.testing.assert_close(actual[1], expected[1])
+
+
+def test_registry_ternary_gptq_defaults_to_ternary_quantizer():
+    calibration = METHOD_REGISTRY["ternary_gptq"](
+        granularity=Granularity.per_group([8])
+    )
+    assert len(calibration.possible_quantizers) == 1
+    assert isinstance(calibration.possible_quantizers[0], TernaryScaleCalibration)
+
+
+def test_ternary_estimator_shares_and_offloads_hessians(tmp_path, monkeypatch):
+    class Attention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(16, 32)
+            self.k_proj = nn.Linear(16, 32)
+            self.v_proj = nn.Linear(16, 32)
+            self.o_proj = nn.Linear(16, 32)
+
+        def forward(self, x):
+            return sum(
+                projection(x)
+                for projection in (
+                    self.q_proj,
+                    self.k_proj,
+                    self.v_proj,
+                    self.o_proj,
+                )
+            )
+
+    class MLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_proj = nn.Linear(16, 32)
+            self.up_proj = nn.Linear(16, 32)
+            self.down_proj = nn.Linear(16, 32)
+
+        def forward(self, x):
+            return self.gate_proj(x) + self.up_proj(x) + self.down_proj(x)
+
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = Attention()
+            self.mlp = MLP()
+
+        def forward(self, x):
+            return self.self_attn(x) + self.mlp(x)
+
+    model = Layer()
+    apply_ternary_hadamard(model, block_size=8)
+    estimator = TernaryGptqEstimatorConfig().build()
+    estimator.prepare(model)
+    requests = estimator.declare_statistics()
+
+    assert [request.target_key for request in requests] == [
+        "self_attn.q_proj.linear",
+        "self_attn.o_proj.linear",
+        "mlp.gate_proj.linear",
+        "mlp.down_proj.linear",
+    ]
+    registry = StatisticsRegistry()
+    registry.register_requests(requests)
+    estimator.configure_statistics_registry(registry)
+    assert len(registry._collectors) == 4
+    assert all(
+        isinstance(collector, HessianAccumulator)
+        and collector.offload_intermediate_tensor_on_disk
+        for collector in registry._collectors.values()
+    )
+    offload_dir = tmp_path / "hessians"
+    offload_dir.mkdir()
+    monkeypatch.setattr(HessianAccumulator, "_offload_dir", offload_dir)
+    registry.collect(model, [torch.randn(2, 16), torch.randn(2, 16)])
+    offload_paths = []
+    for request in requests:
+        hessian = registry.get(request)["hessian"]
+        assert hessian.elem.device.type == "meta"
+        assert hessian.offload_path.exists()
+        offload_paths.append(hessian.offload_path)
+    estimator.estimate(None, registry, None)
+    assert not any(path.exists() for path in offload_paths)
+    for module in estimator._target_modules.values():
+        for row in module.weight.detach().abs():
+            assert torch.unique(row).numel() <= 2
 
 
 def test_export_checkpoint_uses_original_names(tmp_path):
@@ -211,3 +336,74 @@ def test_export_checkpoint_uses_original_names(tmp_path):
         unpack_ternary_weight(words, scales),
         wrapper.linear.weight.float(),
     )
+
+
+def test_export_nested_hf_names_and_shard_index(tmp_path):
+    class Attention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(1024, 32, bias=False)
+            self.k_proj = nn.Linear(1024, 32, bias=False)
+            self.v_proj = nn.Linear(1024, 32, bias=False)
+
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = Attention()
+
+    class LanguageModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([Layer()])
+
+    class InnerModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = LanguageModel()
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = InnerModel()
+
+    model = Model()
+    apply_ternary_hadamard(model, block_size=1024, seed=9)
+    for module in model.modules():
+        if isinstance(module, TernaryHadamardInputLinear):
+            levels = torch.randint(-1, 2, module.linear.weight.shape)
+            module.linear.weight.data.copy_(levels * 0.25)
+
+    output = tmp_path / "export"
+    export_prism_ternary_checkpoint(
+        model,
+        output,
+        {"architectures": ["Qwen3_5ForConditionalGeneration"]},
+        max_shard_bytes=9_000,
+        packing_row_chunk_size=1,
+    )
+
+    index = json.loads((output / "model.safetensors.index.json").read_text())
+    expected_prefix = "model.language_model.layers.0.self_attn"
+    assert set(index["weight_map"]) == {
+        f"{expected_prefix}.{projection}.{suffix}"
+        for projection in ("q_proj", "k_proj", "v_proj")
+        for suffix in ("weight", "scales")
+    }
+    assert all(".linear." not in key for key in index["weight_map"])
+    assert len(set(index["weight_map"].values())) > 1
+
+
+def test_export_failure_leaves_no_partial_checkpoint(tmp_path):
+    class TinyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(1024, 32, bias=False)
+
+    model = TinyModel()
+    apply_ternary_hadamard(model, block_size=1024)
+    output = tmp_path / "export"
+    output.mkdir()
+    with pytest.raises(ValueError, match="not strict ternary"):
+        export_prism_ternary_checkpoint(model, output, {"architectures": ["TinyModel"]})
+    assert list(output.iterdir()) == []
+    assert not list(tmp_path.glob(".export.tmp-*"))

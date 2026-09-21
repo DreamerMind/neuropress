@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +35,10 @@ _AUXILIARY_FILES = (
 
 def pack_signs(signs: torch.Tensor) -> str:
     """Encode signs using the same MSB-first bit layout as ``numpy.packbits``."""
-    negative = (signs.detach().reshape(-1).cpu() < 0).to(torch.uint8)
+    flat_signs = signs.detach().reshape(-1).cpu()
+    if not torch.isfinite(flat_signs).all() or not torch.all(flat_signs.abs() == 1):
+        raise ValueError("Hadamard signs must contain only -1 and +1")
+    negative = (flat_signs < 0).to(torch.uint8)
     padding = (-negative.numel()) % 8
     if padding:
         negative = torch.cat([negative, torch.zeros(padding, dtype=torch.uint8)])
@@ -46,37 +50,54 @@ def pack_signs(signs: torch.Tensor) -> str:
 def pack_ternary_weight(
     weight: torch.Tensor,
     group_size: int = DEFAULT_GROUP_SIZE,
+    row_chunk_size: int = 256,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pack a dequantized strict-ternary matrix into vLLM words and scales."""
+    """Pack a strict-ternary matrix using bounded host-memory row chunks."""
     if weight.dim() != 2:
         raise ValueError(f"expected a matrix, got shape {tuple(weight.shape)}")
+    if group_size <= 0:
+        raise ValueError("group_size must be positive")
     rows, width = weight.shape
     if width % group_size or width % PACKED_LANES:
         raise ValueError(
             f"input width {width} must be divisible by group_size={group_size} "
             f"and packed lanes={PACKED_LANES}"
         )
+    if row_chunk_size <= 0:
+        raise ValueError("row_chunk_size must be positive")
 
-    grouped = weight.detach().to(torch.float32).reshape(rows, -1, group_size)
-    scales = grouped.abs().amax(dim=-1)
-    safe_scales = torch.where(scales == 0, torch.ones_like(scales), scales)
-    levels = (grouped / safe_scales[..., None]).round().clamp(-1, 1)
-    levels = torch.where(scales[..., None] == 0, torch.zeros_like(levels), levels)
-    reconstructed = levels * scales[..., None]
-    tolerance = 1e-5 + scales[..., None] * 1e-3
-    if torch.any((grouped - reconstructed).abs() > tolerance):
-        max_error = (grouped - reconstructed).abs().max().item()
-        raise ValueError(
-            "weight is not strict ternary per group; run ternary_gptq before export "
-            f"(max reconstruction error {max_error:.6g})"
-        )
-
-    codes = (levels.reshape(rows, width).to(torch.int64) + 1).reshape(
-        rows, -1, PACKED_LANES
-    )
+    words = torch.empty((rows, width // PACKED_LANES), dtype=torch.int32)
+    packed_scales = torch.empty((rows, width // group_size), dtype=torch.float16)
     shifts = torch.arange(PACKED_LANES, dtype=torch.int64) * 2
-    words = torch.sum(codes << shifts, dim=-1).to(torch.int32)
-    return words.cpu().contiguous(), scales.to(torch.float16).cpu().contiguous()
+    for start in range(0, rows, row_chunk_size):
+        stop = min(start + row_chunk_size, rows)
+        chunk = weight[start:stop].detach().to(device="cpu", dtype=torch.float32)
+        if not torch.isfinite(chunk).all():
+            raise ValueError(
+                f"weight contains non-finite values in rows [{start}, {stop})"
+            )
+        grouped = chunk.reshape(stop - start, -1, group_size)
+        scales = grouped.abs().amax(dim=-1)
+        safe_scales = torch.where(scales == 0, torch.ones_like(scales), scales)
+        levels = (grouped / safe_scales[..., None]).round().clamp(-1, 1)
+        levels = torch.where(scales[..., None] == 0, torch.zeros_like(levels), levels)
+        reconstructed = levels * scales[..., None]
+        tolerance = 1e-5 + scales[..., None] * 1e-3
+        if torch.any((grouped - reconstructed).abs() > tolerance):
+            max_error = (grouped - reconstructed).abs().max().item()
+            raise ValueError(
+                "weight is not strict ternary per group; run ternary_gptq before "
+                f"export (max reconstruction error {max_error:.6g})"
+            )
+        scales_f16 = scales.to(torch.float16)
+        if not torch.isfinite(scales_f16).all():
+            raise ValueError("weight scales overflow float16 during export")
+        codes = (levels.reshape(stop - start, width).to(torch.int64) + 1).reshape(
+            stop - start, -1, PACKED_LANES
+        )
+        words[start:stop] = torch.sum(codes << shifts, dim=-1).to(torch.int32)
+        packed_scales[start:stop] = scales_f16
+    return words.contiguous(), packed_scales.contiguous()
 
 
 def unpack_ternary_weight(
@@ -116,6 +137,7 @@ def export_prism_ternary_checkpoint(
     hadamard_block: int = DEFAULT_HADAMARD_BLOCK,
     max_shard_bytes: int = 5 * 1024**3,
     language_model_only: bool = True,
+    packing_row_chunk_size: int = 256,
 ) -> Path:
     """Write a Hugging Face checkpoint consumable by ``bonsai-vllm``.
 
@@ -123,16 +145,21 @@ def export_prism_ternary_checkpoint(
     ``ternary_gptq`` estimation.  Existing checkpoint files are never replaced.
     """
     destination = Path(output_dir)
-    destination.mkdir(parents=True, exist_ok=True)
     if group_size != DEFAULT_GROUP_SIZE or hadamard_block != DEFAULT_HADAMARD_BLOCK:
         raise ValueError(
             "the prism_ternary vLLM plugin requires group_size=128 and "
             "hadamard_block=1024"
         )
-    if any(destination.glob("model*.safetensors")):
-        raise FileExistsError(f"checkpoint tensors already exist in {destination}")
+    if destination.exists() and any(destination.iterdir()):
+        raise FileExistsError(f"output directory is not empty: {destination}")
     if max_shard_bytes <= 0:
         raise ValueError("max_shard_bytes must be positive")
+    if packing_row_chunk_size <= 0:
+        raise ValueError("packing_row_chunk_size must be positive")
+
+    config, source_dir = _load_config(base_config)
+    if source_dir is not None and source_dir.resolve() == destination.resolve():
+        raise ValueError("output directory must differ from the base checkpoint")
 
     wrappers = {
         name: module
@@ -177,6 +204,10 @@ def export_prism_ternary_checkpoint(
         if not torch.equal(previous, wrapper.hadamard_signs.detach().cpu()):
             raise ValueError(f"layers with input width {width} do not share signs")
 
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(prefix=f".{destination.name}.tmp-", dir=destination.parent)
+    )
     wrapper_prefixes = sorted(wrappers, key=len, reverse=True)
     state = model.state_dict()
     shards: list[tuple[Path, list[str]]] = []
@@ -188,84 +219,92 @@ def export_prism_ternary_checkpoint(
         nonlocal current, current_bytes
         if not current:
             return
-        path = destination / f"model-{len(shards) + 1:05d}.safetensors"
+        path = staging / f"model-{len(shards) + 1:05d}.safetensors"
         save_file(current, path, metadata={"format": "pt"})
         shards.append((path, list(current)))
         current = {}
         current_bytes = 0
 
-    for key, tensor in state.items():
-        if language_model_only and key.startswith("model.visual."):
-            continue
-        output_name = key
-        output_tensors: list[tuple[str, torch.Tensor]] = []
-        wrapper_name = next(
-            (name for name in wrapper_prefixes if key.startswith(f"{name}.")), None
-        )
-        if wrapper_name is not None:
-            relative = key[len(wrapper_name) + 1 :]
-            if relative == "hadamard_signs":
+    try:
+        for key, tensor in state.items():
+            if language_model_only and key.startswith("model.visual."):
                 continue
-            if relative == "linear.weight":
-                words, scales = pack_ternary_weight(tensor, group_size)
-                output_tensors = [
-                    (f"{wrapper_name}.weight", words),
-                    (f"{wrapper_name}.scales", scales),
-                ]
-            elif relative.startswith("linear."):
-                output_tensors = [
-                    (f"{wrapper_name}.{relative.removeprefix('linear.')}", tensor)
-                ]
+            output_name = key
+            output_tensors: list[tuple[str, torch.Tensor]] = []
+            wrapper_name = next(
+                (name for name in wrapper_prefixes if key.startswith(f"{name}.")), None
+            )
+            if wrapper_name is not None:
+                relative = key[len(wrapper_name) + 1 :]
+                if relative == "hadamard_signs":
+                    continue
+                if relative == "linear.weight":
+                    words, scales = pack_ternary_weight(
+                        tensor, group_size, packing_row_chunk_size
+                    )
+                    output_tensors = [
+                        (f"{wrapper_name}.weight", words),
+                        (f"{wrapper_name}.scales", scales),
+                    ]
+                elif relative.startswith("linear."):
+                    output_tensors = [
+                        (f"{wrapper_name}.{relative.removeprefix('linear.')}", tensor)
+                    ]
+                else:
+                    continue
             else:
-                continue
-        else:
-            output_tensors = [(output_name, tensor)]
+                output_tensors = [(output_name, tensor)]
 
-        for name, value in output_tensors:
-            stored = value.detach().cpu().contiguous().clone()
-            nbytes = stored.numel() * stored.element_size()
-            if current and current_bytes + nbytes > max_shard_bytes:
-                flush()
-            current[name] = stored
-            current_bytes += nbytes
-            total_tensor_bytes += nbytes
-    flush()
+            for name, value in output_tensors:
+                stored = value.detach().cpu().contiguous().clone()
+                nbytes = stored.numel() * stored.element_size()
+                if current and current_bytes + nbytes > max_shard_bytes:
+                    flush()
+                current[name] = stored
+                current_bytes += nbytes
+                total_tensor_bytes += nbytes
+        flush()
 
-    weight_map: dict[str, str] = {}
-    if len(shards) == 1:
-        source, names = shards[0]
-        target = destination / "model.safetensors"
-        source.rename(target)
-        weight_map = dict.fromkeys(names, target.name)
-    else:
-        total = len(shards)
-        for index, (source, names) in enumerate(shards, 1):
-            target = destination / f"model-{index:05d}-of-{total:05d}.safetensors"
+        weight_map: dict[str, str] = {}
+        if len(shards) == 1:
+            source, names = shards[0]
+            target = staging / "model.safetensors"
             source.rename(target)
-            weight_map.update(dict.fromkeys(names, target.name))
-        index = {
-            "metadata": {"total_size": total_tensor_bytes},
-            "weight_map": weight_map,
-        }
-        (destination / "model.safetensors.index.json").write_text(
-            json.dumps(index, indent=2) + "\n"
-        )
+            weight_map = dict.fromkeys(names, target.name)
+        else:
+            total = len(shards)
+            for index, (source, names) in enumerate(shards, 1):
+                target = staging / f"model-{index:05d}-of-{total:05d}.safetensors"
+                source.rename(target)
+                weight_map.update(dict.fromkeys(names, target.name))
+            index = {
+                "metadata": {"total_size": total_tensor_bytes},
+                "weight_map": weight_map,
+            }
+            (staging / "model.safetensors.index.json").write_text(
+                json.dumps(index, indent=2) + "\n"
+            )
 
-    config, source_dir = _load_config(base_config)
-    config["quantization_config"] = {
-        "quant_method": PRISM_TERNARY_METHOD,
-        "bits": 2,
-        "group_size": group_size,
-        "hadamard_block": hadamard_block,
-        "signs": {
-            str(width): pack_signs(signs)
-            for width, signs in sorted(signs_by_width.items())
-        },
-    }
-    (destination / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-    if source_dir is not None:
-        for filename in _AUXILIARY_FILES:
-            source = source_dir / filename
-            if source.exists():
-                shutil.copyfile(source, destination / filename)
-    return destination
+        config["quantization_config"] = {
+            "quant_method": PRISM_TERNARY_METHOD,
+            "bits": 2,
+            "group_size": group_size,
+            "hadamard_block": hadamard_block,
+            "signs": {
+                str(width): pack_signs(signs)
+                for width, signs in sorted(signs_by_width.items())
+            },
+        }
+        (staging / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+        if source_dir is not None:
+            for filename in _AUXILIARY_FILES:
+                source = source_dir / filename
+                if source.exists():
+                    shutil.copyfile(source, staging / filename)
+        if destination.exists():
+            destination.rmdir()
+        staging.rename(destination)
+        return destination
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
