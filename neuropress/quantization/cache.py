@@ -10,11 +10,12 @@ Layout on disk (:class:`DiskCacheManager`)::
 
     {cache_dir}/
       cal_{cal_fingerprint}/      # stages whose scope is "calibration"
-        hessian/
+        hessian/                  # ordinary GPTQ
           {key}.safetensors
         hessian_diag/
           {key}.safetensors
       recipe_{recipe_fingerprint}/  # stages whose scope is "recipe"
+        hessian/                  # basis-dependent ternary GPTQ
         centroids/
           {key}.safetensors
         assignments/
@@ -24,13 +25,13 @@ Two fingerprints are computed automatically from the recipe:
 
 * **cal_fingerprint** — SHA-256 of the calibration config fields only
   (dataset, n_samples, seq_len, seed, batch_size).  Changing quantization
-  hyperparameters (n_iter, num_centroids, …) does not change this; all runs
-  sharing the same calibration config share the same hessian cache.
+  hyperparameters (n_iter, num_centroids, …) does not change this. Ordinary
+  GPTQ runs sharing the same calibration config can share Hessians.
 
 * **recipe_fingerprint** — SHA-256 of the full ``recipe_config_json`` string.
   Any change to any hyperparameter (including calibration) produces a new
-  fingerprint and a fresh centroid/assignment cache, while the hessian cache
-  (keyed on cal_fingerprint) remains reusable.
+  fingerprint and a fresh recipe-scoped cache. Ternary GPTQ uses this scope
+  because its Hessians depend on the configured Hadamard basis.
 
 Key sanitisation: dots → ``__``, slashes → ``_`` so module names like
 ``model.layers.0.mlp.down_proj`` map to safe filenames.
@@ -100,12 +101,12 @@ class CacheManager(Protocol):
         """Return True if the given stage/key is present in the cache."""
         ...
 
-    def load(self, stage: str, key: str) -> dict[str, torch.Tensor] | None:
-        """Return the cached tensor dict, or None on miss."""
+    def load(self, stage: str, key: str) -> dict[str, Any] | None:
+        """Return the cached tensor/scalar dict, or None on miss."""
         ...
 
-    def save(self, stage: str, key: str, data: dict[str, torch.Tensor]) -> None:
-        """Persist *data* under *stage*/*key*."""
+    def save(self, stage: str, key: str, data: dict[str, Any]) -> None:
+        """Persist tensor and scalar *data* under *stage*/*key*."""
         ...
 
 
@@ -116,11 +117,11 @@ class NullCacheManager:
         """Return ``False``: a null cache never holds anything."""
         return False
 
-    def load(self, stage: str, key: str) -> dict[str, torch.Tensor] | None:
+    def load(self, stage: str, key: str) -> dict[str, Any] | None:
         """Return ``None``: a null cache never holds anything."""
         return None
 
-    def save(self, stage: str, key: str, data: dict[str, torch.Tensor]) -> None:
+    def save(self, stage: str, key: str, data: dict[str, Any]) -> None:
         """Discard *data*: a null cache does not persist."""
 
 
@@ -177,30 +178,56 @@ class DiskCacheManager:
         """Return ``True`` if a safetensors file exists for *stage*/*key*."""
         return self._path(stage, key).exists()
 
-    def load(self, stage: str, key: str) -> dict[str, torch.Tensor] | None:
+    def load(self, stage: str, key: str) -> dict[str, Any] | None:
         """Return the cached tensor dict, or ``None`` on miss or read failure."""
-        from safetensors.torch import load_file
+        from safetensors import safe_open
 
         path = self._path(stage, key)
         if not path.exists():
             return None
         try:
-            data = dict(load_file(str(path)))
+            with safe_open(path, framework="pt", device="cpu") as cache_file:
+                data: dict[str, Any] = {
+                    name: cache_file.get_tensor(name) for name in cache_file.keys()
+                }
+                for name, encoded in (cache_file.metadata() or {}).items():
+                    if not name.startswith("neuropress.scalar."):
+                        continue
+                    scalar_name = name.removeprefix("neuropress.scalar.")
+                    scalar = json.loads(encoded)
+                    scalar_type = scalar["type"]
+                    value = scalar["value"]
+                    if scalar_type == "bool":
+                        data[scalar_name] = bool(value)
+                    elif scalar_type == "int":
+                        data[scalar_name] = int(value)
+                    elif scalar_type == "float":
+                        data[scalar_name] = float(value)
+                    else:
+                        raise ValueError(f"unknown cached scalar type {scalar_type!r}")
             LOGGER.debug("cache hit  %s/%s", stage, key)
             return data
         except Exception as exc:
             LOGGER.warning("cache load failed  %s/%s: %s", stage, key, exc)
             return None
 
-    def save(self, stage: str, key: str, data: dict[str, torch.Tensor]) -> None:
+    def save(self, stage: str, key: str, data: dict[str, Any]) -> None:
         """Persist *data* under *stage*/*key*; log and continue on failure."""
         from safetensors.torch import save_file
 
         path = self._path(stage, key)
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            cpu_data = {k: v.detach().contiguous().cpu() for k, v in data.items()}
-            save_file(cpu_data, str(path))
+            cpu_data: dict[str, torch.Tensor] = {}
+            metadata: dict[str, str] = {}
+            for name, value in data.items():
+                if isinstance(value, bool | int | float):
+                    metadata[f"neuropress.scalar.{name}"] = json.dumps(
+                        {"type": type(value).__name__, "value": value}
+                    )
+                else:
+                    cpu_data[name] = value.detach().contiguous().cpu()
+            save_file(cpu_data, str(path), metadata=metadata)
             size_mb = path.stat().st_size / (1024 * 1024)
             LOGGER.info("cache save  %s/%s  %.1f MB", stage, key, size_mb)
         except Exception as exc:

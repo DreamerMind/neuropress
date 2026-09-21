@@ -116,7 +116,10 @@ class QuantizationPipeline:
                 ),
                 total=total_batches,
             )
-        registry.collect(model, calibration_iter)
+        if requests:
+            registry.collect(model, calibration_iter)
+        else:
+            LOGGER.info("Step 4: No statistics requested; skipping calibration pass")
 
         # -- Step 5: Estimate QSchemes -------------------------------------
         LOGGER.info("Step 5: Estimating QSchemes")

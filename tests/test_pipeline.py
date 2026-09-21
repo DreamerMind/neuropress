@@ -73,6 +73,23 @@ def test_pipeline_runs():
     assert isinstance(result, nn.Module)
 
 
+def test_pipeline_skips_calibration_forward_when_no_statistics_are_requested():
+    class CountingModel(_SimpleModel):
+        def __init__(self):
+            super().__init__()
+            self.forward_calls = 0
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            self.forward_calls += 1
+            return super().forward(x)
+
+    model = CountingModel()
+    pipeline = QuantizationPipeline(_make_recipe())
+    pipeline.run(model, [torch.randn(2, 8) for _ in range(3)])
+
+    assert model.forward_calls == 1
+
+
 def test_pipeline_output_matches_input_api():
     """The adapted model must preserve the forward signature."""
     model = _SimpleModel()

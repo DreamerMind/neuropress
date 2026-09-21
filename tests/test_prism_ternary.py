@@ -9,7 +9,11 @@ import torch
 from safetensors import safe_open
 from torch import nn
 
-from neuropress.calibration.probe import HessianAccumulator, StatisticsRegistry
+from neuropress.calibration.probe import (
+    HessianAccumulator,
+    StatisticRequest,
+    StatisticsRegistry,
+)
 from neuropress.estimator_configs import TernaryGptqEstimatorConfig
 from neuropress.formats.prism_ternary import (
     export_prism_ternary_checkpoint,
@@ -21,6 +25,7 @@ from neuropress.methods import METHOD_REGISTRY
 from neuropress.methods.ternary import TernaryGPTQCalibration, TernaryScaleCalibration
 from neuropress.preprocessing import TernaryHadamardStep, TernaryHadamardStepConfig
 from neuropress.qscheme import Granularity, TernaryScaleScheme
+from neuropress.quantization.cache import DiskCacheManager
 from neuropress.transforms.ternary_hadamard import (
     TernaryHadamardInputLinear,
     apply_ternary_hadamard,
@@ -299,6 +304,87 @@ def test_ternary_estimator_shares_and_offloads_hessians(tmp_path, monkeypatch):
     for module in estimator._target_modules.values():
         for row in module.weight.detach().abs():
             assert torch.unique(row).numel() <= 2
+
+
+def test_partial_disk_cache_collects_only_missing_hessians(tmp_path, monkeypatch):
+    class Attention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(16, 32)
+            self.o_proj = nn.Linear(16, 32)
+
+        def forward(self, x):
+            return self.q_proj(x) + self.o_proj(x)
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = Attention()
+
+        def forward(self, x):
+            return self.self_attn(x)
+
+    model = Model()
+    apply_ternary_hadamard(model, block_size=8)
+    estimator = TernaryGptqEstimatorConfig().build()
+    scopes = {stage.name: stage.scope for stage in estimator.cache_stages()}
+    assert scopes == {"hessian": "recipe"}
+    cache = DiskCacheManager(tmp_path / "cache", "cal", "recipe", scopes)
+    estimator.set_cache(cache)
+    estimator.prepare(model)
+
+    cached_source = "self_attn.q_proj.linear"
+    missing_source = "self_attn.o_proj.linear"
+    cache.save(
+        "hessian",
+        cached_source,
+        {"hessian": torch.eye(16), "nsamples": 2},
+    )
+    cached = cache.load("hessian", cached_source)
+    assert cached is not None
+    assert cached["nsamples"] == 2
+    assert isinstance(cached["nsamples"], int)
+
+    requests = estimator.declare_statistics()
+    assert [request.target_key for request in requests] == [missing_source]
+    registry = StatisticsRegistry()
+    registry.register_requests(requests)
+    estimator.configure_statistics_registry(registry)
+    assert len(registry._collectors) == 1
+    assert all(
+        collector.offload_intermediate_tensor_on_disk
+        for collector in registry._collectors.values()
+    )
+
+    offload_dir = tmp_path / "hessians"
+    offload_dir.mkdir()
+    monkeypatch.setattr(HessianAccumulator, "_offload_dir", offload_dir)
+    registry.collect(model, [torch.randn(2, 16)])
+    assert registry.get(
+        next(request for request in requests if request.target_key == missing_source)
+    )["hessian"].offload_path.exists()
+    assert not registry.has(
+        StatisticRequest(target_key=cached_source, stat_type="hessian")
+    )
+
+    estimator.estimate(None, registry, None)
+    assert cache.has("hessian", cached_source)
+    assert cache.has("hessian", missing_source)
+    newly_cached = cache.load("hessian", missing_source)
+    assert newly_cached is not None
+    assert newly_cached["hessian"].shape == (16, 16)
+    assert newly_cached["nsamples"] == 1
+    assert isinstance(newly_cached["nsamples"], int)
+    cached_estimator = TernaryGptqEstimatorConfig().build()
+    cached_estimator.set_cache(cache)
+    cached_estimator.prepare(model)
+    assert cached_estimator.declare_statistics() == []
+
+
+def test_nonternary_gptq_hessian_cache_remains_calibration_scoped():
+    from neuropress.estimators import GPTQEstimator
+
+    assert GPTQEstimator().cache_stages()[0].scope == "calibration"
 
 
 def test_export_checkpoint_uses_original_names(tmp_path):

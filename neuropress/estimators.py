@@ -282,14 +282,23 @@ class GPTQEstimator(QuantizationParamEstimator):
         )
 
     def cache_stages(self) -> list[CacheStageDescriptor]:
-        """Declare the per-layer Hessian cache stage (calibration-scoped)."""
+        """Declare the Hessian cache stage with preprocessing-safe scope."""
         return [
             CacheStageDescriptor(
                 "hessian",
                 "Full input Hessians (one per unique projection input)",
-                scope="calibration",
+                scope=(
+                    "recipe"
+                    if self.ternary_threshold_ratio is not None
+                    else "calibration"
+                ),
             )
         ]
+
+    def _missing_stat_sources(self) -> list[str]:
+        """Return unique Hessian sources that are absent from the cache."""
+        sources = dict.fromkeys(self._stat_source_by_target.values())
+        return [name for name in sources if not self._cache.has("hessian", name)]
 
     def declare_statistics(self) -> list[StatisticRequest]:
         """Return one Hessian request per unique target input.
@@ -297,25 +306,23 @@ class GPTQEstimator(QuantizationParamEstimator):
         Returns an empty list when all hessians are already in cache, causing
         the pipeline to skip the calibration forward pass entirely.
         """
-        cache = self._cache
         sources = list(dict.fromkeys(self._stat_source_by_target.values()))
-        if all(cache.has("hessian", name) for name in sources):
+        missing = self._missing_stat_sources()
+        if not missing:
             LOGGER.info(
                 "GPTQEstimator: all %d hessians in cache - skipping calibration.",
                 len(sources),
             )
             return []
         return [
-            StatisticRequest(target_key=name, stat_type="hessian") for name in sources
+            StatisticRequest(target_key=name, stat_type="hessian") for name in missing
         ]
 
     def configure_statistics_registry(self, registry: StatisticsRegistry) -> None:
         """Use disk-backed collectors so full-model Hessians do not fill RAM."""
         if not self.offload_hessians:
             return
-        for source in dict.fromkeys(self._stat_source_by_target.values()):
-            if self._cache.has("hessian", source):
-                continue
+        for source in self._missing_stat_sources():
             request = StatisticRequest(target_key=source, stat_type="hessian")
             registry.register_collector(
                 request,
