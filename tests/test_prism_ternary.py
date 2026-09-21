@@ -16,6 +16,7 @@ from neuropress.calibration.probe import (
     StatisticsRegistry,
 )
 from neuropress.estimator_configs import TernaryGptqEstimatorConfig
+from neuropress.estimators import CompositeEstimator
 from neuropress.formats.prism_ternary import (
     export_prism_ternary_checkpoint,
     pack_signs,
@@ -314,6 +315,8 @@ def test_ternary_estimator_shares_and_offloads_hessians(tmp_path, monkeypatch):
     estimator.estimate(None, registry, None)
     assert len(reload_counts) == len(requests)
     assert set(reload_counts.values()) == {1}
+    assert all(path.exists() for path in offload_paths)
+    registry.release_all()
     assert not any(path.exists() for path in offload_paths)
     for module in estimator._target_modules.values():
         for row in module.weight.detach().abs():
@@ -399,6 +402,29 @@ def test_nonternary_gptq_hessian_cache_remains_calibration_scoped():
     from neuropress.estimators import GPTQEstimator
 
     assert GPTQEstimator().cache_stages()[0].scope == "calibration"
+
+
+def test_composite_delegates_disk_backed_hessian_configuration():
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(16, 32)
+
+    model = Model()
+    apply_ternary_hadamard(model, block_size=8)
+    child = TernaryGptqEstimatorConfig().build()
+    estimator = CompositeEstimator([child])
+    estimator.prepare(model)
+    requests = estimator.declare_statistics()
+    registry = StatisticsRegistry()
+    registry.register_requests(requests)
+
+    estimator.configure_statistics_registry(registry)
+
+    assert len(registry._collectors) == 1
+    collector = next(iter(registry._collectors.values()))
+    assert isinstance(collector, HessianAccumulator)
+    assert collector.offload_intermediate_tensor_on_disk
 
 
 def test_export_checkpoint_uses_original_names(tmp_path):

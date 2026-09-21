@@ -542,14 +542,8 @@ class GPTQEstimator(QuantizationParamEstimator):
                             if q is not None:
                                 assignments[name] = q
         finally:
-            try:
-                if residency_pool is not None:
-                    residency_pool.close()
-            finally:
-                for source in dict.fromkeys(self._stat_source_by_target.values()):
-                    registry.release(
-                        StatisticRequest(target_key=source, stat_type="hessian")
-                    )
+            if residency_pool is not None:
+                residency_pool.close()
 
         return QuantizationPlan(weight_assignments=assignments)
 
@@ -3269,6 +3263,11 @@ class CompositeEstimator(QuantizationParamEstimator):
                     seen.add(key)
                     requests.append(req)
         return requests
+
+    def configure_statistics_registry(self, registry: StatisticsRegistry) -> None:
+        """Allow each child to install specialised statistic collectors."""
+        for est in self.estimators:
+            est.configure_statistics_registry(registry)
 
     def estimate(
         self,
