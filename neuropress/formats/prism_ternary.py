@@ -22,7 +22,9 @@ PRISM_TERNARY_METHOD = "prism_ternary"
 DEFAULT_GROUP_SIZE = 128
 DEFAULT_HADAMARD_BLOCK = 1024
 PACKED_LANES = 16
-ROW_BLOCK = 32
+# The plugin's Triton layout is organized in 32-row blocks, but its compiled
+# decode kernel requires the total output width to be divisible by 64.
+VLLM_DECODE_ROW_BLOCK = 64
 
 _AUXILIARY_FILES = (
     "generation_config.json",
@@ -193,10 +195,10 @@ def export_prism_ternary_checkpoint(
                 f"{name} uses Hadamard block {wrapper.block_size}, expected {hadamard_block}"
             )
         width = wrapper.linear.in_features
-        if wrapper.linear.out_features % ROW_BLOCK:
+        if wrapper.linear.out_features % VLLM_DECODE_ROW_BLOCK:
             raise ValueError(
                 f"{name} output width {wrapper.linear.out_features} must be divisible "
-                f"by vLLM row block {ROW_BLOCK}"
+                f"by vLLM decode row block {VLLM_DECODE_ROW_BLOCK}"
             )
         previous = signs_by_width.setdefault(
             width, wrapper.hadamard_signs.detach().cpu()

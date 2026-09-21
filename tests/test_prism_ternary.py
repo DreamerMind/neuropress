@@ -431,7 +431,7 @@ def test_export_checkpoint_uses_original_names(tmp_path):
     class TinyModel(nn.Module):
         def __init__(self):
             super().__init__()
-            self.q_proj = nn.Linear(1024, 32, bias=False)
+            self.q_proj = nn.Linear(1024, 64, bias=False)
 
     model = TinyModel()
     apply_ternary_hadamard(model, block_size=1024, seed=7)
@@ -468,9 +468,9 @@ def test_export_nested_hf_names_and_shard_index(tmp_path):
     class Attention(nn.Module):
         def __init__(self):
             super().__init__()
-            self.q_proj = nn.Linear(1024, 32, bias=False)
-            self.k_proj = nn.Linear(1024, 32, bias=False)
-            self.v_proj = nn.Linear(1024, 32, bias=False)
+            self.q_proj = nn.Linear(1024, 64, bias=False)
+            self.k_proj = nn.Linear(1024, 64, bias=False)
+            self.v_proj = nn.Linear(1024, 64, bias=False)
 
     class Layer(nn.Module):
         def __init__(self):
@@ -523,7 +523,7 @@ def test_export_failure_leaves_no_partial_checkpoint(tmp_path):
     class TinyModel(nn.Module):
         def __init__(self):
             super().__init__()
-            self.q_proj = nn.Linear(1024, 32, bias=False)
+            self.q_proj = nn.Linear(1024, 64, bias=False)
 
     model = TinyModel()
     apply_ternary_hadamard(model, block_size=1024)
@@ -533,3 +533,20 @@ def test_export_failure_leaves_no_partial_checkpoint(tmp_path):
         export_prism_ternary_checkpoint(model, output, {"architectures": ["TinyModel"]})
     assert list(output.iterdir()) == []
     assert not list(tmp_path.glob(".export.tmp-*"))
+
+
+def test_export_rejects_output_width_unsupported_by_decode_kernel(tmp_path):
+    class TinyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(1024, 32, bias=False)
+
+    model = TinyModel()
+    apply_ternary_hadamard(model, block_size=1024)
+
+    with pytest.raises(ValueError, match="vLLM decode row block 64"):
+        export_prism_ternary_checkpoint(
+            model,
+            tmp_path / "export",
+            {"architectures": ["TinyModel"]},
+        )
