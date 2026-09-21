@@ -8,6 +8,7 @@ import pytest
 import torch
 from safetensors import safe_open
 from torch import nn
+from torch_to_nnef.tensor import OffloadedTensor
 
 from neuropress.calibration.probe import (
     HessianAccumulator,
@@ -299,7 +300,18 @@ def test_ternary_estimator_shares_and_offloads_hessians(tmp_path, monkeypatch):
         assert hessian.elem.device.type == "meta"
         assert hessian.offload_path.exists()
         offload_paths.append(hessian.offload_path)
+
+    reload_counts: dict[str, int] = {}
+    original_reload = OffloadedTensor.reload
+
+    def counted_reload(self, *args, **kwargs):
+        reload_counts[self._name] = reload_counts.get(self._name, 0) + 1
+        return original_reload(self, *args, **kwargs)
+
+    monkeypatch.setattr(OffloadedTensor, "reload", counted_reload)
     estimator.estimate(None, registry, None)
+    assert len(reload_counts) == len(requests)
+    assert set(reload_counts.values()) == {1}
     assert not any(path.exists() for path in offload_paths)
     for module in estimator._target_modules.values():
         for row in module.weight.detach().abs():

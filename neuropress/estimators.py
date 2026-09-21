@@ -362,85 +362,187 @@ class GPTQEstimator(QuantizationParamEstimator):
         spans = self._spans
         saved_sources: set[str] = set()
 
+        # NeuroPress owns traversal policy while torch-to-nnef owns tensor
+        # residency. Cached in-memory Hessians keep their existing path.
+        residency_pool = None
+        offloaded_type: type | tuple[type, ...] = ()
+        if self.offload_hessians:
+            from torch_to_nnef.tensor import OffloadedTensor
+
+            offloaded_type = OffloadedTensor
+            try:
+                from torch_to_nnef.tensor import TensorResidencyPool
+            except ImportError:
+                LOGGER.warning(
+                    "torch-to-nnef has no TensorResidencyPool; using "
+                    "synchronous Hessian reloads"
+                )
+            else:
+                residency_pool = TensorResidencyPool(max_workers=1)
+
+        target_items = list(self._target_modules.items())
+        last_index_by_source = {
+            self._stat_source_by_target.get(name, name): index
+            for index, (name, _mod) in enumerate(target_items)
+        }
+
+        def _offloaded_hessian(source: str):
+            stat = registry.get(
+                StatisticRequest(target_key=source, stat_type="hessian")
+            )
+            if not isinstance(stat, dict):
+                return None, stat
+            hessian = stat.get("hessian")
+            if isinstance(hessian, offloaded_type):
+                return hessian, stat
+            return None, stat
+
+        def _prefetch_after(index: int, current_source: str) -> None:
+            if residency_pool is None:
+                return
+            seen_sources = {current_source}
+            for later_name, _later_mod in target_items[index + 1 :]:
+                later_source = self._stat_source_by_target.get(later_name, later_name)
+                if later_source in seen_sources:
+                    continue
+                seen_sources.add(later_source)
+                later_hessian, _stat = _offloaded_hessian(later_source)
+                if later_hessian is not None:
+                    residency_pool.prefetch(later_hessian, device=self._device)
+                    return
+
+        if residency_pool is not None:
+            for source in dict.fromkeys(self._stat_source_by_target.values()):
+                first_hessian, _stat = _offloaded_hessian(source)
+                if first_hessian is not None:
+                    residency_pool.prefetch(first_hessian, device=self._device)
+                    break
+
         n_targets = len(self._target_modules)
         prog_ctx = _layer_progress(n_targets) if _RICH else contextlib.nullcontext()
-        with prog_ctx as progress:
-            task_id = (
-                progress.add_task("GPTQ  starting…", total=n_targets) if _RICH else None
-            )
-            for name, mod in self._target_modules.items():
-                stat_source = self._stat_source_by_target.get(name, name)
-                raw_weight = mod.weight
-                assert isinstance(raw_weight, torch.Tensor)
-                weight_id = id(raw_weight)
-
-                if _RICH:
-                    progress.update(
-                        task_id,
-                        description=f"GPTQ  [dim]{_re(name)}[/dim]",
-                    )
-
-                if weight_id in ids_seen:
-                    LOGGER.info("Shared weight '%s' already processed - skipping", name)
-                    if _RICH:
-                        progress.advance(task_id)
-                    continue
-                ids_seen.add(weight_id)
-
-                LOGGER.info(
-                    "GPTQ quantizing: %s  shape=%s", name, tuple(raw_weight.shape)
+        try:
+            with prog_ctx as progress:
+                task_id = (
+                    progress.add_task("GPTQ  starting…", total=n_targets)
+                    if _RICH
+                    else None
                 )
+                for index, (name, mod) in enumerate(target_items):
+                    stat_source = self._stat_source_by_target.get(name, name)
+                    raw_weight = mod.weight
+                    assert isinstance(raw_weight, torch.Tensor)
+                    weight_id = id(raw_weight)
 
-                # Restore hessian from cache when calibration was skipped.
-                cached_h = cache.load("hessian", stat_source)
-                if cached_h is not None:
-                    registry.set_stat(stat_source, "hessian", cached_h)
-
-                try:
-                    with timed_span(spans, "gptq.layer", layer=name):
-                        _gptq_layer(
-                            name,
-                            mod,
-                            registry,
-                            self._device,
-                            group_size=self.group_size,
-                            nbits=self.nbits,
-                            symmetric=self.symmetric,
-                            damp_percent=self.damp_percent,
-                            damp_auto_increment=self.damp_auto_increment,
-                            ternary_threshold_ratio=self.ternary_threshold_ratio,
-                            statistic_target=stat_source,
+                    if _RICH:
+                        progress.update(
+                            task_id,
+                            description=f"GPTQ  [dim]{_re(name)}[/dim]",
                         )
-                except Exception as exc:
-                    LOGGER.error("GPTQ failed for '%s': %s - skipping", name, exc)
+
+                    if weight_id in ids_seen:
+                        LOGGER.info(
+                            "Shared weight '%s' already processed - skipping", name
+                        )
+                        if _RICH:
+                            progress.advance(task_id)
+                        continue
+                    ids_seen.add(weight_id)
+
+                    LOGGER.info(
+                        "GPTQ quantizing: %s  shape=%s",
+                        name,
+                        tuple(raw_weight.shape),
+                    )
+
+                    # Restore hessian from cache when calibration was skipped.
+                    cached_h = cache.load("hessian", stat_source)
+                    if cached_h is not None:
+                        registry.set_stat(stat_source, "hessian", cached_h)
+
+                    offloaded_hessian, stat = _offloaded_hessian(stat_source)
+                    lease = (
+                        residency_pool.acquire(offloaded_hessian, device=self._device)
+                        if residency_pool is not None and offloaded_hessian is not None
+                        else contextlib.nullcontext(None)
+                    )
+                    succeeded = False
+                    try:
+                        with lease as resident_hessian:
+                            if (
+                                offloaded_hessian is not None
+                                and residency_pool is not None
+                            ):
+                                stat["hessian"] = resident_hessian
+                            _prefetch_after(index, stat_source)
+                            try:
+                                with timed_span(spans, "gptq.layer", layer=name):
+                                    _gptq_layer(
+                                        name,
+                                        mod,
+                                        registry,
+                                        self._device,
+                                        group_size=self.group_size,
+                                        nbits=self.nbits,
+                                        symmetric=self.symmetric,
+                                        damp_percent=self.damp_percent,
+                                        damp_auto_increment=self.damp_auto_increment,
+                                        ternary_threshold_ratio=(
+                                            self.ternary_threshold_ratio
+                                        ),
+                                        statistic_target=stat_source,
+                                    )
+                                succeeded = True
+                            except Exception as exc:
+                                LOGGER.error(
+                                    "GPTQ failed for '%s': %s - skipping",
+                                    name,
+                                    exc,
+                                )
+
+                            # Save while a disk-backed Hessian is resident so
+                            # the cache does not trigger a second reload.
+                            if (
+                                succeeded
+                                and cached_h is None
+                                and stat_source not in saved_sources
+                            ):
+                                current_stat = registry.get(
+                                    StatisticRequest(
+                                        target_key=stat_source,
+                                        stat_type="hessian",
+                                    )
+                                )
+                                if current_stat is not None:
+                                    cache.save("hessian", stat_source, current_stat)
+                                    saved_sources.add(stat_source)
+                    finally:
+                        if offloaded_hessian is not None and residency_pool is not None:
+                            assert isinstance(stat, dict)
+                            stat["hessian"] = offloaded_hessian
+                            if last_index_by_source[stat_source] == index:
+                                residency_pool.evict(offloaded_hessian)
+
                     if _RICH:
                         progress.advance(task_id)
-                    continue
 
-                # Save hessian to cache for future runs (skip if already cached).
-                if cached_h is None and stat_source not in saved_sources:
-                    stat = registry.get(
-                        StatisticRequest(target_key=stat_source, stat_type="hessian")
-                    )
-                    if stat is not None:
-                        cache.save("hessian", stat_source, stat)
-                        saved_sources.add(stat_source)
+                    if not succeeded:
+                        continue
 
-                if _RICH:
-                    progress.advance(task_id)
-
-                if self.weight_transform is not None:
-                    if mod.weight.dim() < 2:
-                        LOGGER.warning(
-                            "Skipping weight_transform for '%s': %dD weight %s",
-                            name,
-                            mod.weight.dim(),
-                            tuple(mod.weight.shape),
-                        )
-                    else:
-                        q = self.weight_transform(mod.weight, name)
-                        if q is not None:
-                            assignments[name] = q
+                    if self.weight_transform is not None:
+                        if mod.weight.dim() < 2:
+                            LOGGER.warning(
+                                "Skipping weight_transform for '%s': %dD weight %s",
+                                name,
+                                mod.weight.dim(),
+                                tuple(mod.weight.shape),
+                            )
+                        else:
+                            q = self.weight_transform(mod.weight, name)
+                            if q is not None:
+                                assignments[name] = q
+        finally:
+            if residency_pool is not None:
+                residency_pool.close()
 
         for source in dict.fromkeys(self._stat_source_by_target.values()):
             registry.release(StatisticRequest(target_key=source, stat_type="hessian"))

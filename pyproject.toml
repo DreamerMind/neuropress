@@ -101,6 +101,11 @@ exclude = [
 [tool.uv]
 package = true
 
+[tool.uv.sources]
+# Temporary integration source for scoped OffloadedTensor residency. Replace
+# this with a released version after sonos/torch-to-nnef#354 lands.
+torch-to-nnef = { git = "https://github.com/JulienBalianSonos/torch-to-nnef.git", rev = "832df66cbd47451a37360d05e7521ec00492bfd5" }
+
 [tool.ruff]
 target-version = "py313"
 line-length = 88
