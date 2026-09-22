@@ -102,9 +102,9 @@ exclude = [
 package = true
 
 [tool.uv.sources]
-# Temporary integration source for scoped OffloadedTensor residency. Replace
-# this with a released version after sonos/torch-to-nnef#354 lands.
-torch-to-nnef = { git = "https://github.com/JulienBalianSonos/torch-to-nnef.git", rev = "61912dff4a80f0f88ffa5058bf0ee7eaf1dedd3e" }
+# Scoped OffloadedTensor residency is merged upstream but not yet released.
+# Replace this commit pin with the first release containing sonos/torch-to-nnef#354.
+torch-to-nnef = { git = "https://github.com/sonos/torch-to-nnef.git", rev = "c42d2afc88b43dab28d24b1c35b5f069d3162b77" }
 
 [tool.ruff]
 target-version = "py313"
