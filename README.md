@@ -210,6 +210,12 @@ unique FP32 Hessian sizes). Point the system temporary directory at a volume
 with enough free space. Export is transactional and packs weights in row
 chunks, so a failed validation does not leave a partial checkpoint.
 
+The asynchronous Hessian prefetch path uses the scoped residency API merged in
+`torch-to-nnef` PR 354. Until that API appears in a release after 0.24.8,
+`uv sync` from this repository uses the pinned upstream commit in
+`tool.uv.sources`. Installations resolved only from released package metadata
+remain correct but log a warning and reload Hessians synchronously.
+
 ---
 
 ## Cloud GPU runner (`neuropress-cloud`)

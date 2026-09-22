@@ -63,6 +63,11 @@ class TernaryHadamardInputLinear(nn.Module):
         self, linear: nn.Linear, signs: torch.Tensor, block_size: int = 1024
     ) -> None:
         super().__init__()
+        # Estimator selection must be based on wrapper membership rather than
+        # the conventional child name ``linear``.  Real models can contain
+        # unrelated modules with that name, and quantizing those as ternary
+        # would silently corrupt an otherwise dense checkpoint tensor.
+        linear._neuropress_ternary_wrapped = True
         self.linear = linear
         self.block_size = block_size
         self.register_buffer("hadamard_signs", signs.to(torch.float32))

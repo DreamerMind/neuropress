@@ -154,11 +154,17 @@ def test_ternary_gptq_produces_exportable_group_weights():
 
 
 def test_recipe_targets_only_plugin_supported_wrappers():
+    class OrdinaryProjection(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(16, 32)
+
     class TinyModel(nn.Module):
         def __init__(self):
             super().__init__()
             self.q_proj = nn.Linear(16, 32)
             self.state_proj = nn.Linear(16, 32)
+            self.ordinary_projection = OrdinaryProjection()
 
     model = TinyModel()
     TernaryHadamardStep(block_size=8).apply(model, [])
@@ -167,6 +173,7 @@ def test_recipe_targets_only_plugin_supported_wrappers():
 
     assert isinstance(model.q_proj, TernaryHadamardInputLinear)
     assert isinstance(model.state_proj, nn.Linear)
+    assert isinstance(model.ordinary_projection.linear, nn.Linear)
     assert list(estimator._target_modules) == ["q_proj.linear"]
 
 

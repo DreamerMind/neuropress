@@ -93,9 +93,9 @@ def _resolve_module_class(target: str) -> type[nn.Module]:
     return mod_cls
 
 
-def _ternary_wrapped_linear_filter(name: str, _module: nn.Module) -> bool:
+def _ternary_wrapped_linear_filter(_name: str, module: nn.Module) -> bool:
     """Select only linears installed inside ternary Hadamard wrappers."""
-    return name.endswith(".linear")
+    return getattr(module, "_neuropress_ternary_wrapped", False) is True
 
 
 # ---------------------------------------------------------------------------
