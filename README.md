@@ -202,6 +202,12 @@ The `0.4` threshold is an empirical Bonsai-format match, not a published Prism
 hyperparameter; use `0.5` for conventional nearest-level ternary rounding and
 sweep this value against perplexity for a new architecture.
 
+The current exporter is intentionally text-only: it omits the vision tower to
+match the plugin's verified serving path. Start vLLM with
+`--language-model-only`. Multimodal export should only be added after the
+plugin's visual-layer selection and a complete image request have been tested
+end to end.
+
 For large models, the ternary recipe shares Hessians between sibling
 projections with identical inputs and offloads each unique Hessian between
 calibration updates. This bounds resident memory, but quantizing a 27B-class

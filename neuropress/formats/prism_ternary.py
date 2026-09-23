@@ -138,13 +138,15 @@ def export_prism_ternary_checkpoint(
     group_size: int = DEFAULT_GROUP_SIZE,
     hadamard_block: int = DEFAULT_HADAMARD_BLOCK,
     max_shard_bytes: int = 5 * 1024**3,
-    language_model_only: bool = True,
     packing_row_chunk_size: int = 256,
 ) -> Path:
-    """Write a Hugging Face checkpoint consumable by ``bonsai-vllm``.
+    """Write a text-only Hugging Face checkpoint consumable by ``bonsai-vllm``.
 
     The model must first pass through ``ternary_hadamard`` preprocessing and
-    ``ternary_gptq`` estimation.  Existing checkpoint files are never replaced.
+    ``ternary_gptq`` estimation. Vision-tower tensors are omitted because the
+    current plugin contract is only verified with vLLM's
+    ``--language-model-only`` mode. Existing checkpoint files are never
+    replaced.
     """
     destination = Path(output_dir)
     if group_size != DEFAULT_GROUP_SIZE or hadamard_block != DEFAULT_HADAMARD_BLOCK:
@@ -229,7 +231,7 @@ def export_prism_ternary_checkpoint(
 
     try:
         for key, tensor in state.items():
-            if language_model_only and key.startswith("model.visual."):
+            if key.startswith("model.visual."):
                 continue
             output_name = key
             output_tensors: list[tuple[str, torch.Tensor]] = []

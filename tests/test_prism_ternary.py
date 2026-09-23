@@ -493,6 +493,7 @@ def test_export_nested_hf_names_and_shard_index(tmp_path):
         def __init__(self):
             super().__init__()
             self.language_model = LanguageModel()
+            self.visual = nn.Embedding(8, 16)
 
     class Model(nn.Module):
         def __init__(self):
@@ -523,6 +524,7 @@ def test_export_nested_hf_names_and_shard_index(tmp_path):
         for suffix in ("weight", "scales")
     }
     assert all(".linear." not in key for key in index["weight_map"])
+    assert not any(name.startswith("model.visual.") for name in index["weight_map"])
     assert len(set(index["weight_map"].values())) > 1
 
 
