@@ -2,6 +2,7 @@
 
 from .descriptor import Granularity, GranularityType, QSchemeDescriptor
 from .group import PanelSpec, QSchemeGroup, TensorSlice
+from .ternary import TernaryScaleScheme
 from .zp_scale import ZpScaleScheme
 
 __all__ = [
@@ -11,5 +12,6 @@ __all__ = [
     "QSchemeDescriptor",
     "QSchemeGroup",
     "TensorSlice",
+    "TernaryScaleScheme",
     "ZpScaleScheme",
 ]

@@ -40,13 +40,14 @@ except ImportError:
 import torch
 from torch import nn
 
-from .calibration.probe import StatisticRequest, StatisticsRegistry
+from .calibration.probe import HessianAccumulator, StatisticRequest, StatisticsRegistry
 from .estimator import QuantizationParamEstimator
 from .graph.graph import QGraph
 from .methods.correction_mode import CorrectionMode
 from .methods.gptq import GPTQCalibration
 from .methods.gptq_panel import GPTQMixedPrecisionCalibration
 from .methods.hqq import HQQCalibration
+from .methods.ternary import TernaryGPTQCalibration, TernaryScaleCalibration
 from .methods.zp_scale_calib import NormZpScaleCalibration
 from .plan import QuantizationPlan
 from .qscheme.descriptor import Granularity
@@ -120,6 +121,8 @@ def _gptq_layer(
     symmetric: bool,
     damp_percent: float,
     damp_auto_increment: float,
+    ternary_threshold_ratio: float | None = None,
+    statistic_target: str | None = None,
 ) -> None:
     """Apply GPTQ to *mod*, updating its weight in-place to dequantized floats.
 
@@ -136,6 +139,10 @@ def _gptq_layer(
         symmetric: Whether to use symmetric quantization.
         damp_percent: Initial Hessian dampening fraction.
         damp_auto_increment: Dampening increment on Cholesky failure.
+        ternary_threshold_ratio: Enable strict ternary quantization with this
+            zero/non-zero threshold, or use affine quantization when ``None``.
+        statistic_target: Registry key to inject when a sibling layer owns the
+            shared Hessian; defaults to *name*.
     """
     in_features = mod.weight.shape[1]
     if in_features >= group_size and in_features % group_size == 0:
@@ -143,14 +150,29 @@ def _gptq_layer(
     else:
         gran = Granularity.per_channel()
 
-    calib = GPTQCalibration(
-        granularity=gran,
-        possible_quantizers=[
-            NormZpScaleCalibration(nbits=nbits, symmetric=symmetric, granularity=gran)
-        ],
-        damp_percent=damp_percent,
-        damp_auto_increment=damp_auto_increment,
-    )
+    if ternary_threshold_ratio is None:
+        calib = GPTQCalibration(
+            granularity=gran,
+            possible_quantizers=[
+                NormZpScaleCalibration(
+                    nbits=nbits, symmetric=symmetric, granularity=gran
+                )
+            ],
+            damp_percent=damp_percent,
+            damp_auto_increment=damp_auto_increment,
+        )
+    else:
+        calib = TernaryGPTQCalibration(
+            granularity=gran,
+            possible_quantizers=[
+                TernaryScaleCalibration(
+                    granularity=gran,
+                    threshold_ratio=ternary_threshold_ratio,
+                )
+            ],
+            damp_percent=damp_percent,
+            damp_auto_increment=damp_auto_increment,
+        )
     _w = mod.weight
     assert isinstance(_w, torch.Tensor)
     calib.weight_tensor = _w
@@ -159,7 +181,7 @@ def _gptq_layer(
     calib.name = name
     calib.device = device
     calib.init()
-    registry.inject(calib, name)
+    registry.inject(calib, statistic_target or name)
     calib.compute_qscheme()
 
 
@@ -193,6 +215,9 @@ class GPTQEstimator(QuantizationParamEstimator):
         symmetric: Whether to use symmetric quantization.
         damp_percent: Initial Hessian dampening fraction.
         damp_auto_increment: Dampening increment on Cholesky failure.
+        share_hessians: Reuse statistics for known sibling projections that
+            consume the same input tensor.
+        offload_hessians: Keep full Hessians disk-backed between updates.
     """
 
     module_classes: tuple[type[nn.Module], ...] = field(default=(nn.Linear,))
@@ -203,6 +228,9 @@ class GPTQEstimator(QuantizationParamEstimator):
     symmetric: bool = True
     damp_percent: float = 0.01
     damp_auto_increment: float = 0.0025
+    ternary_threshold_ratio: float | None = None
+    share_hessians: bool = False
+    offload_hessians: bool = False
 
     # Set by prepare() - not part of the public construction interface.
     _target_modules: dict[str, nn.Module] = field(
@@ -211,6 +239,23 @@ class GPTQEstimator(QuantizationParamEstimator):
     _device: torch.device | None = field(
         default=None, init=False, repr=False, compare=False
     )
+    _stat_source_by_target: dict[str, str] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+
+    @staticmethod
+    def _shared_input_key(name: str) -> str:
+        """Return a conservative key for projections fed by the same tensor."""
+        projection_name = name.removesuffix(".linear")
+        parent, _, leaf = projection_name.rpartition(".")
+        parent_leaf = parent.rpartition(".")[2]
+        if leaf in {"q_proj", "k_proj", "v_proj"} and parent_leaf == "self_attn":
+            return f"{parent}::qkv_input"
+        if leaf in {"gate_proj", "up_proj"} and parent_leaf == "mlp":
+            return f"{parent}::gate_up_input"
+        if leaf in {"in_proj_qkv", "in_proj_z"}:
+            return f"{parent}::linear_attn_input"
+        return name
 
     def prepare(self, model: nn.Module) -> None:
         """Bind this estimator to *model*: discover target layers and device.
@@ -224,39 +269,69 @@ class GPTQEstimator(QuantizationParamEstimator):
         self._target_modules = collect_target_modules(
             model, self.module_classes, self.filter_fn
         )
+        self._stat_source_by_target = {}
+        shared_sources: dict[str, str] = {}
+        for name in self._target_modules:
+            key = self._shared_input_key(name) if self.share_hessians else name
+            self._stat_source_by_target[name] = shared_sources.setdefault(key, name)
         LOGGER.info(
-            "GPTQEstimator: %d target modules (device=%s)",
+            "GPTQEstimator: %d target modules, %d Hessians (device=%s)",
             len(self._target_modules),
+            len(set(self._stat_source_by_target.values())),
             self._device,
         )
 
     def cache_stages(self) -> list[CacheStageDescriptor]:
-        """Declare the per-layer Hessian cache stage (calibration-scoped)."""
+        """Declare the Hessian cache stage with preprocessing-safe scope."""
         return [
             CacheStageDescriptor(
                 "hessian",
-                "Full input Hessians (one per layer)",
-                scope="calibration",
+                "Full input Hessians (one per unique projection input)",
+                scope=(
+                    "recipe"
+                    if self.ternary_threshold_ratio is not None
+                    else "calibration"
+                ),
             )
         ]
 
+    def _missing_stat_sources(self) -> list[str]:
+        """Return unique Hessian sources that are absent from the cache."""
+        sources = dict.fromkeys(self._stat_source_by_target.values())
+        return [name for name in sources if not self._cache.has("hessian", name)]
+
     def declare_statistics(self) -> list[StatisticRequest]:
-        """Return one Hessian request per target module.
+        """Return one Hessian request per unique target input.
 
         Returns an empty list when all hessians are already in cache, causing
         the pipeline to skip the calibration forward pass entirely.
         """
-        cache = self._cache
-        if all(cache.has("hessian", name) for name in self._target_modules):
+        sources = list(dict.fromkeys(self._stat_source_by_target.values()))
+        missing = self._missing_stat_sources()
+        if not missing:
             LOGGER.info(
                 "GPTQEstimator: all %d hessians in cache - skipping calibration.",
-                len(self._target_modules),
+                len(sources),
             )
             return []
         return [
-            StatisticRequest(target_key=name, stat_type="hessian")
-            for name in self._target_modules
+            StatisticRequest(target_key=name, stat_type="hessian") for name in missing
         ]
+
+    def configure_statistics_registry(self, registry: StatisticsRegistry) -> None:
+        """Use disk-backed collectors so full-model Hessians do not fill RAM."""
+        if not self.offload_hessians:
+            return
+        for source in self._missing_stat_sources():
+            request = StatisticRequest(target_key=source, stat_type="hessian")
+            registry.register_collector(
+                request,
+                HessianAccumulator(
+                    name=source,
+                    device=torch.device("cpu"),
+                    offload_intermediate_tensor_on_disk=True,
+                ),
+            )
 
     def estimate(
         self,
@@ -285,82 +360,190 @@ class GPTQEstimator(QuantizationParamEstimator):
         assignments: dict[str, Any] = {}
         cache = self._cache
         spans = self._spans
+        saved_sources: set[str] = set()
+
+        # NeuroPress owns traversal policy while torch-to-nnef owns tensor
+        # residency. Cached in-memory Hessians keep their existing path.
+        residency_pool = None
+        offloaded_type: type | tuple[type, ...] = ()
+        if self.offload_hessians:
+            from torch_to_nnef.tensor import OffloadedTensor
+
+            offloaded_type = OffloadedTensor
+            try:
+                from torch_to_nnef.tensor import TensorResidencyPool
+            except ImportError:
+                LOGGER.warning(
+                    "torch-to-nnef has no TensorResidencyPool; using "
+                    "synchronous Hessian reloads"
+                )
+            else:
+                residency_pool = TensorResidencyPool(max_workers=1)
+
+        target_items = list(self._target_modules.items())
+        last_index_by_source = {
+            self._stat_source_by_target.get(name, name): index
+            for index, (name, _mod) in enumerate(target_items)
+        }
+
+        def _offloaded_hessian(source: str):
+            stat = registry.get(
+                StatisticRequest(target_key=source, stat_type="hessian")
+            )
+            if not isinstance(stat, dict):
+                return None, stat
+            hessian = stat.get("hessian")
+            if isinstance(hessian, offloaded_type):
+                return hessian, stat
+            return None, stat
+
+        def _prefetch_after(index: int, current_source: str) -> None:
+            if residency_pool is None:
+                return
+            seen_sources = {current_source}
+            for later_name, _later_mod in target_items[index + 1 :]:
+                later_source = self._stat_source_by_target.get(later_name, later_name)
+                if later_source in seen_sources:
+                    continue
+                seen_sources.add(later_source)
+                later_hessian, _stat = _offloaded_hessian(later_source)
+                if later_hessian is not None:
+                    residency_pool.prefetch(later_hessian, device=self._device)
+                    return
+
+        if residency_pool is not None:
+            for source in dict.fromkeys(self._stat_source_by_target.values()):
+                first_hessian, _stat = _offloaded_hessian(source)
+                if first_hessian is not None:
+                    residency_pool.prefetch(first_hessian, device=self._device)
+                    break
 
         n_targets = len(self._target_modules)
         prog_ctx = _layer_progress(n_targets) if _RICH else contextlib.nullcontext()
-        with prog_ctx as progress:
-            task_id = (
-                progress.add_task("GPTQ  starting…", total=n_targets) if _RICH else None
-            )
-            for name, mod in self._target_modules.items():
-                raw_weight = mod.weight
-                assert isinstance(raw_weight, torch.Tensor)
-                weight_id = id(raw_weight)
-
-                if _RICH:
-                    progress.update(
-                        task_id,
-                        description=f"GPTQ  [dim]{_re(name)}[/dim]",
-                    )
-
-                if weight_id in ids_seen:
-                    LOGGER.info("Shared weight '%s' already processed - skipping", name)
-                    if _RICH:
-                        progress.advance(task_id)
-                    continue
-                ids_seen.add(weight_id)
-
-                LOGGER.info(
-                    "GPTQ quantizing: %s  shape=%s", name, tuple(raw_weight.shape)
+        residency_ctx = (
+            residency_pool.scope(device=self._device)
+            if residency_pool is not None
+            else contextlib.nullcontext()
+        )
+        try:
+            with residency_ctx, prog_ctx as progress:
+                task_id = (
+                    progress.add_task("GPTQ  starting…", total=n_targets)
+                    if _RICH
+                    else None
                 )
+                for index, (name, mod) in enumerate(target_items):
+                    stat_source = self._stat_source_by_target.get(name, name)
+                    raw_weight = mod.weight
+                    assert isinstance(raw_weight, torch.Tensor)
+                    weight_id = id(raw_weight)
 
-                # Restore hessian from cache when calibration was skipped.
-                cached_h = cache.load("hessian", name)
-                if cached_h is not None:
-                    registry.set_stat(name, "hessian", cached_h)
-
-                try:
-                    with timed_span(spans, "gptq.layer", layer=name):
-                        _gptq_layer(
-                            name,
-                            mod,
-                            registry,
-                            self._device,
-                            group_size=self.group_size,
-                            nbits=self.nbits,
-                            symmetric=self.symmetric,
-                            damp_percent=self.damp_percent,
-                            damp_auto_increment=self.damp_auto_increment,
+                    if _RICH:
+                        progress.update(
+                            task_id,
+                            description=f"GPTQ  [dim]{_re(name)}[/dim]",
                         )
-                except Exception as exc:
-                    LOGGER.error("GPTQ failed for '%s': %s - skipping", name, exc)
+
+                    if weight_id in ids_seen:
+                        LOGGER.info(
+                            "Shared weight '%s' already processed - skipping", name
+                        )
+                        if _RICH:
+                            progress.advance(task_id)
+                        continue
+                    ids_seen.add(weight_id)
+
+                    LOGGER.info(
+                        "GPTQ quantizing: %s  shape=%s",
+                        name,
+                        tuple(raw_weight.shape),
+                    )
+
+                    request = StatisticRequest(
+                        target_key=stat_source, stat_type="hessian"
+                    )
+                    # Restore from cache only when calibration did not already
+                    # populate this source. In particular, do not replace an
+                    # offloaded shared Hessian with the cache file just written
+                    # by an earlier sibling projection.
+                    cache_hit = cache.has("hessian", stat_source)
+                    cached_h = None
+                    if registry.get(request) is None:
+                        cached_h = cache.load("hessian", stat_source)
+                        if cached_h is not None:
+                            registry.set_stat(stat_source, "hessian", cached_h)
+
+                    offloaded_hessian, _stat = _offloaded_hessian(stat_source)
+                    succeeded = False
+                    try:
+                        _prefetch_after(index, stat_source)
+                        try:
+                            with timed_span(spans, "gptq.layer", layer=name):
+                                _gptq_layer(
+                                    name,
+                                    mod,
+                                    registry,
+                                    self._device,
+                                    group_size=self.group_size,
+                                    nbits=self.nbits,
+                                    symmetric=self.symmetric,
+                                    damp_percent=self.damp_percent,
+                                    damp_auto_increment=self.damp_auto_increment,
+                                    ternary_threshold_ratio=(
+                                        self.ternary_threshold_ratio
+                                    ),
+                                    statistic_target=stat_source,
+                                )
+                            succeeded = True
+                        except Exception as exc:
+                            LOGGER.error(
+                                "GPTQ failed for '%s': %s - skipping",
+                                name,
+                                exc,
+                            )
+
+                        # The active residency scope makes cache serialization
+                        # reuse the materialized Hessian without replacing the
+                        # registry's OffloadedTensor.
+                        if (
+                            succeeded
+                            and not cache_hit
+                            and cached_h is None
+                            and stat_source not in saved_sources
+                        ):
+                            current_stat = registry.get(request)
+                            if current_stat is not None:
+                                cache.save("hessian", stat_source, current_stat)
+                                saved_sources.add(stat_source)
+                    finally:
+                        if (
+                            offloaded_hessian is not None
+                            and residency_pool is not None
+                            and last_index_by_source[stat_source] == index
+                        ):
+                            residency_pool.evict(offloaded_hessian)
+
                     if _RICH:
                         progress.advance(task_id)
-                    continue
 
-                # Save hessian to cache for future runs (skip if already cached).
-                if cached_h is None:
-                    stat = registry.get(
-                        StatisticRequest(target_key=name, stat_type="hessian")
-                    )
-                    if stat is not None:
-                        cache.save("hessian", name, stat)
+                    if not succeeded:
+                        continue
 
-                if _RICH:
-                    progress.advance(task_id)
-
-                if self.weight_transform is not None:
-                    if mod.weight.dim() < 2:
-                        LOGGER.warning(
-                            "Skipping weight_transform for '%s': %dD weight %s",
-                            name,
-                            mod.weight.dim(),
-                            tuple(mod.weight.shape),
-                        )
-                    else:
-                        q = self.weight_transform(mod.weight, name)
-                        if q is not None:
-                            assignments[name] = q
+                    if self.weight_transform is not None:
+                        if mod.weight.dim() < 2:
+                            LOGGER.warning(
+                                "Skipping weight_transform for '%s': %dD weight %s",
+                                name,
+                                mod.weight.dim(),
+                                tuple(mod.weight.shape),
+                            )
+                        else:
+                            q = self.weight_transform(mod.weight, name)
+                            if q is not None:
+                                assignments[name] = q
+        finally:
+            if residency_pool is not None:
+                residency_pool.close()
 
         return QuantizationPlan(weight_assignments=assignments)
 
@@ -3080,6 +3263,11 @@ class CompositeEstimator(QuantizationParamEstimator):
                     seen.add(key)
                     requests.append(req)
         return requests
+
+    def configure_statistics_registry(self, registry: StatisticsRegistry) -> None:
+        """Allow each child to install specialised statistic collectors."""
+        for est in self.estimators:
+            est.configure_statistics_registry(registry)
 
     def estimate(
         self,

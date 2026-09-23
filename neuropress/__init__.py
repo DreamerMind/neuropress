@@ -15,6 +15,7 @@ from .estimator_configs import (
     GptqPanelEstimatorConfig,
     HqqEstimatorConfig,
     MinMaxZpWeightEstimatorConfig,
+    TernaryGptqEstimatorConfig,
     WeightTransformEntry,
 )
 from .estimators import (
@@ -36,6 +37,8 @@ from .preprocessing import (
     PreprocessingStepConfig,
     SmoothQuantStep,
     SmoothQuantStepConfig,
+    TernaryHadamardStep,
+    TernaryHadamardStepConfig,
     preprocessing_step_config,
 )
 from .qscheme import (
@@ -45,6 +48,7 @@ from .qscheme import (
     QSchemeDescriptor,
     QSchemeGroup,
     TensorSlice,
+    TernaryScaleScheme,
 )
 from .recipe import CalibrationConfig, QuantizationRecipe
 from .recipe_config import (
@@ -116,6 +120,10 @@ __all__ = [
     "StatisticRequest",
     "StatisticsRegistry",
     "TensorSlice",
+    "TernaryGptqEstimatorConfig",
+    "TernaryHadamardStep",
+    "TernaryHadamardStepConfig",
+    "TernaryScaleScheme",
     "WeightAssignmentAdapter",
     "WeightAssignmentAdapterConfig",
     "WeightTarget",

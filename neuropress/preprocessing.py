@@ -147,6 +147,42 @@ class HadamardRotationStep(PreprocessingStep):
         )
 
 
+@dataclass
+class TernaryHadamardStep(PreprocessingStep):
+    """Apply the blockwise signed-Hadamard basis used by ternary kernels."""
+
+    block_size: int = 1024
+    seed: int = 1234
+    module_suffixes: tuple[str, ...] | None = None
+
+    def apply(self, model: nn.Module, calibration_data: list[dict[str, Any]]) -> None:
+        """Fold signed block-Hadamard transforms into selected linears."""
+        from .transforms.ternary_hadamard import (
+            PRISM_TERNARY_SOURCE_SUFFIXES,
+            apply_ternary_hadamard,
+            is_prism_ternary_source_module,
+        )
+
+        suffixes = (
+            PRISM_TERNARY_SOURCE_SUFFIXES
+            if self.module_suffixes is None
+            else self.module_suffixes
+        )
+
+        def module_filter(name: str, _module: nn.Linear) -> bool:
+            if self.module_suffixes is None:
+                return is_prism_ternary_source_module(name)
+            return name.rsplit(".", 1)[-1] in suffixes
+
+        apply_ternary_hadamard(
+            model,
+            block_size=self.block_size,
+            seed=self.seed,
+            module_filter=module_filter,
+            strict_width=True,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Serialisable config hierarchy (JSON-round-trippable counterparts)
 # ---------------------------------------------------------------------------
@@ -268,6 +304,28 @@ class HadamardRotationStepConfig(PreprocessingStepConfig):
         )
 
 
+@preprocessing_step_config("ternary_hadamard")
+class TernaryHadamardStepConfig(PreprocessingStepConfig):
+    """Serializable config for :class:`TernaryHadamardStep`."""
+
+    type: Literal["ternary_hadamard"] = "ternary_hadamard"
+    block_size: Literal[1024] = 1024
+    seed: int = 1234
+    module_suffixes: list[str] | None = None
+
+    def build(self) -> TernaryHadamardStep:
+        """Build a blockwise ternary Hadamard preprocessing step."""
+        return TernaryHadamardStep(
+            block_size=self.block_size,
+            seed=self.seed,
+            module_suffixes=(
+                tuple(self.module_suffixes)
+                if self.module_suffixes is not None
+                else None
+            ),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Runtime registry (step class lookup by name)
 # ---------------------------------------------------------------------------
@@ -276,4 +334,5 @@ PREPROCESSING_REGISTRY: dict[str, type[PreprocessingStep]] = {
     "smooth_quant": SmoothQuantStep,
     "hadamard_rotation": HadamardRotationStep,
     "down_proj_smooth": DownProjSmoothStep,
+    "ternary_hadamard": TernaryHadamardStep,
 }

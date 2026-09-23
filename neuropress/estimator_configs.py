@@ -11,6 +11,7 @@ The ``target`` field accepts a module class name (``"linear"``, ``"conv2d"``,
 Available estimator types:
 
 * ``"gptq"`` → :class:`.GPTQEstimator`
+* ``"ternary_gptq"`` → strict ternary :class:`.GPTQEstimator`
 * ``"gptq_panel"`` → :class:`.GPTQPanelEstimator`
 * ``"hqq"`` → :class:`.HQQEstimator`
 * ``"min_max_zp_weight"`` → :class:`.MinMaxZpWeightEstimator`
@@ -90,6 +91,11 @@ def _resolve_module_class(target: str) -> type[nn.Module]:
             f"Unknown target module {target!r}. Available: {sorted(_MODULE_CLASS_MAP)}"
         )
     return mod_cls
+
+
+def _ternary_wrapped_linear_filter(_name: str, module: nn.Module) -> bool:
+    """Select only linears installed inside ternary Hadamard wrappers."""
+    return getattr(module, "_neuropress_ternary_wrapped", False) is True
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +213,35 @@ class GptqEstimatorConfig(EstimatorConfig):
             symmetric=self.symmetric,
             damp_percent=self.damp_percent,
             damp_auto_increment=self.damp_auto_increment,
+        )
+
+
+@estimator_config("ternary_gptq")
+class TernaryGptqEstimatorConfig(EstimatorConfig):
+    """Bonsai-style strict ternary GPTQ with per-group scales."""
+
+    type: Literal["ternary_gptq"] = "ternary_gptq"
+    target: Literal["linear"] = "linear"
+    group_size: Literal[128] = 128
+    threshold_ratio: float = 0.4
+    damp_percent: float = 0.01
+    damp_auto_increment: float = 0.0025
+
+    def build(self) -> GPTQEstimator:
+        """Build a strict ternary GPTQ estimator."""
+        if not 0.0 < self.threshold_ratio <= 1.0:
+            raise ValueError("threshold_ratio must be in (0, 1]")
+        return GPTQEstimator(
+            module_classes=(_resolve_module_class(self.target),),
+            filter_fn=_ternary_wrapped_linear_filter,
+            group_size=self.group_size,
+            nbits=2,
+            symmetric=True,
+            damp_percent=self.damp_percent,
+            damp_auto_increment=self.damp_auto_increment,
+            ternary_threshold_ratio=self.threshold_ratio,
+            share_hessians=True,
+            offload_hessians=True,
         )
 
 
