@@ -30,7 +30,7 @@ RUN_INTEGRATION=1 uv run pytest tests/integration/ -v
 
 2. **Targets** – `WeightTarget` (`module_id/param_name`) and `ActivationTarget` (`value_id`) identify what to quantize.
 
-3. **StatisticsRegistry** – `QuantizationParamEstimator.declare_statistics()` returns `StatisticRequest` objects. The registry deduplicates them (key = `target_key::stat_type`), installs hooks, runs a forward pass over calibration data, and stores results. Supported stat types: `"min_max"` and `"hessian"`.
+3. **StatisticsRegistry** – `QuantizationParamEstimator.declare_statistics()` returns `StatisticRequest` objects. The registry deduplicates them (key = `target_key::stat_type`), installs hooks, runs a forward pass over calibration data, and stores results. Supported stat types: `"min_max"` and `"hessian"`. An estimator may instead take over steps 2-4 through `calibrate_sequential()` (see `methods/sequential.py`): the ternary GPTQ estimator quantizes decoder blocks in order on activations propagated through the already-quantized prefix.
 
 4. **QuantizationRecipe** – ties together `allowed_weight_qschemes`, `allowed_activation_qschemes`, a `QuantizationParamEstimator`, and a `ModuleQuantizationAdapter`.
 

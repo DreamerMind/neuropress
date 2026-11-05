@@ -199,8 +199,23 @@ in `config.json`. Code `3` is reserved and never emitted. Install the vLLM
 plugin before serving the result. The exporter deliberately refuses ordinary
 2-bit affine weights; its input must already be strict ternary after GPTQ.
 The `0.4` threshold is an empirical Bonsai-format match, not a published Prism
-hyperparameter; use `0.5` for conventional nearest-level ternary rounding and
-sweep this value against perplexity for a new architecture.
+hyperparameter. By default the estimator also searches `threshold_grid`
+(`0.3` to `0.6`) for every group and keeps the ratio with the lowest
+Hessian-weighted error; pass `"threshold_grid": []` to use `threshold_ratio`
+alone.
+
+Calibration is block-sequential by default (`"sequential": true`): decoder
+blocks are quantized in order, each Hessian is collected after the
+projections that run before it have been quantized, and the quantized block's
+outputs feed the next block. Set `"sequential": false` to collect every
+Hessian from the unquantized model in a single global pass.
+
+`ternary_hadamard` leaves the modules in `dense_modules` (default
+`["lm_head"]`) unwrapped. The exporter keeps them in the checkpoint's dense
+weights and lists them under `quantization_config.dense_modules`; the vLLM
+plugin must honor that key to load them as ordinary linears. When `lm_head`
+is made ternary on a model with tied embeddings, the Hadamard fold unties it
+and the exported config sets `tie_word_embeddings` to `false`.
 
 The current exporter is intentionally text-only: it omits the vision tower to
 match the plugin's verified serving path. Start vLLM with
@@ -208,12 +223,13 @@ match the plugin's verified serving path. Start vLLM with
 plugin's visual-layer selection and a complete image request have been tested
 end to end.
 
-For large models, the ternary recipe shares Hessians between sibling
-projections with identical inputs and offloads each unique Hessian between
-calibration updates. This bounds resident memory, but quantizing a 27B-class
-model still requires substantial temporary disk space (roughly the sum of the
-unique FP32 Hessian sizes). Point the system temporary directory at a volume
-with enough free space. Export is transactional and packs weights in row
+The ternary recipe shares Hessians between sibling projections with
+identical inputs. Sequential calibration keeps only one block's Hessians
+resident. For the global pass on large models, `"offload_hessians": true`
+offloads each unique Hessian between calibration updates. This bounds
+resident memory at the cost of heavy disk traffic and temporary disk space
+(roughly the sum of the unique FP32 Hessian sizes); point the system
+temporary directory at a volume with enough free space. Export is transactional and packs weights in row
 chunks, so a failed validation does not leave a partial checkpoint.
 
 The asynchronous Hessian prefetch path uses the scoped residency API merged in
