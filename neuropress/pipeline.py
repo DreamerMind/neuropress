@@ -98,28 +98,34 @@ class QuantizationPipeline:
         # statistics (e.g. GPTQEstimator.prepare discovers target modules).
         if hasattr(estimator, "prepare"):
             estimator.prepare(model)
-        requests = estimator.declare_statistics()
-        registry = StatisticsRegistry()
-        registry.register_requests(requests)
-        estimator.configure_statistics_registry(registry)
-
-        # -- Step 4: Global calibration (single lazy pass) -----------------
-        LOGGER.info("Step 4: Running global calibration")
-        cal = self.recipe.calibration
-        total_batches = math.ceil(cal.n_samples / cal.batch_size)
-        if _RICH:
-            calibration_iter = _rich_track(
-                calibration_iter,
-                description=(
-                    f"[cyan]Hessians[/cyan]  "
-                    f"{cal.n_samples} samples / batch {cal.batch_size}"
-                ),
-                total=total_batches,
-            )
-        if requests:
-            registry.collect(model, calibration_iter)
+        if estimator.calibrate_sequential(model, calibration_iter):
+            LOGGER.info("Steps 2-4: estimator calibrated sequentially")
+            registry = StatisticsRegistry()
         else:
-            LOGGER.info("Step 4: No statistics requested; skipping calibration pass")
+            requests = estimator.declare_statistics()
+            registry = StatisticsRegistry()
+            registry.register_requests(requests)
+            estimator.configure_statistics_registry(registry)
+
+            # -- Step 4: Global calibration (single lazy pass) -------------
+            LOGGER.info("Step 4: Running global calibration")
+            cal = self.recipe.calibration
+            total_batches = math.ceil(cal.n_samples / cal.batch_size)
+            if _RICH:
+                calibration_iter = _rich_track(
+                    calibration_iter,
+                    description=(
+                        f"[cyan]Hessians[/cyan]  "
+                        f"{cal.n_samples} samples / batch {cal.batch_size}"
+                    ),
+                    total=total_batches,
+                )
+            if requests:
+                registry.collect(model, calibration_iter)
+            else:
+                LOGGER.info(
+                    "Step 4: No statistics requested; skipping calibration pass"
+                )
 
         # -- Step 5: Estimate QSchemes -------------------------------------
         LOGGER.info("Step 5: Estimating QSchemes")

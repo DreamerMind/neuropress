@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any
 
 from torch import nn
 
@@ -97,6 +98,17 @@ class QuantizationParamEstimator(ABC):
         disk-backed Hessian accumulator.
         """
         return None
+
+    def calibrate_sequential(
+        self, model: nn.Module, calibration_data: Iterable[Any]
+    ) -> bool:
+        """Optionally calibrate *model* layer by layer instead of globally.
+
+        Return ``True`` when this estimator consumed *calibration_data* and
+        needs no statistics from the pipeline's single global pass; the
+        pipeline then skips steps 2-4. The default returns ``False``.
+        """
+        return False
 
     @abstractmethod
     def declare_statistics(self) -> list[StatisticRequest]:
