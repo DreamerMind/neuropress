@@ -375,6 +375,10 @@ class GPTQCalibration(CalibrationMethodOnActivation[T_SUPPORTED_QSCHEMES]):
         if hessian is not None and not isinstance(hessian, torch.Tensor):
             hessian = hessian.to_base_tensor()
         assert hessian is not None
+        # Cache hits and the CPU-accumulation fallback can leave the Hessian
+        # on a different device than the weight being quantized.
+        if hessian.device != w.device:
+            hessian = hessian.to(device=w.device)
         # Free the stored hessian to reclaim memory.
         self.hessian = None
         if self._hessian_accumulator is not None:
