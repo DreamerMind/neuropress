@@ -284,6 +284,18 @@ class GPTQCalibration(CalibrationMethodOnActivation[T_SUPPORTED_QSCHEMES]):
             qschemes.append(q.compute_qscheme())
         return qschemes
 
+    def _configure_group_quantizer(
+        self,
+        quantizer: ZpScaleCalibration,
+        q_data: QProcessingData,
+        columns: torch.Tensor,
+    ) -> None:
+        """Hook: condition a fresh group quantizer on its (permuted) columns.
+
+        Called after ``quantizer.init()`` and before ``quantizer.update`` for
+        dynamically computed groups. The default does nothing.
+        """
+
     def _pick_group_qscheme(
         self,
         current_qscheme: ZpScaleScheme | None,
@@ -311,6 +323,7 @@ class GPTQCalibration(CalibrationMethodOnActivation[T_SUPPORTED_QSCHEMES]):
             ]
             q = copy.deepcopy(self.select_quantizer_for_group(g_idx))
             q.init()
+            self._configure_group_quantizer(q, q_data, inv_indices)
             q.update(q_data.full_float_corr_weights[:, inv_indices])
             scheme = q.compute_qscheme()
             q_data.qschemes[g_idx] = scheme
@@ -321,6 +334,15 @@ class GPTQCalibration(CalibrationMethodOnActivation[T_SUPPORTED_QSCHEMES]):
             g_idx = col_idx // self.group_size
             q = copy.deepcopy(self.select_quantizer_for_group(g_idx))
             q.init()
+            self._configure_group_quantizer(
+                q,
+                q_data,
+                torch.arange(
+                    col_idx,
+                    min(col_idx + self.group_size, self.columns),
+                    device=q_data.inv_hessian_chol_upper.device,
+                ),
+            )
             q.update(
                 q_data.full_float_corr_weights[:, col_idx : col_idx + self.group_size]
             )

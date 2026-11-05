@@ -2,13 +2,20 @@
 
 import json
 
+import pytest
 import torch
 from safetensors import safe_open
 from torch import nn
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from neuropress.formats.prism_ternary import export_prism_ternary_checkpoint
+from neuropress.estimator_configs import TernaryGptqEstimatorConfig
+from neuropress.formats.prism_ternary import (
+    export_prism_ternary_checkpoint,
+    pack_ternary_weight,
+)
+from neuropress.methods.ternary import TernaryGPTQCalibration, TernaryScaleCalibration
 from neuropress.preprocessing import TernaryHadamardStep
+from neuropress.qscheme import Granularity, TernaryScaleScheme
 from neuropress.transforms.ternary_hadamard import TernaryHadamardInputLinear
 
 
@@ -99,3 +106,66 @@ def test_dense_lm_head_keeps_tie():
 
     assert model.config.tie_word_embeddings is True
     assert model.lm_head.weight is model.model.embed_tokens.weight
+
+
+GRID = (0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6)
+
+
+def _weighted_error(data, scheme, weights):
+    restored = scheme.dequantize(scheme.quantize_as_u8(data), data.dtype)
+    return ((data - restored).square() * weights).sum()
+
+
+def test_grid_fit_never_scores_worse_than_fixed_threshold():
+    torch.manual_seed(3)
+    data = torch.randn(64, 128) * torch.linspace(0.2, 3.0, 128)
+    weights = torch.rand(128) + 0.1
+    granularity = Granularity.per_group([128])
+
+    def fit(grid):
+        quantizer = TernaryScaleCalibration(
+            granularity=granularity, threshold_ratio=0.4, threshold_grid=grid
+        )
+        quantizer.init()
+        quantizer.column_weights = weights
+        quantizer.update(data)
+        return quantizer.compute_qscheme()
+
+    fixed, searched = fit(()), fit(GRID)
+
+    assert isinstance(searched, TernaryScaleScheme)
+    assert _weighted_error(data, searched, weights) <= _weighted_error(
+        data, fixed, weights
+    )
+    assert searched.threshold_ratio.unique().numel() > 1
+
+
+def test_grid_ternary_gptq_output_is_strict_and_exportable():
+    torch.manual_seed(4)
+    granularity = Granularity.per_group([128])
+    module = nn.Linear(256, 64, bias=False)
+    calibration = TernaryGPTQCalibration(
+        granularity=granularity,
+        possible_quantizers=[
+            TernaryScaleCalibration(
+                granularity=granularity, threshold_ratio=0.4, threshold_grid=GRID
+            )
+        ],
+    )
+    calibration.weight_tensor = module.weight
+    calibration.module_class = nn.Linear
+    calibration.module = module
+    calibration.name = "q_proj.linear"
+    calibration.init()
+    calibration.update_statistics(torch.randn(512, 256))
+
+    weights, scheme, *_ = calibration.compute_quantization()
+    restored = scheme.dequantize(scheme.quantize_as_u8(weights), weights.dtype)
+
+    torch.testing.assert_close(restored, weights)
+    pack_ternary_weight(weights, group_size=128)
+
+
+def test_config_rejects_invalid_threshold_grid():
+    with pytest.raises(ValueError, match="threshold_grid"):
+        TernaryGptqEstimatorConfig(threshold_grid=[0.0, 0.5]).build()

@@ -18,9 +18,10 @@ class TernaryScaleScheme(ZpScaleScheme):
         scale: torch.Tensor,
         calibration_data_shape: list[int],
         qscheme_data_shape: list[int],
-        threshold_ratio: float = 0.5,
+        threshold_ratio: float | torch.Tensor = 0.5,
     ) -> None:
-        if not 0.0 < threshold_ratio <= 1.0:
+        ratio = torch.as_tensor(threshold_ratio)
+        if not bool(((ratio > 0.0) & (ratio <= 1.0)).all()):
             raise ValueError("threshold_ratio must be in (0, 1]")
         super().__init__(
             zero_point=torch.ones_like(scale, dtype=torch.int32),
@@ -29,6 +30,8 @@ class TernaryScaleScheme(ZpScaleScheme):
             calibration_data_shape=calibration_data_shape,
             qscheme_data_shape=qscheme_data_shape,
         )
+        # A float applies to every group; a tensor shaped like ``scale``
+        # carries one threshold per group.
         self.threshold_ratio = threshold_ratio
 
     @property
@@ -46,7 +49,10 @@ class TernaryScaleScheme(ZpScaleScheme):
             view_shape = list(fp_tensor.shape) + [1] * extra
             data = fp_tensor.view(view_shape).to(self.scale.dtype)
 
-        threshold = self.scale * self.threshold_ratio
+        ratio = torch.as_tensor(
+            self.threshold_ratio, dtype=self.scale.dtype, device=self.scale.device
+        )
+        threshold = self.scale * ratio
         codes = torch.ones_like(data, dtype=torch.uint8)
         codes = torch.where(data >= threshold, torch.full_like(codes, 2), codes)
         codes = torch.where(data <= -threshold, torch.zeros_like(codes), codes)

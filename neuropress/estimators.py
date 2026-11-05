@@ -122,6 +122,7 @@ def _gptq_layer(
     damp_percent: float,
     damp_auto_increment: float,
     ternary_threshold_ratio: float | None = None,
+    ternary_threshold_grid: tuple[float, ...] = (),
     statistic_target: str | None = None,
 ) -> None:
     """Apply GPTQ to *mod*, updating its weight in-place to dequantized floats.
@@ -141,6 +142,8 @@ def _gptq_layer(
         damp_auto_increment: Dampening increment on Cholesky failure.
         ternary_threshold_ratio: Enable strict ternary quantization with this
             zero/non-zero threshold, or use affine quantization when ``None``.
+        ternary_threshold_grid: Candidate threshold ratios searched per group
+            with Hessian weighting; empty uses the fixed ratio.
         statistic_target: Registry key to inject when a sibling layer owns the
             shared Hessian; defaults to *name*.
     """
@@ -168,6 +171,7 @@ def _gptq_layer(
                 TernaryScaleCalibration(
                     granularity=gran,
                     threshold_ratio=ternary_threshold_ratio,
+                    threshold_grid=ternary_threshold_grid,
                 )
             ],
             damp_percent=damp_percent,
@@ -218,6 +222,8 @@ class GPTQEstimator(QuantizationParamEstimator):
         share_hessians: Reuse statistics for known sibling projections that
             consume the same input tensor.
         offload_hessians: Keep full Hessians disk-backed between updates.
+        ternary_threshold_grid: Threshold ratios searched per ternary group
+            with inverse-Hessian column weights; empty keeps the fixed ratio.
     """
 
     module_classes: tuple[type[nn.Module], ...] = field(default=(nn.Linear,))
@@ -229,6 +235,7 @@ class GPTQEstimator(QuantizationParamEstimator):
     damp_percent: float = 0.01
     damp_auto_increment: float = 0.0025
     ternary_threshold_ratio: float | None = None
+    ternary_threshold_grid: tuple[float, ...] = ()
     share_hessians: bool = False
     offload_hessians: bool = False
 
@@ -492,6 +499,9 @@ class GPTQEstimator(QuantizationParamEstimator):
                                     damp_auto_increment=self.damp_auto_increment,
                                     ternary_threshold_ratio=(
                                         self.ternary_threshold_ratio
+                                    ),
+                                    ternary_threshold_grid=(
+                                        self.ternary_threshold_grid
                                     ),
                                     statistic_target=stat_source,
                                 )
