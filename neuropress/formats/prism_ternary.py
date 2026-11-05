@@ -6,6 +6,7 @@ import base64
 import json
 import shutil
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -14,8 +15,10 @@ from safetensors.torch import save_file
 from torch import nn
 
 from ..transforms.ternary_hadamard import (
+    DENSE_MODULES_ATTR,
     TernaryHadamardInputLinear,
     is_prism_ternary_source_module,
+    matches_module_list,
 )
 
 PRISM_TERNARY_METHOD = "prism_ternary"
@@ -139,6 +142,7 @@ def export_prism_ternary_checkpoint(
     hadamard_block: int = DEFAULT_HADAMARD_BLOCK,
     max_shard_bytes: int = 5 * 1024**3,
     packing_row_chunk_size: int = 256,
+    dense_modules: Sequence[str] | None = None,
 ) -> Path:
     """Write a text-only Hugging Face checkpoint consumable by ``bonsai-vllm``.
 
@@ -147,6 +151,10 @@ def export_prism_ternary_checkpoint(
     current plugin contract is only verified with vLLM's
     ``--language-model-only`` mode. Existing checkpoint files are never
     replaced.
+
+    ``dense_modules`` defaults to the list recorded by ``TernaryHadamardStep``;
+    listed modules are written unquantized and named in
+    ``quantization_config.dense_modules``.
     """
     destination = Path(output_dir)
     if group_size != DEFAULT_GROUP_SIZE or hadamard_block != DEFAULT_HADAMARD_BLOCK:
@@ -160,6 +168,11 @@ def export_prism_ternary_checkpoint(
         raise ValueError("max_shard_bytes must be positive")
     if packing_row_chunk_size <= 0:
         raise ValueError("packing_row_chunk_size must be positive")
+    dense = tuple(
+        getattr(model, DENSE_MODULES_ATTR, ())
+        if dense_modules is None
+        else dense_modules
+    )
 
     config, source_dir = _load_config(base_config)
     if source_dir is not None and source_dir.resolve() == destination.resolve():
@@ -183,7 +196,9 @@ def export_prism_ternary_checkpoint(
     unwrapped_targets = [
         name
         for name, module in model.named_modules()
-        if isinstance(module, nn.Linear) and is_prism_ternary_source_module(name)
+        if isinstance(module, nn.Linear)
+        and is_prism_ternary_source_module(name)
+        and not matches_module_list(name, dense)
     ]
     if unwrapped_targets:
         raise ValueError(
@@ -289,7 +304,7 @@ def export_prism_ternary_checkpoint(
                 json.dumps(index, indent=2) + "\n"
             )
 
-        config["quantization_config"] = {
+        quantization_config: dict[str, Any] = {
             "quant_method": PRISM_TERNARY_METHOD,
             "bits": 2,
             "group_size": group_size,
@@ -299,6 +314,15 @@ def export_prism_ternary_checkpoint(
                 for width, signs in sorted(signs_by_width.items())
             },
         }
+        if dense:
+            quantization_config["dense_modules"] = sorted(dense)
+        config["quantization_config"] = quantization_config
+        if any(name == "lm_head" or name.endswith(".lm_head") for name in wrappers):
+            # A ternary lm_head is a separate tensor from the embedding.
+            config["tie_word_embeddings"] = False
+            text_config = config.get("text_config")
+            if isinstance(text_config, dict):
+                text_config["tie_word_embeddings"] = False
         (staging / "config.json").write_text(json.dumps(config, indent=2) + "\n")
         if source_dir is not None:
             for filename in _AUXILIARY_FILES:

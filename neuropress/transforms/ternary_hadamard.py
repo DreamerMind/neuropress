@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import torch
 from torch import nn
@@ -32,6 +32,14 @@ def is_prism_ternary_source_module(name: str) -> bool:
         and "mtp" not in parts
         and "visual" not in parts
     )
+
+
+DENSE_MODULES_ATTR = "_neuropress_ternary_dense_modules"
+
+
+def matches_module_list(name: str, patterns: Sequence[str]) -> bool:
+    """Return whether *name* equals or ends with ``.<pattern>`` for a pattern."""
+    return any(name == pattern or name.endswith(f".{pattern}") for pattern in patterns)
 
 
 def block_hadamard_transform(x: torch.Tensor, block_size: int = 1024) -> torch.Tensor:
