@@ -168,6 +168,12 @@ def test_grid_ternary_gptq_output_is_strict_and_exportable():
     pack_ternary_weight(weights, group_size=128)
 
 
+def test_config_searches_thresholds_by_default():
+    estimator = TernaryGptqEstimatorConfig().build()
+    assert 0.4 in estimator.ternary_threshold_grid
+    assert len(estimator.ternary_threshold_grid) > 1
+
+
 def test_config_rejects_invalid_threshold_grid():
     with pytest.raises(ValueError, match="threshold_grid"):
         TernaryGptqEstimatorConfig(threshold_grid=[0.0, 0.5]).build()

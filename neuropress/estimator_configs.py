@@ -224,7 +224,9 @@ class TernaryGptqEstimatorConfig(EstimatorConfig):
     target: Literal["linear"] = "linear"
     group_size: Literal[128] = 128
     threshold_ratio: float = 0.4
-    threshold_grid: list[float] = Field(default_factory=list)
+    threshold_grid: list[float] = Field(
+        default_factory=lambda: [0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6]
+    )
     damp_percent: float = 0.01
     damp_auto_increment: float = 0.0025
     offload_hessians: bool = False
