@@ -361,6 +361,7 @@ class GPTQEstimator(QuantizationParamEstimator):
         cache = self._cache
         spans = self._spans
         saved_sources: set[str] = set()
+        failures: list[tuple[str, Exception]] = []
 
         # NeuroPress owns traversal policy while torch-to-nnef owns tensor
         # residency. Cached in-memory Hessians keep their existing path.
@@ -496,11 +497,8 @@ class GPTQEstimator(QuantizationParamEstimator):
                                 )
                             succeeded = True
                         except Exception as exc:
-                            LOGGER.error(
-                                "GPTQ failed for '%s': %s - skipping",
-                                name,
-                                exc,
-                            )
+                            LOGGER.error("GPTQ failed for '%s': %s", name, exc)
+                            failures.append((name, exc))
 
                         # The active residency scope makes cache serialization
                         # reuse the materialized Hessian without replacing the
@@ -545,6 +543,13 @@ class GPTQEstimator(QuantizationParamEstimator):
             if residency_pool is not None:
                 residency_pool.close()
 
+        if failures:
+            first = ", ".join(name for name, _exc in failures[:3])
+            raise RuntimeError(
+                f"GPTQ failed for {len(failures)}/{n_targets} modules "
+                f"(first: {first}); refusing to return a partially "
+                "quantized model"
+            ) from failures[0][1]
         return QuantizationPlan(weight_assignments=assignments)
 
 

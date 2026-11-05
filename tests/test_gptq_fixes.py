@@ -4,6 +4,8 @@ import pytest
 import torch
 from torch import nn
 
+from neuropress.calibration.probe import StatisticsRegistry
+from neuropress.estimators import GPTQEstimator
 from neuropress.methods.gptq import GPTQCalibration
 from neuropress.methods.zp_scale_calib import NormZpScaleCalibration
 from neuropress.qscheme import Granularity
@@ -33,3 +35,13 @@ def test_gptq_accepts_hessian_on_another_device():
 
     assert module.weight.device.type == "cuda"
     assert torch.isfinite(module.weight).all()
+
+
+def test_gptq_estimator_raises_when_a_layer_fails():
+    model = nn.Sequential(nn.Linear(64, 32, bias=False))
+    estimator = GPTQEstimator(group_size=32, nbits=4)
+    estimator.prepare(model)
+
+    # No Hessian was collected, so GPTQ fails for the only target.
+    with pytest.raises(RuntimeError, match="GPTQ failed for 1/1 modules"):
+        estimator.estimate(None, StatisticsRegistry(), None)
