@@ -6,7 +6,7 @@ import contextlib
 import logging
 import math
 import operator
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from functools import reduce
 from typing import Any
@@ -224,6 +224,9 @@ class GPTQEstimator(QuantizationParamEstimator):
         offload_hessians: Keep full Hessians disk-backed between updates.
         ternary_threshold_grid: Threshold ratios searched per ternary group
             with inverse-Hessian column weights; empty keeps the fixed ratio.
+        sequential: Quantize decoder blocks in order on inputs propagated
+            through already quantized blocks, when the pipeline offers
+            :meth:`calibrate_sequential`.
     """
 
     module_classes: tuple[type[nn.Module], ...] = field(default=(nn.Linear,))
@@ -238,6 +241,8 @@ class GPTQEstimator(QuantizationParamEstimator):
     ternary_threshold_grid: tuple[float, ...] = ()
     share_hessians: bool = False
     offload_hessians: bool = False
+    sequential: bool = False
+    _sequential_done: bool = field(default=False, init=False, repr=False, compare=False)
 
     # Set by prepare() - not part of the public construction interface.
     _target_modules: dict[str, nn.Module] = field(
@@ -277,6 +282,7 @@ class GPTQEstimator(QuantizationParamEstimator):
             model, self.module_classes, self.filter_fn
         )
         self._stat_source_by_target = {}
+        self._sequential_done = False
         shared_sources: dict[str, str] = {}
         for name in self._target_modules:
             key = self._shared_input_key(name) if self.share_hessians else name
@@ -340,6 +346,57 @@ class GPTQEstimator(QuantizationParamEstimator):
                 ),
             )
 
+    def calibrate_sequential(
+        self, model: nn.Module, calibration_data: Iterable[Any]
+    ) -> bool:
+        """Quantize block by block when ``sequential`` is enabled."""
+        if not self.sequential:
+            return False
+        from .methods.sequential import quantize_blocks_sequentially
+
+        def _quantize(name: str, module: nn.Module, stat: dict[str, Any]) -> None:
+            registry = StatisticsRegistry()
+            registry.set_stat(
+                name,
+                "hessian",
+                {"hessian": stat["hessian"].clone(), "nsamples": stat["nsamples"]},
+            )
+            with timed_span(self._spans, "gptq.layer", layer=name):
+                _gptq_layer(
+                    name,
+                    module,
+                    registry,
+                    self._device,
+                    group_size=self.group_size,
+                    nbits=self.nbits,
+                    symmetric=self.symmetric,
+                    damp_percent=self.damp_percent,
+                    damp_auto_increment=self.damp_auto_increment,
+                    ternary_threshold_ratio=self.ternary_threshold_ratio,
+                    ternary_threshold_grid=self.ternary_threshold_grid,
+                )
+
+        quantize_blocks_sequentially(
+            model,
+            list(calibration_data),
+            self._target_modules,
+            self._stat_source_by_target,
+            _quantize,
+        )
+        self._sequential_done = True
+        return True
+
+    def _weight_transform_plan(self) -> QuantizationPlan:
+        """Build the plan from weights that were already quantized in place."""
+        assignments: dict[str, Any] = {}
+        if self.weight_transform is not None:
+            for name, mod in self._target_modules.items():
+                if mod.weight.dim() >= 2:
+                    q = self.weight_transform(mod.weight, name)
+                    if q is not None:
+                        assignments[name] = q
+        return QuantizationPlan(weight_assignments=assignments)
+
     def estimate(
         self,
         graph: QGraph,
@@ -363,6 +420,8 @@ class GPTQEstimator(QuantizationParamEstimator):
             each successfully processed layer, or an empty plan when
             *weight_transform* is *None*.
         """
+        if self._sequential_done:
+            return self._weight_transform_plan()
         ids_seen: set[int] = set()
         assignments: dict[str, Any] = {}
         cache = self._cache

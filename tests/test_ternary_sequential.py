@@ -9,10 +9,12 @@ from torch import nn
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from neuropress.estimator_configs import TernaryGptqEstimatorConfig
+from neuropress.estimators import GPTQEstimator
 from neuropress.formats.prism_ternary import (
     export_prism_ternary_checkpoint,
     pack_ternary_weight,
 )
+from neuropress.methods.sequential import quantize_blocks_sequentially
 from neuropress.methods.ternary import TernaryGPTQCalibration, TernaryScaleCalibration
 from neuropress.preprocessing import TernaryHadamardStep
 from neuropress.qscheme import Granularity, TernaryScaleScheme
@@ -169,3 +171,83 @@ def test_grid_ternary_gptq_output_is_strict_and_exportable():
 def test_config_rejects_invalid_threshold_grid():
     with pytest.raises(ValueError, match="threshold_grid"):
         TernaryGptqEstimatorConfig(threshold_grid=[0.0, 0.5]).build()
+
+
+def _input_hessians(model, names, batches):
+    """2/n * sum(x x^T) of each named module's input over a plain forward."""
+    sums, counts, hooks = {}, {}, []
+    modules = dict(model.named_modules())
+
+    def make_hook(name):
+        def hook(_module, inputs, _output):
+            x = inputs[0].reshape(-1, inputs[0].shape[-1]).float()
+            sums[name] = sums.get(name, 0) + x.T @ x
+            counts[name] = counts.get(name, 0) + x.shape[0]
+
+        return hook
+
+    for name in names:
+        hooks.append(modules[name].register_forward_hook(make_hook(name)))
+    with torch.inference_mode():
+        for batch in batches:
+            model(**batch)
+    for hook in hooks:
+        hook.remove()
+    return {name: 2.0 * sums[name] / counts[name] for name in names}
+
+
+@pytest.mark.parametrize("modify", [False, True])
+def test_sequential_hessians_see_the_quantized_prefix(modify):
+    model = _tiny_llama()
+    TernaryHadamardStep(dense_modules=()).apply(model, [])
+    estimator = TernaryGptqEstimatorConfig().build()
+    estimator.prepare(model)
+    batches = _batches()
+    recorded = {}
+
+    def quantize(name, module, stat):
+        recorded[name] = stat["hessian"].clone()
+        if modify:
+            module.weight.mul_(0.5)
+
+    quantize_blocks_sequentially(
+        model,
+        batches,
+        estimator._target_modules,
+        estimator._stat_source_by_target,
+        quantize,
+    )
+
+    sources = {estimator._stat_source_by_target[name] for name in recorded}
+    expected = _input_hessians(model, sorted(sources), batches)
+    assert set(recorded) == set(estimator._target_modules)
+    for name, hessian in recorded.items():
+        torch.testing.assert_close(
+            hessian,
+            expected[estimator._stat_source_by_target[name]],
+            rtol=1e-4,
+            atol=1e-5,
+        )
+
+
+def test_sequential_estimator_quantizes_every_wrapped_linear():
+    model = _tiny_llama()
+    lm_head = model.lm_head.weight.detach().clone()
+    TernaryHadamardStep().apply(model, [])
+    estimator = TernaryGptqEstimatorConfig().build()
+    estimator.prepare(model)
+
+    assert estimator.calibrate_sequential(model, iter(_batches())) is True
+    plan = estimator.estimate(None, None, None)
+
+    assert plan.weight_assignments == {}
+    for module in estimator._target_modules.values():
+        pack_ternary_weight(module.weight, group_size=128)
+    torch.testing.assert_close(model.lm_head.weight, lm_head)
+
+
+def test_non_sequential_gptq_declines_sequential_calibration():
+    estimator = GPTQEstimator(group_size=32, nbits=4)
+    estimator.prepare(nn.Sequential(nn.Linear(64, 32)))
+
+    assert estimator.calibrate_sequential(nn.Sequential(), iter([])) is False
