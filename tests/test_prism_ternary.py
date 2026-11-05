@@ -279,7 +279,7 @@ def test_ternary_estimator_shares_and_offloads_hessians(tmp_path, monkeypatch):
 
     model = Layer()
     apply_ternary_hadamard(model, block_size=8)
-    estimator = TernaryGptqEstimatorConfig().build()
+    estimator = TernaryGptqEstimatorConfig(offload_hessians=True).build()
     scopes = {stage.name: stage.scope for stage in estimator.cache_stages()}
     estimator.set_cache(DiskCacheManager(tmp_path / "cache", "cal", "recipe", scopes))
     estimator.prepare(model)
@@ -350,7 +350,7 @@ def test_partial_disk_cache_collects_only_missing_hessians(tmp_path, monkeypatch
 
     model = Model()
     apply_ternary_hadamard(model, block_size=8)
-    estimator = TernaryGptqEstimatorConfig().build()
+    estimator = TernaryGptqEstimatorConfig(offload_hessians=True).build()
     scopes = {stage.name: stage.scope for stage in estimator.cache_stages()}
     assert scopes == {"hessian": "recipe"}
     cache = DiskCacheManager(tmp_path / "cache", "cal", "recipe", scopes)
@@ -399,7 +399,7 @@ def test_partial_disk_cache_collects_only_missing_hessians(tmp_path, monkeypatch
     assert newly_cached["hessian"].shape == (16, 16)
     assert newly_cached["nsamples"] == 1
     assert isinstance(newly_cached["nsamples"], int)
-    cached_estimator = TernaryGptqEstimatorConfig().build()
+    cached_estimator = TernaryGptqEstimatorConfig(offload_hessians=True).build()
     cached_estimator.set_cache(cache)
     cached_estimator.prepare(model)
     assert cached_estimator.declare_statistics() == []
@@ -419,7 +419,7 @@ def test_composite_delegates_disk_backed_hessian_configuration():
 
     model = Model()
     apply_ternary_hadamard(model, block_size=8)
-    child = TernaryGptqEstimatorConfig().build()
+    child = TernaryGptqEstimatorConfig(offload_hessians=True).build()
     estimator = CompositeEstimator([child])
     estimator.prepare(model)
     requests = estimator.declare_statistics()
@@ -559,3 +559,8 @@ def test_export_rejects_output_width_unsupported_by_decode_kernel(tmp_path):
             tmp_path / "export",
             {"architectures": ["TinyModel"]},
         )
+
+
+def test_ternary_config_does_not_offload_hessians_by_default():
+    assert TernaryGptqEstimatorConfig().build().offload_hessians is False
+    assert TernaryGptqEstimatorConfig(offload_hessians=True).build().offload_hessians

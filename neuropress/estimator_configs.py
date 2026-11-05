@@ -226,6 +226,7 @@ class TernaryGptqEstimatorConfig(EstimatorConfig):
     threshold_ratio: float = 0.4
     damp_percent: float = 0.01
     damp_auto_increment: float = 0.0025
+    offload_hessians: bool = False
 
     def build(self) -> GPTQEstimator:
         """Build a strict ternary GPTQ estimator."""
@@ -241,7 +242,7 @@ class TernaryGptqEstimatorConfig(EstimatorConfig):
             damp_auto_increment=self.damp_auto_increment,
             ternary_threshold_ratio=self.threshold_ratio,
             share_hessians=True,
-            offload_hessians=True,
+            offload_hessians=self.offload_hessians,
         )
 
 
