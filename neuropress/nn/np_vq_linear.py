@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -64,6 +65,16 @@ log = logging.getLogger(__name__)
 # Minimum out_features / num_centroids ratio for AUTO to choose CUDA_LUT.
 # Below this threshold WMMA is preferred (low centroid reuse, small layers).
 _LUT_COV_MIN: float = 4.0
+
+# Above this many tokens (rows of the flattened input) the fused VQ kernels
+# lose to decoding the weight once and running a dense GEMM: they re-decode
+# the codebook per token tile, so their cost grows linearly with M.  Measured
+# on GB10 (Llama-3.1-8B): the crossover sits between 32 and 64 tokens for
+# q/gate/down_proj, and a 16x256-token forward drops from 26.3 s to 1.44 s
+# (bf16: 1.05 s).  Override with the env var.
+_FUSED_MAX_TOKENS: int = int(os.environ.get("NEUROPRESS_VQ_FUSED_MAX_TOKENS", "32"))
+
+_FUSED_BACKENDS = frozenset({VQBackend.CUDA_WMMA, VQBackend.CUDA_LUT, VQBackend.CUDA})
 
 
 def _resolve_vq_backend(
@@ -994,6 +1005,12 @@ class NPVQLinear(nn.Module):
         """
         if self.column_perm is not None:
             x = x[..., self.column_perm]
+        if (
+            self.backend in _FUSED_BACKENDS
+            and x.numel() // self.in_features > _FUSED_MAX_TOKENS
+        ):
+            # Prefill / batched eval: dequant once + GEMM beats the fused kernel.
+            return self._forward_dequant_gemm(x)
         if self.backend == VQBackend.CUDA_ZERO_ESCAPE:
             return self._forward_cuda_zero_escape(x)
         if self.backend == VQBackend.CUDA_NTIER:
@@ -1052,6 +1069,29 @@ class NPVQLinear(nn.Module):
         indices = IndexPacking.unpack(self.packed_indices, self.bits, self.n_vectors)
         w = self.proxy.centroids[indices].reshape(self.out_features, self.in_features)
         return F.linear(x, w.to(x.dtype), self.bias)
+
+    def _forward_dequant_gemm(self, x: torch.Tensor) -> torch.Tensor:
+        """Decode the weight in one kernel pass, then run a cuBLAS GEMM.
+
+        The decoded ``[N, K]`` weight is a temporary: peak extra memory is one
+        layer's dense weight, returned to the allocator after the matmul.
+        Falls back to the compiled gather path if the kernel cannot build.
+        """
+        from .. import kernels
+
+        try:
+            w = kernels.vq_dequant(
+                self.packed_indices,
+                self.proxy.centroids,
+                self.bits,
+                self.out_features,
+                self.in_features,
+                x.dtype,
+            )
+        except RuntimeError as exc:
+            log.warning("vq_dequant unavailable, using compiled gather: %s", exc)
+            return self._forward_compile(x)
+        return F.linear(x, w, self.bias)
 
     def _forward_compile(self, x: torch.Tensor) -> torch.Tensor:
         return _get_compiled_vq()(
