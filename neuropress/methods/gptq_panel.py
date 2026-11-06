@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 import torch
 
 from ..qscheme.descriptor import Granularity, GranularityType
+from ..qscheme.group import PanelSpec, QSchemeGroup, TensorSlice
 from ..qscheme.zp_scale import ZpScaleScheme
 from .gptq import GPTQCalibration, QProcessingData
 from .zp_scale_calib import ZpScaleCalibration
@@ -474,24 +475,13 @@ class GPTQMixedPrecisionCalibration(GPTQCalibration):
         n_cols: int,
     ):
         """Assemble global qscheme; may be heterogeneous across groups."""
-        if all(isinstance(s, ZpScaleScheme) for s in qschemes):
-            col_dim = 2
-            # If all share the same nbits, use parent implementation.
-            nbits_set = {s.nbits for s in qschemes}
-            if len(nbits_set) == 1:
-                zeros = [s.zero_point for s in qschemes]
-                scales = [s.scale for s in qschemes]
-                qds = list(qschemes[0].qscheme_data_shape)
-                qds[col_dim] = len(scales)
-                cds = list(qds)
-                cds[-1] = n_cols // len(scales)
-                return ZpScaleScheme(
-                    zero_point=torch.cat(zeros, dim=col_dim),
-                    scale=torch.cat(scales, dim=col_dim),
-                    nbits=next(iter(nbits_set)),
-                    calibration_data_shape=cds,
-                    qscheme_data_shape=qds,
+        width = n_cols // len(qschemes)
+        return QSchemeGroup(
+            panels=[
+                PanelSpec(
+                    region=TensorSlice(dim=1, start=i * width, end=(i + 1) * width),
+                    qscheme=scheme,
                 )
-        # Heterogeneous: return the first scheme as a representative.
-        # A full implementation would wrap these in a QSchemeGroup.
-        return qschemes[0]
+                for i, scheme in enumerate(qschemes)
+            ]
+        )

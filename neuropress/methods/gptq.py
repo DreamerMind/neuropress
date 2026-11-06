@@ -25,6 +25,7 @@ from torch.types import Device
 
 from ..calibration.probe import HessianAccumulator, StatField
 from ..qscheme.descriptor import GranularityType
+from ..qscheme.group import QSchemeGroup
 from ..qscheme.zp_scale import ZpScaleScheme
 from .base import CalibrationMethodOnActivation
 from .zp_scale_calib import NormZpScaleCalibration, ZpScaleCalibration
@@ -106,6 +107,8 @@ class GPTQCalibration(CalibrationMethodOnActivation[T_SUPPORTED_QSCHEMES]):
     # CalibrationMethod interface
     # ------------------------------------------------------------------
 
+    quantized_codes: torch.Tensor | None = field(default=None, init=False, repr=False)
+
     def update_statistics(self, data: torch.Tensor) -> None:
         """Delegate to the Hessian accumulator and sync state back."""
         acc = self._ensure_accumulator()
@@ -116,6 +119,7 @@ class GPTQCalibration(CalibrationMethodOnActivation[T_SUPPORTED_QSCHEMES]):
     def init(self) -> None:
         """Reset all calibration state."""
         super().init()
+        self.quantized_codes = None
         self.hessian = None
         self.nsamples = 0
         self.__dict__.pop("rows", None)
@@ -123,7 +127,7 @@ class GPTQCalibration(CalibrationMethodOnActivation[T_SUPPORTED_QSCHEMES]):
         if self._hessian_accumulator is not None:
             self._hessian_accumulator.reset()
 
-    def compute_qscheme(self) -> ZpScaleScheme:
+    def compute_qscheme(self) -> ZpScaleScheme | QSchemeGroup:
         """Run GPTQ, update weights in-place, and return the final QScheme."""
         quant_weights, qscheme, duration, avg_loss, damp_percent = (
             self.compute_quantization()
@@ -340,6 +344,7 @@ class GPTQCalibration(CalibrationMethodOnActivation[T_SUPPORTED_QSCHEMES]):
         hinv_block = q_data.inv_hessian_chol_upper[start:end, start:end]
 
         qdq = torch.zeros_like(fp_block)
+        codes = torch.zeros_like(fp_block, dtype=torch.uint8)
         err = torch.zeros_like(fp_block)
         losses = torch.zeros_like(fp_block)
 
@@ -355,9 +360,9 @@ class GPTQCalibration(CalibrationMethodOnActivation[T_SUPPORTED_QSCHEMES]):
                 qscheme = self._pick_group_qscheme(qscheme, q_data, col_idx)
 
             assert qscheme is not None
-            q_col = qscheme.dequantize(
-                qscheme.quantize_as_u8(w_col), fp_block.dtype
-            ).flatten()
+            code = qscheme.quantize_as_u8(w_col)
+            codes[:, offset] = code.flatten()
+            q_col = qscheme.dequantize(code, fp_block.dtype).flatten()
             qdq[:, offset] = q_col
             losses[:, offset] = (w_col - q_col) ** 2 / h_diag**2
             e = (w_col - q_col) / h_diag
@@ -367,7 +372,7 @@ class GPTQCalibration(CalibrationMethodOnActivation[T_SUPPORTED_QSCHEMES]):
             err[:, offset] = e
 
         corr = err.matmul(q_data.inv_hessian_chol_upper[start:end, end:])
-        return QBlockOutput(qdq, losses / 2, corr)
+        return QBlockOutput(qdq, losses / 2, corr, codes)
 
     def _quantize_preprocess(self) -> QProcessingData:
         w = self._clone_weights()
@@ -430,7 +435,7 @@ class GPTQCalibration(CalibrationMethodOnActivation[T_SUPPORTED_QSCHEMES]):
     @torch.inference_mode()
     def compute_quantization(
         self,
-    ) -> tuple[torch.Tensor, ZpScaleScheme, float, float, float]:
+    ) -> tuple[torch.Tensor, ZpScaleScheme | QSchemeGroup, float, float, float]:
         """Run the full GPTQ pass and return quantized weights and diagnostics."""
         start = time.time()
         _maybe_warn_macos()
@@ -443,6 +448,7 @@ class GPTQCalibration(CalibrationMethodOnActivation[T_SUPPORTED_QSCHEMES]):
             )
             blk = self._quantize_per_block(block_start, block_end, q_data)
             q_data.quant_weights[:, block_start:block_end] = blk.quantized
+            q_data.codes[:, block_start:block_end] = blk.codes
             q_data.losses[:, block_start:block_end] = blk.losses
             q_data.full_float_corr_weights[:, block_end:] -= blk.corr
 
@@ -455,9 +461,15 @@ class GPTQCalibration(CalibrationMethodOnActivation[T_SUPPORTED_QSCHEMES]):
         if math.isnan(avg_loss):
             raise ValueError("GPTQ: NaN loss encountered")
 
+        codes = q_data.codes
+        if self.quant_col_in_hessian_diag_magnitude_order and q_data.perm is not None:
+            codes = codes[:, torch.argsort(q_data.perm)]
+        if _is_conv1d_transpose(self.module_class):
+            codes = codes.t()
+        self.quantized_codes = codes.reshape(self.weight_tensor.shape)
+        n_cols = q_data.quant_weights.shape[1]
         self._quantize_postprocess(q_data)
 
-        n_cols = q_data.quant_weights.shape[-1]
         final_qscheme = self.build_global_tensor_qscheme(q_data.qschemes, n_cols)
 
         if self.offload_intermediate_tensor_on_disk:
@@ -491,6 +503,7 @@ class QProcessingData:
     """Mutable state container for per-layer GPTQ processing."""
 
     __slots__ = (
+        "codes",
         "damp_percent",
         "full_float_corr_weights",
         "inv_hessian_chol_upper",
@@ -516,10 +529,11 @@ class QProcessingData:
         self.perm = perm
         self.losses = losses
         self.quant_weights = quant_weights
+        self.codes = torch.empty_like(quant_weights, dtype=torch.uint8)
         self.damp_percent = damp_percent
 
 
-QBlockOutput = namedtuple("QBlockOutput", ["quantized", "losses", "corr"])
+QBlockOutput = namedtuple("QBlockOutput", ["quantized", "losses", "corr", "codes"])
 
 
 # ---------------------------------------------------------------------------

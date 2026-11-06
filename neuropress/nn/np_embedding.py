@@ -403,18 +403,13 @@ class NPEmbedding(nn.Module):
 
         type_name = "QTensorTractScaleOnly" if self.qtype == "sym" else "QTensorScaleZp"
         serde = _SERDE_REGISTRY[type_name]
-        # self.u8_blob is nibble-packed ([V, D // vpb], see class docstring)
-        # for GPU-memory efficiency, but the serde's generic dequantize
-        # assumes one quantized value per byte (the format nn.Linear weights
-        # use, which are never packed) -- unpack before handing off, or every
-        # downstream shape is short by the packing factor.
         tensors: dict[str, torch.Tensor] = {
             "u8_blob": _unpack_u8(self.u8_blob, self.nbits),
             "scale": self.scale.reshape(-1, 1),
         }
         if self.zero_point is not None:
             tensors["zero_point"] = self.zero_point.reshape(-1, 1)
-        return serde.from_parts(tensors, self._qtensor_meta)
+        return serde.from_parts(tensors, {**self._qtensor_meta, "packing": "[]"})
 
     # ------------------------------------------------------------------
     # Backend switching

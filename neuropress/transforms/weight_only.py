@@ -61,8 +61,9 @@ from torch_to_nnef.tensor.quant.base import (
 from torch_to_nnef.tensor.quant.qtract import QTensorTractScaleOnly
 
 from ..estimator_configs import WEIGHT_TRANSFORM_REGISTRY, WeightTransformEntry
+from ..plan import QuantizedWeight
 from ..qscheme.zp_scale import ZpScaleScheme
-from ..t2n.packing import BitPacking2, BitPacking4
+from ..t2n.packing import BitPacking2, BitPacking4, BitPacking8
 
 LOGGER = logging.getLogger(__name__)
 
@@ -70,17 +71,9 @@ Q4_X_GROUP_SIZE: int = 32
 """Column-group size required by the tract Q4_0 format."""
 
 
-def _identity_transform(weight: torch.Tensor, name: str) -> torch.Tensor:
-    """Return the GPTQ-corrected *weight* unchanged.
-
-    Args:
-        weight: GPTQ-corrected dequantized float weight tensor.
-        name: Fully-qualified module name (unused).
-
-    Returns:
-        *weight* as-is.
-    """
-    return weight
+def _identity_transform(weight: QuantizedWeight, name: str) -> torch.Tensor:
+    """Materialize the selected values without changing their scheme."""
+    return weight.dequantize()
 
 
 """Identity weight-transform: ``"identity"`` in :data:`.WEIGHT_TRANSFORM_REGISTRY`.
@@ -201,49 +194,37 @@ def _make_q4_0_packed_tensor(
 
 
 @torch.no_grad()
-def _q4_0_from_gptq(
-    weight: torch.Tensor,
-    scheme: ZpScaleScheme,
+def _q4_0_from_assignment(
+    weight: QuantizedWeight,
     name: str,
     *,
     packed: bool = False,
 ) -> torch.Tensor:
-    """Preserve GPTQ's 4-bit codes and scales in tract Q4_0.
-
-    Scales round to the format's f16 representation; codes are never
-    recalibrated. Larger groups repeat their scale for each 32-value block.
-    """
+    """Pack selected symmetric 4-bit codes without recalibrating the scheme."""
+    scheme = weight.scheme
+    if not isinstance(scheme, ZpScaleScheme):
+        raise ValueError("Q4_0 requires a homogeneous affine scheme")
     group_size = scheme.calibration_data_shape[-1]
-    if (
-        scheme.nbits != 4
-        or group_size % Q4_X_GROUP_SIZE != 0
-        or not torch.all(scheme.zero_point == 8)
-    ):
+    if scheme.nbits != 4 or group_size % 32 or not torch.all(scheme.zero_point == 8):
         raise ValueError(
-            "Q4_0 requires symmetric 4-bit GPTQ with groups divisible by 32"
+            "Q4_0 requires symmetric 4-bit quantization with groups divisible by 32"
         )
-    codes = scheme.quantize_as_u8(weight)
     scales = (
-        scheme.scale.reshape(-1, 1)
-        .repeat_interleave(group_size // Q4_X_GROUP_SIZE, dim=0)
-        .to(torch.float16)
+        scheme.scale.reshape(-1, 1).repeat_interleave(group_size // 32, dim=0).half()
     )
     if not torch.all(torch.isfinite(scales) & (scales > 0)):
-        raise ValueError("GPTQ scales must be positive and representable in f16")
-    shape = weight.shape
-
-    def _wrap(w: torch.Tensor) -> QTensorTractScaleOnly:
-        q = QTensorTractScaleOnly(
-            w.reshape(shape),
-            qscheme=QScalePerGroupF16(Q4_X_GROUP_SIZE, scales, 4),
-            dequant_to_dtype=w.dtype,
-            u8_compressors=[BitPacking4] if packed else [],
+        raise ValueError(
+            "Quantization scales must be positive and representable in f16"
         )
-        q.u8_blob = BitPacking4.compress(codes) if packed else codes
-        q.nnef_name = f"{name}.weight"
-        return q
-
-    return offloaded_tensor_qtensor(_wrap, weight, "gptq_q4_0")
+    q = QTensorTractScaleOnly(
+        torch.zeros_like(weight.codes, dtype=weight.dtype),
+        QScalePerGroupF16(32, scales, 4),
+        dequant_to_dtype=weight.dtype,
+        u8_compressors=[BitPacking4] if packed else [],
+    )
+    q.u8_blob = BitPacking4.compress(weight.codes) if packed else weight.codes
+    q.nnef_name = f"{name}.weight"
+    return q
 
 
 def _safe_q4_0_transform(weight: torch.Tensor, name: str) -> Any:
@@ -303,8 +284,7 @@ def _Q4_X_NO_LM_HEAD_FILTER(name: str, mod: nn.Module) -> bool:
 
 
 WEIGHT_TRANSFORM_REGISTRY["q4_0_unpacked"] = WeightTransformEntry(
-    transform=_safe_q4_0_transform,
-    quantized_transform=_q4_0_from_gptq,
+    transform=_q4_0_from_assignment,
     filter_fn=_Q4_X_FILTER,
     # Standard tract Q4_0: one nibble per uint8 byte (unpacked) → 8 storage bits.
     # + f16 scale per 32-element group → 0.5 bpw overhead → 8.5 effective bpw.
@@ -315,8 +295,7 @@ WEIGHT_TRANSFORM_REGISTRY["q4_0_unpacked"] = WeightTransformEntry(
 WEIGHT_TRANSFORM_REGISTRY["q4_0"] = WEIGHT_TRANSFORM_REGISTRY["q4_0_unpacked"]
 
 WEIGHT_TRANSFORM_REGISTRY["q4_0_packed"] = WeightTransformEntry(
-    transform=_safe_q4_0_packed_transform,
-    quantized_transform=functools.partial(_q4_0_from_gptq, packed=True),
+    transform=functools.partial(_q4_0_from_assignment, packed=True),
     filter_fn=_Q4_X_FILTER,
     # Bit-packed Q4_0: two nibbles per uint8 byte → 4 storage bits.
     # + scale in f16
@@ -325,8 +304,7 @@ WEIGHT_TRANSFORM_REGISTRY["q4_0_packed"] = WeightTransformEntry(
 )
 
 WEIGHT_TRANSFORM_REGISTRY["q4_0_packed_no_lm_head"] = WeightTransformEntry(
-    transform=_safe_q4_0_packed_transform,
-    quantized_transform=functools.partial(_q4_0_from_gptq, packed=True),
+    transform=functools.partial(_q4_0_from_assignment, packed=True),
     filter_fn=_Q4_X_NO_LM_HEAD_FILTER,
     storage_bits=4.5,
     group_size=Q4_X_GROUP_SIZE,
@@ -387,7 +365,7 @@ def _make_packed_qtensor(
 
 
 WEIGHT_TRANSFORM_REGISTRY["q2_0_packed"] = WeightTransformEntry(
-    transform=lambda w, n: _make_packed_qtensor(w, n, nbits=2),
+    transform=lambda w, n: _affine_from_assignment(w, n, nbits=2),
     filter_fn=_Q4_X_FILTER,
     # Bit-packed Q2_0: four 2-bit values per uint8 byte → 2 storage bits.
     storage_bits=2,
@@ -540,21 +518,11 @@ def _qscalezp_per_group_f16_min_max_calibration(
 
 
 class QTensorScaleZp(QTensor):
-    """Asymmetric Q4_1 packed tensor with f16 scale and zero-point per group.
+    """Packed affine weights with f16 scale and offset per group.
 
-    Extends :class:`~torch_to_nnef.tensor.quant.base.QTensor` with a
-    :class:`QScaleZpPerGroupF16` qscheme.  The underlying bit-packing uses
-    :data:`~neuropress.t2n.packing.BitPacking4` (two 4-bit values per byte),
-    giving 4 raw storage bits plus 0.5 scale bits and 0.5 zero-point bits per
-    32-element group — a total of 5 effective bpw.
-
-    .. note::
-
-       The tract NNEF binary format has no Q4_1 header type, so
-       :meth:`write_in_file` always raises
-       :exc:`~torch_to_nnef.exceptions.T2NErrorNotImplemented`.  Use
-       :func:`~neuropress.t2n.qtensors.save_qtensor` and
-       :func:`~neuropress.t2n.qtensors.load_qtensor` for persistence.
+    Supports 2-, 4- and 8-bit in-memory storage and safetensors persistence.
+    These affine layouts have no tract NNEF binary header; write_in_file
+    raises instead of silently changing the format.
     """
 
     def write_in_file(self, dirpath: Any, label: str, **kwargs: Any) -> None:
@@ -634,8 +602,47 @@ def _safe_q4_1_packed_transform(weight: torch.Tensor, name: str) -> Any:
         return None
 
 
+@torch.no_grad()
+def _affine_from_assignment(
+    weight: QuantizedWeight,
+    name: str,
+    *,
+    nbits: int,
+) -> torch.Tensor:
+    """Pack affine codes with f16 scale/offset for in-memory and safetensors use."""
+    scheme = weight.scheme
+    if not isinstance(scheme, ZpScaleScheme) or scheme.nbits != nbits:
+        raise ValueError(f"Expected a homogeneous {nbits}-bit affine scheme")
+    group_size = scheme.calibration_data_shape[-1]
+    if group_size % 32:
+        raise ValueError("Packed affine formats require groups divisible by 32")
+    scale = (
+        scheme.scale.reshape(-1, 1).repeat_interleave(group_size // 32, dim=0).half()
+    )
+    zero = (
+        scheme.zero_point.reshape(-1, 1)
+        .repeat_interleave(group_size // 32, dim=0)
+        .half()
+    )
+    if (
+        not torch.all(torch.isfinite(scale) & (scale > 0))
+        or not torch.isfinite(zero).all()
+    ):
+        raise ValueError("Affine scale and offset must be representable in f16")
+    packer = {2: BitPacking2, 4: BitPacking4, 8: BitPacking8}[nbits]
+    q = QTensorScaleZp(
+        torch.zeros_like(weight.codes, dtype=weight.dtype),
+        QScaleZpPerGroupF16(32, scale, zero, nbits),
+        dequant_to_dtype=weight.dtype,
+        u8_compressors=[packer],
+    )
+    q.u8_blob = packer.compress(weight.codes)
+    q.nnef_name = f"{name}.weight"
+    return q
+
+
 WEIGHT_TRANSFORM_REGISTRY["q4_1_packed"] = WeightTransformEntry(
-    transform=_safe_q4_1_packed_transform,
+    transform=functools.partial(_affine_from_assignment, nbits=4),
     filter_fn=_Q4_X_FILTER,
     # Bit-packed asymmetric Q4_1: 4 raw bits + f16 scale + f16 zero-point per
     # 32-element group → 4 + 16/32 + 16/32 = 5.0 effective bpw.
