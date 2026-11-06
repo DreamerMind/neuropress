@@ -208,19 +208,26 @@ def _q4_0_from_gptq(
     *,
     packed: bool = False,
 ) -> torch.Tensor:
-    """Preserve GPTQ's 4-bit codes and group-32 scales in tract Q4_0.
+    """Preserve GPTQ's 4-bit codes and scales in tract Q4_0.
 
     Scales round to the format's f16 representation; codes are never
-    recalibrated. Asymmetric or differently grouped schemes are rejected.
+    recalibrated. Larger groups repeat their scale for each 32-value block.
     """
+    group_size = scheme.calibration_data_shape[-1]
     if (
         scheme.nbits != 4
-        or scheme.calibration_data_shape[-1] != Q4_X_GROUP_SIZE
+        or group_size % Q4_X_GROUP_SIZE != 0
         or not torch.all(scheme.zero_point == 8)
     ):
-        raise ValueError("Q4_0 requires symmetric 4-bit GPTQ with groups of 32")
+        raise ValueError(
+            "Q4_0 requires symmetric 4-bit GPTQ with groups divisible by 32"
+        )
     codes = scheme.quantize_as_u8(weight)
-    scales = scheme.scale.reshape(-1, 1).to(torch.float16)
+    scales = (
+        scheme.scale.reshape(-1, 1)
+        .repeat_interleave(group_size // Q4_X_GROUP_SIZE, dim=0)
+        .to(torch.float16)
+    )
     if not torch.all(torch.isfinite(scales) & (scales > 0)):
         raise ValueError("GPTQ scales must be positive and representable in f16")
     shape = weight.shape

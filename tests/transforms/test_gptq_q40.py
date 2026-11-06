@@ -19,12 +19,13 @@ from neuropress.transforms.weight_only import _q4_0_from_gptq
 @pytest.mark.parametrize(
     "format_name", ["q4_0", "q4_0_unpacked", "q4_0_packed", "q4_0_packed_no_lm_head"]
 )
-def test_pipeline_preserves_gptq_grid_in_nnef(format_name, tmp_path):
+@pytest.mark.parametrize("group_size", [32, 64])
+def test_pipeline_preserves_gptq_grid_in_nnef(format_name, group_size, tmp_path):
     torch.manual_seed(42)
     model = nn.Sequential(nn.Linear(64, 16, bias=False)).eval()
     original = model[0].weight.detach().clone()
     x = torch.randn(8, 64, 64)
-    gran = Granularity.per_group([32])
+    gran = Granularity.per_group([group_size])
     reference = nn.Linear(64, 16, bias=False)
     reference.weight.data.copy_(original)
     calib = GPTQCalibration(
@@ -41,8 +42,10 @@ def test_pipeline_preserves_gptq_grid_in_nnef(format_name, tmp_path):
     calib.update_statistics(x)
     weights, scheme, *_ = calib.compute_quantization()
     expected_codes = scheme.quantize_as_u8(weights).reshape(-1, 32)
-    expected_scales = scheme.scale.flatten().half()
-    estimator = GptqEstimatorConfig(group_size=32, weight_transform=format_name).build()
+    expected_scales = scheme.scale.flatten().repeat_interleave(group_size // 32).half()
+    estimator = GptqEstimatorConfig(
+        group_size=group_size, weight_transform=format_name
+    ).build()
     recipe = QuantizationRecipe(
         param_estimator=estimator, adapter=WeightAssignmentAdapter()
     )
@@ -65,7 +68,7 @@ def test_pipeline_preserves_gptq_grid_in_nnef(format_name, tmp_path):
     np.testing.assert_array_equal(actual_codes, expected_codes.numpy())
 
 
-@pytest.mark.parametrize("group_size, symmetric", [(64, True), (32, False)])
+@pytest.mark.parametrize("group_size, symmetric", [(16, True), (32, False)])
 def test_q40_rejects_incompatible_gptq_scheme(group_size, symmetric):
     gran = Granularity.per_group([group_size])
     calib = NormZpScaleCalibration(nbits=4, symmetric=symmetric, granularity=gran)
