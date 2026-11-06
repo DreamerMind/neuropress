@@ -519,14 +519,20 @@ class MinMaxZpWeightEstimator(QuantizationParamEstimator):
                 )
             groups = w.reshape(-1, 1, 1, width)
             if self.symmetric:
-                scale = groups.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8) / (
-                    2 ** (self.nbits - 1) - 1
+                maximum = groups.abs().amax(dim=-1, keepdim=True)
+                scale = torch.where(
+                    maximum == 0,
+                    torch.ones_like(maximum),
+                    maximum / (2 ** (self.nbits - 1) - 1),
                 )
                 zero = torch.full_like(scale, 2 ** (self.nbits - 1))
             else:
                 low = groups.amin(dim=-1, keepdim=True)
                 high = groups.amax(dim=-1, keepdim=True)
-                scale = (high - low).clamp(min=1e-8) / (2**self.nbits - 1)
+                span = high - low
+                scale = torch.where(
+                    span == 0, torch.ones_like(span), span / (2**self.nbits - 1)
+                )
                 zero = -low / scale
             scheme = ZpScaleScheme(
                 zero, scale, self.nbits, list(groups.shape), list(scale.shape)

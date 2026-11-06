@@ -80,6 +80,35 @@ def test_scalar_estimators_defer_conversion_and_preserve_codes(
     )
 
 
+@pytest.mark.parametrize(
+    "symmetric,format_name", [(True, "q4_0_packed"), (False, "q4_1_packed")]
+)
+@pytest.mark.parametrize("value", [0.0, 0.5, -0.5])
+def test_minmax_constant_groups_survive_format_conversion(
+    symmetric, format_name, value
+):
+    model = nn.Sequential(nn.Linear(64, 16, bias=False))
+    with torch.no_grad():
+        model[0].weight.fill_(value)
+    estimator = MinMaxZpWeightEstimatorConfig(
+        target="linear",
+        group_size=32,
+        nbits=4,
+        symmetric=symmetric,
+        weight_transform=format_name,
+    ).build()
+    plan = estimate(estimator, model, [])
+    selected = plan.weight_assignments["0"]
+    WeightAssignmentAdapter().apply(model, plan)
+    quantized = model[0].weight
+    torch.testing.assert_close(
+        quantized.decompress_to_u8(), selected.codes, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        quantized.decompress(), torch.full((16, 64), value), rtol=1e-3, atol=0
+    )
+
+
 def test_panel_estimator_defers_model_surgery_and_preserves_each_scheme(tmp_path):
     torch.manual_seed(3)
     model = nn.Sequential(nn.Linear(128, 16, bias=True))
