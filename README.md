@@ -149,6 +149,12 @@ exporter.prepare(
 )
 ```
 
+GPTQ with the `q4_0`, `q4_0_unpacked`, `q4_0_packed`, or
+`q4_0_packed_no_lm_head` weight transform preserves the selected integer codes
+and group scales during NNEF conversion. Scales round to f16 as required by
+Q4_0; there is no second min/max calibration. These transforms require
+symmetric 4-bit quantization with groups of 32.
+
 See all keys with `neuropress-eval list`.  Built-in entries:
 
 | Key | Method |

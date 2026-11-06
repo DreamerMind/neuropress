@@ -42,6 +42,7 @@ from .estimators import (
     VPTQGroupEstimator,
 )
 from .methods.correction_mode import CorrectionMode
+from .qscheme.zp_scale import ZpScaleScheme
 from .recipe_config import EstimatorConfig, estimator_config
 
 # ---------------------------------------------------------------------------
@@ -109,6 +110,8 @@ class WeightTransformEntry:
             addition to the estimator's ``module_classes`` check.  Use this to
             enforce backend-specific shape constraints (e.g. group-size
             divisibility for tract Q4_0).
+        quantized_transform: Optional GPTQ adapter receiving the selected scheme
+            alongside the weights, so packing does not recalibrate them.
         storage_bits: Effective bits per weight on disk, *including* all
             quantization-metadata overhead (scales, zero-points).  For example,
             4-bit packed weights with one f16 scale per 32-element group cost
@@ -125,6 +128,9 @@ class WeightTransformEntry:
     filter_fn: Callable[[str, nn.Module], bool] | None = None
     storage_bits: float | None = None
     group_size: int | None = None
+    quantized_transform: (
+        Callable[[torch.Tensor, ZpScaleScheme, str], Any | None] | None
+    ) = None
 
 
 WEIGHT_TRANSFORM_REGISTRY: dict[str, WeightTransformEntry] = {}
@@ -202,6 +208,9 @@ class GptqEstimatorConfig(EstimatorConfig):
             module_classes=(_resolve_module_class(self.target),),
             filter_fn=entry.filter_fn if entry is not None else None,
             weight_transform=entry.transform if entry is not None else None,
+            quantized_weight_transform=entry.quantized_transform
+            if entry is not None
+            else None,
             group_size=self.group_size,
             nbits=self.nbits,
             symmetric=self.symmetric,

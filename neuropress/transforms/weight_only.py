@@ -53,6 +53,7 @@ from torch_to_nnef.exceptions import (
 )
 from torch_to_nnef.tensor.quant import fp_to_tract_q4_0_with_min_max_calibration
 from torch_to_nnef.tensor.quant.base import (
+    QScalePerGroupF16,
     QScheme,
     QTensor,
     qscale_per_group_f16_min_max_calibration,
@@ -60,6 +61,7 @@ from torch_to_nnef.tensor.quant.base import (
 from torch_to_nnef.tensor.quant.qtract import QTensorTractScaleOnly
 
 from ..estimator_configs import WEIGHT_TRANSFORM_REGISTRY, WeightTransformEntry
+from ..qscheme.zp_scale import ZpScaleScheme
 from ..t2n.packing import BitPacking2, BitPacking4
 
 LOGGER = logging.getLogger(__name__)
@@ -198,6 +200,45 @@ def _make_q4_0_packed_tensor(
     return offloaded_tensor_qtensor(_calib, weight, suffix_name)
 
 
+@torch.no_grad()
+def _q4_0_from_gptq(
+    weight: torch.Tensor,
+    scheme: ZpScaleScheme,
+    name: str,
+    *,
+    packed: bool = False,
+) -> torch.Tensor:
+    """Preserve GPTQ's 4-bit codes and group-32 scales in tract Q4_0.
+
+    Scales round to the format's f16 representation; codes are never
+    recalibrated. Asymmetric or differently grouped schemes are rejected.
+    """
+    if (
+        scheme.nbits != 4
+        or scheme.calibration_data_shape[-1] != Q4_X_GROUP_SIZE
+        or not torch.all(scheme.zero_point == 8)
+    ):
+        raise ValueError("Q4_0 requires symmetric 4-bit GPTQ with groups of 32")
+    codes = scheme.quantize_as_u8(weight)
+    scales = scheme.scale.reshape(-1, 1).to(torch.float16)
+    if not torch.all(torch.isfinite(scales) & (scales > 0)):
+        raise ValueError("GPTQ scales must be positive and representable in f16")
+    shape = weight.shape
+
+    def _wrap(w: torch.Tensor) -> QTensorTractScaleOnly:
+        q = QTensorTractScaleOnly(
+            w.reshape(shape),
+            qscheme=QScalePerGroupF16(Q4_X_GROUP_SIZE, scales, 4),
+            dequant_to_dtype=w.dtype,
+            u8_compressors=[BitPacking4] if packed else [],
+        )
+        q.u8_blob = BitPacking4.compress(codes) if packed else codes
+        q.nnef_name = f"{name}.weight"
+        return q
+
+    return offloaded_tensor_qtensor(_wrap, weight, "gptq_q4_0")
+
+
 def _safe_q4_0_transform(weight: torch.Tensor, name: str) -> Any:
     """Wrap *weight* as Q4_0, returning *None* on quantization failure.
 
@@ -256,6 +297,7 @@ def _Q4_X_NO_LM_HEAD_FILTER(name: str, mod: nn.Module) -> bool:
 
 WEIGHT_TRANSFORM_REGISTRY["q4_0_unpacked"] = WeightTransformEntry(
     transform=_safe_q4_0_transform,
+    quantized_transform=_q4_0_from_gptq,
     filter_fn=_Q4_X_FILTER,
     # Standard tract Q4_0: one nibble per uint8 byte (unpacked) → 8 storage bits.
     # + f16 scale per 32-element group → 0.5 bpw overhead → 8.5 effective bpw.
@@ -267,6 +309,7 @@ WEIGHT_TRANSFORM_REGISTRY["q4_0"] = WEIGHT_TRANSFORM_REGISTRY["q4_0_unpacked"]
 
 WEIGHT_TRANSFORM_REGISTRY["q4_0_packed"] = WeightTransformEntry(
     transform=_safe_q4_0_packed_transform,
+    quantized_transform=functools.partial(_q4_0_from_gptq, packed=True),
     filter_fn=_Q4_X_FILTER,
     # Bit-packed Q4_0: two nibbles per uint8 byte → 4 storage bits.
     # + scale in f16
@@ -276,6 +319,7 @@ WEIGHT_TRANSFORM_REGISTRY["q4_0_packed"] = WeightTransformEntry(
 
 WEIGHT_TRANSFORM_REGISTRY["q4_0_packed_no_lm_head"] = WeightTransformEntry(
     transform=_safe_q4_0_packed_transform,
+    quantized_transform=functools.partial(_q4_0_from_gptq, packed=True),
     filter_fn=_Q4_X_NO_LM_HEAD_FILTER,
     storage_bits=4.5,
     group_size=Q4_X_GROUP_SIZE,
