@@ -113,13 +113,24 @@ The default is **`cpu`** — no GPU is assumed or required.
 ### VQ inference on CUDA
 
 Vector-quantized layers keep their packed indices at inference time. With
-`kernel_lowering="auto"` each layer picks a fused kernel (`cuda_wmma`, or
-`cuda_lut` for large codebooks) that decodes the weight inside the matmul.
-That wins for decode-sized inputs, but its cost grows with the token count,
-so above `NEUROPRESS_VQ_FUSED_MAX_TOKENS` rows (default 32) a layer instead
-decodes its weight in one CUDA pass and runs a cuBLAS GEMM. The decoded weight
-is a temporary: peak extra memory is one layer's dense weight. Raise the
-variable to keep the fused kernel for larger batches.
+`kernel_lowering="auto"` each layer gets a CUDA backend (`cuda_wmma`, or
+`cuda_lut` for large codebooks), then picks a path per call from the number of
+input rows (tokens):
+
+| Rows | Path | Threshold (env var, default) |
+|------|------|------------------------------|
+| up to the fused limit | fused kernel, decodes inside the matmul | `NEUROPRESS_VQ_FUSED_MAX_TOKENS`, 2 |
+| up to the Triton limit | Triton GEMM decoding weight tiles on the fly | `NEUROPRESS_VQ_TRITON_MAX_TOKENS`, 384 |
+| above | one-pass weight decode, then a cuBLAS GEMM | |
+
+The fused kernels re-decode the weight for every 16 rows, so they only win for
+single-token decode. The Triton GEMM never materializes the weight but decodes
+each tile once per block of rows, which large batches outgrow. The decode +
+GEMM path writes the layer's dense weight as a temporary, so its peak extra
+memory is one layer's dense weight. `cuda_lut` layers skip the first two bands
+(`NEUROPRESS_VQ_LUT_MAX_TOKENS`, default 0): decode + GEMM is faster for them
+at any batch size. Setting a threshold to 0 disables that band. If Triton is
+unavailable the Triton band falls back to decode + GEMM.
 
 ## Architecture
 
