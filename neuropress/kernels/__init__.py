@@ -10,7 +10,7 @@ Available functions:
         (scale-only) and asymmetric (scale + zero_point) schemes.
 
     :func:`vq_linear` — fused VQ-weight linear (``vq_linear.cu``).
-        Unpacks 4, 8, or 12-bit codebook indices, gathers centroids, and
+        Unpacks 4- to 16-bit codebook indices, gathers centroids, and
         accumulates — without materialising the float weight matrix.
 
     :func:`dequantize_vq_weight` — materialise a fp16 weight matrix from
@@ -230,7 +230,7 @@ def vq_linear(
             Length = ``N * n_groups`` for ``bits=8``, or
             ``ceil(N * n_groups / 2)`` for ``bits=4``.
         centroids: Codebook ``[num_centroids, vector_len]`` float16, on CUDA.
-        bits: Bits per index — 4, 8, or 12.
+        bits: Bits per index: 4, 8, 10, 12, 14, 15 or 16.
         vector_len: Number of weight elements per VQ vector.
         bias: Optional float bias ``[N]`` (any float dtype).
 
@@ -424,6 +424,33 @@ def vq_lut_gather(
         ``[M, N]`` float32 CUDA tensor.
     """
     return _load_lut_extension().vq_lut_gather(lut, packed_indices, bits, out_features)
+
+
+# ---------------------------------------------------------------------------
+# Fallback reporting
+# ---------------------------------------------------------------------------
+
+_warned_fallbacks: set[str] = set()
+
+
+def warn_kernel_fallback(kernel: str, fallback: str, exc: BaseException) -> None:
+    """Warn once per *kernel* that it is unavailable and *fallback* runs instead.
+
+    Fallback paths can be one to two orders of magnitude slower, so the
+    message carries the underlying error and the usual fix (the JIT build
+    needs ``ninja`` and ``nvcc``).  Later calls for the same kernel are silent.
+    """
+    if kernel in _warned_fallbacks:
+        return
+    _warned_fallbacks.add(kernel)
+    log.warning(
+        "CUDA kernel %s unavailable (%s); using %s instead, which can be much "
+        "slower. The JIT build needs ninja (pip install ninja) and nvcc on PATH "
+        "or under CUDA_HOME.",
+        kernel,
+        exc,
+        fallback,
+    )
 
 
 # ---------------------------------------------------------------------------

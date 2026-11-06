@@ -66,15 +66,36 @@ log = logging.getLogger(__name__)
 # Below this threshold WMMA is preferred (low centroid reuse, small layers).
 _LUT_COV_MIN: float = 4.0
 
-# Above this many tokens (rows of the flattened input) the fused VQ kernels
-# lose to decoding the weight once and running a dense GEMM: they re-decode
-# the codebook per token tile, so their cost grows linearly with M.  Measured
-# on GB10 (Llama-3.1-8B): the crossover sits between 32 and 64 tokens for
-# q/gate/down_proj, and a 16x256-token forward drops from 26.3 s to 1.44 s
-# (bf16: 1.05 s).  Override with the env var.
-_FUSED_MAX_TOKENS: int = int(os.environ.get("NEUROPRESS_VQ_FUSED_MAX_TOKENS", "32"))
+# Token-count bands for cuda_wmma / cuda layers (tokens = rows of the
+# flattened input).  The fused kernels re-decode the weight per 16-row tile, so
+# their cost grows linearly with M; measured on an idle GB10 (Llama-3.1-8B,
+# 12-bit indices) they win only at 1-2 tokens.  Override with the env vars.
+_FUSED_MAX_TOKENS: int = int(os.environ.get("NEUROPRESS_VQ_FUSED_MAX_TOKENS", "2"))
+
+# cuda_lut builds an [M, n_groups, NC] table first, which for the large
+# codebooks it is chosen for (bits > 12) costs more than decoding the whole
+# weight: on GB10 it loses to decode + GEMM by 20-130x at every M, M=1
+# included.  Hence a separate threshold, 0 = always decode + GEMM.
+_LUT_MAX_TOKENS: int = int(os.environ.get("NEUROPRESS_VQ_LUT_MAX_TOKENS", "0"))
+
+# Between the fused-kernel threshold and this many tokens, cuda_wmma / cuda
+# layers use the Triton VQ GEMM (neuropress/kernels/vq_triton.py), which
+# decodes weight tiles inside the matmul instead of writing the dense weight.
+# It beats decode + GEMM for mid-sized batches but re-decodes each tile per
+# BLOCK_M rows, so large batches go back to decode + GEMM: on GB10 Triton wins
+# from 4 to 384 tokens on every 12-bit layer and loses from 512.  0 disables it.
+_TRITON_MAX_TOKENS: int = int(os.environ.get("NEUROPRESS_VQ_TRITON_MAX_TOKENS", "384"))
 
 _FUSED_BACKENDS = frozenset({VQBackend.CUDA_WMMA, VQBackend.CUDA_LUT, VQBackend.CUDA})
+
+# Set once the Triton path fails (missing Triton, compile error) so later
+# calls go straight to decode + GEMM.
+_triton_failed: bool = False
+
+
+def _fused_max_tokens(backend: VQBackend) -> int:
+    """Largest token count for which *backend*'s fused kernel is used."""
+    return _LUT_MAX_TOKENS if backend == VQBackend.CUDA_LUT else _FUSED_MAX_TOKENS
 
 
 def _resolve_vq_backend(
@@ -1005,12 +1026,15 @@ class NPVQLinear(nn.Module):
         """
         if self.column_perm is not None:
             x = x[..., self.column_perm]
-        if (
-            self.backend in _FUSED_BACKENDS
-            and x.numel() // self.in_features > _FUSED_MAX_TOKENS
-        ):
-            # Prefill / batched eval: dequant once + GEMM beats the fused kernel.
-            return self._forward_dequant_gemm(x)
+        if self.backend in _FUSED_BACKENDS:
+            m = x.numel() // self.in_features
+            if m > _fused_max_tokens(self.backend):
+                # The fused kernel re-decodes the weight per 16-row tile, so
+                # past the threshold: Triton for mid-sized batches, then
+                # decode once + GEMM.  cuda_lut layers skip the Triton band.
+                if self.backend != VQBackend.CUDA_LUT and m <= _TRITON_MAX_TOKENS:
+                    return self._forward_triton(x)
+                return self._forward_dequant_gemm(x)
         if self.backend == VQBackend.CUDA_ZERO_ESCAPE:
             return self._forward_cuda_zero_escape(x)
         if self.backend == VQBackend.CUDA_NTIER:
@@ -1070,6 +1094,36 @@ class NPVQLinear(nn.Module):
         w = self.proxy.centroids[indices].reshape(self.out_features, self.in_features)
         return F.linear(x, w.to(x.dtype), self.bias)
 
+    def _forward_triton(self, x: torch.Tensor) -> torch.Tensor:
+        """Triton GEMM decoding weight tiles in the matmul; falls back to decode + GEMM."""
+        global _triton_failed
+        vl = self.proxy.centroids.shape[1]
+        if (
+            _triton_failed
+            or x.dtype not in (torch.bfloat16, torch.float16)
+            or vl & (vl - 1)  # tl.arange needs a power-of-two vector length
+        ):
+            return self._forward_dequant_gemm(x)
+        try:
+            from ..kernels.vq_triton import vq_gemm_triton
+
+            *leading, _ = x.shape
+            y = vq_gemm_triton(
+                x.reshape(-1, self.in_features),
+                self.packed_indices,
+                self.proxy.centroids,
+                self.bits,
+                self.out_features,
+                self.bias,
+            )
+        except Exception as exc:
+            from .. import kernels
+
+            _triton_failed = True
+            kernels.warn_kernel_fallback("vq_gemm_triton", "decode + GEMM", exc)
+            return self._forward_dequant_gemm(x)
+        return y.reshape(*leading, self.out_features)
+
     def _forward_dequant_gemm(self, x: torch.Tensor) -> torch.Tensor:
         """Decode the weight in one kernel pass, then run a cuBLAS GEMM.
 
@@ -1089,7 +1143,7 @@ class NPVQLinear(nn.Module):
                 x.dtype,
             )
         except RuntimeError as exc:
-            log.warning("vq_dequant unavailable, using compiled gather: %s", exc)
+            kernels.warn_kernel_fallback("vq_dequant", "the compiled gather path", exc)
             return self._forward_compile(x)
         return F.linear(x, w, self.bias)
 
