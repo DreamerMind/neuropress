@@ -110,6 +110,17 @@ The default is **`cpu`** — no GPU is assumed or required.
 > 4-core laptop: ~45–60 min).  On an RTX 3090/4090 the same job finishes
 > in **2–5 minutes**.
 
+### VQ inference on CUDA
+
+Vector-quantized layers keep their packed indices at inference time. With
+`kernel_lowering="auto"` each layer picks a fused kernel (`cuda_wmma`, or
+`cuda_lut` for large codebooks) that decodes the weight inside the matmul.
+That wins for decode-sized inputs, but its cost grows with the token count,
+so above `NEUROPRESS_VQ_FUSED_MAX_TOKENS` rows (default 32) a layer instead
+decodes its weight in one CUDA pass and runs a cuBLAS GEMM. The decoded weight
+is a temporary: peak extra memory is one layer's dense weight. Raise the
+variable to keep the fused kernel for larger batches.
+
 ## Architecture
 
 The full pipeline runs in six steps (see `neuropress/pipeline.py`):
