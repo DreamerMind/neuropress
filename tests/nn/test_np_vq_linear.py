@@ -465,7 +465,9 @@ def test_lut_layers_skip_triton_band(monkeypatch):
 
 
 def test_triton_failure_falls_back_once(monkeypatch):
-    import neuropress.kernels.vq_triton as vt
+    import sys
+    import types
+
     import neuropress.nn.np_vq_linear as mod
 
     monkeypatch.setattr(mod, "_triton_failed", False)
@@ -479,7 +481,10 @@ def test_triton_failure_falls_back_once(monkeypatch):
         calls.append("triton")
         raise RuntimeError("no triton here")
 
-    monkeypatch.setattr(vt, "vq_gemm_triton", _boom)
+    # A stand-in module: CPU-only installs have no Triton to import.
+    fake = types.ModuleType("neuropress.kernels.vq_triton")
+    fake.vq_gemm_triton = _boom
+    monkeypatch.setitem(sys.modules, "neuropress.kernels.vq_triton", fake)
     monkeypatch.setattr(
         layer, "_forward_dequant_gemm", lambda x: calls.append("dense") or x[..., :16]
     )
