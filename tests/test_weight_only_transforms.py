@@ -19,7 +19,6 @@ from neuropress.transforms.weight_only import (
     _make_packed_qtensor,
     _make_q4_0_packed_tensor,
     _make_q4_0_tensor,
-    _make_q4_1_packed_tensor,
 )
 
 # ---------------------------------------------------------------------------
@@ -85,14 +84,6 @@ def test_make_packed_qtensor_survives_flat_callback():
     assert result is not None
 
 
-def test_q4_1_packed_tensor_survives_flat_callback():
-    """_make_q4_1_packed_tensor must not crash when _calib receives a 1-D view."""
-    weight = torch.randn(64, 32)
-    with patch(_OFFLOAD_PATH, _flat_offload):
-        result = _make_q4_1_packed_tensor(weight, "mod")
-    assert result is not None
-
-
 # ---------------------------------------------------------------------------
 # Sanity: normal (non-flat) path still works
 # ---------------------------------------------------------------------------
@@ -102,13 +93,6 @@ def test_q4_0_packed_tensor_normal_path():
     weight = torch.randn(64, 32)
     with patch(_OFFLOAD_PATH, _normal_offload):
         result = _make_q4_0_packed_tensor(weight, "mod")
-    assert result is not None
-
-
-def test_q4_1_packed_tensor_normal_path():
-    weight = torch.randn(64, 32)
-    with patch(_OFFLOAD_PATH, _normal_offload):
-        result = _make_q4_1_packed_tensor(weight, "mod")
     assert result is not None
 
 

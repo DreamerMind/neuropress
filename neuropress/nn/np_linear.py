@@ -570,7 +570,7 @@ class NPLinear(nn.Module):
         qtensor_meta = serde.to_metadata(weight_q)
 
         return cls(
-            u8_blob=weight_q.u8_blob.detach().clone(),
+            u8_blob=_pack_u8(weight_q.decompress_to_u8(), weight_q.qscheme.n_bits),
             scale=weight_q.qscheme.scale.detach().clone(),
             out_features=linear.out_features,
             in_features=linear.in_features,
@@ -609,20 +609,19 @@ class NPLinear(nn.Module):
                 "Cannot reconstruct QTensor: no serde metadata stored. "
                 "Build via NPLinear.from_linear() to enable to_qtensor()."
             )
-        from ..t2n.qtensors import _SERDE_REGISTRY
+        from ..t2n.qtensors import scalar_qtensor_from_codes
 
         if self.backend == LinearBackend.DEFAULT:
             return self._weight_q
 
         type_name = "QTensorTractScaleOnly" if self.qtype == "sym" else "QTensorScaleZp"
-        serde = _SERDE_REGISTRY[type_name]
-        tensors: dict[str, torch.Tensor] = {
-            "u8_blob": self.u8_blob,
-            "scale": self.scale.reshape(-1, 1),
-        }
-        if self.zero_point is not None:
-            tensors["zero_point"] = self.zero_point.reshape(-1, 1)
-        return serde.from_parts(tensors, self._qtensor_meta)
+        return scalar_qtensor_from_codes(
+            type_name,
+            _unpack_u8(self.u8_blob, self.nbits),
+            self.scale,
+            self.zero_point,
+            self._qtensor_meta,
+        )
 
     # ------------------------------------------------------------------
     # Backend switching

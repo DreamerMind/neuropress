@@ -12,9 +12,10 @@ from neuropress.estimator_configs import GptqEstimatorConfig
 from neuropress.methods.gptq import GPTQCalibration
 from neuropress.methods.zp_scale_calib import NormZpScaleCalibration
 from neuropress.pipeline import QuantizationPipeline
+from neuropress.plan import QuantizedWeight
 from neuropress.qscheme import Granularity
 from neuropress.recipe import QuantizationRecipe
-from neuropress.transforms.weight_only import _q4_0_from_gptq
+from neuropress.transforms.weight_only import _q4_0_from_assignment
 
 
 @pytest.mark.parametrize(
@@ -41,8 +42,8 @@ def test_pipeline_preserves_gptq_grid_in_nnef(format_name, group_size, tmp_path)
     calib.name = "reference"
     calib.init()
     calib.update_statistics(x)
-    weights, scheme, *_ = calib.compute_quantization()
-    expected_codes = scheme.quantize_as_u8(weights).reshape(-1, 32)
+    _weights, scheme, *_ = calib.compute_quantization()
+    expected_codes = calib.quantized_codes.reshape(-1, 32)
     expected_scales = scheme.scale.flatten().repeat_interleave(group_size // 32).half()
     estimator = GptqEstimatorConfig(
         group_size=group_size, weight_transform=format_name
@@ -77,8 +78,11 @@ def test_q40_rejects_incompatible_gptq_scheme(group_size, symmetric):
     calib.init()
     calib.update(weight)
     scheme = calib.compute_qscheme()
-    with pytest.raises(ValueError, match="symmetric 4-bit GPTQ"):
-        _q4_0_from_gptq(weight, scheme, "weight")
+    with pytest.raises(ValueError, match="symmetric 4-bit quantization"):
+        _q4_0_from_assignment(
+            QuantizedWeight(scheme.quantize_as_u8(weight), scheme, weight.dtype),
+            "weight",
+        )
 
 
 def _run_q40_gptq(scale_first_block: float):

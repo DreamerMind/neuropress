@@ -28,7 +28,7 @@ from .graph import QGraph, QNode, QValue, RuntimeModuleGraphProvider
 from .kernel_lowering import AutoKernelLowering, KernelLowering
 from .methods import METHOD_REGISTRY
 from .pipeline import QuantizationPipeline
-from .plan import QuantizationPlan
+from .plan import QuantizationPlan, QuantizedWeight
 from .preprocessing import (
     PREPROCESSING_CONFIG_REGISTRY,
     PREPROCESSING_REGISTRY,
@@ -110,6 +110,7 @@ __all__ = [
     "QuantizationPlan",
     "QuantizationRecipe",
     "QuantizationRecipeConfig",
+    "QuantizedWeight",
     "RuntimeModuleGraphProvider",
     "SmoothQuantStep",
     "SmoothQuantStepConfig",

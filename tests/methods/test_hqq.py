@@ -4,6 +4,7 @@ import pytest
 import torch
 from torch import nn
 
+from neuropress.adapter import WeightAssignmentAdapter
 from neuropress.estimator_configs import HqqEstimatorConfig
 from neuropress.estimators import HQQEstimator
 from neuropress.methods.hqq import HQQCalibration, _hqq_optimize, _proximal_shrink
@@ -344,7 +345,7 @@ def test_hqq_estimator_declares_no_statistics():
     assert est.declare_statistics() == []
 
 
-def test_hqq_estimator_updates_weights_in_place():
+def test_hqq_estimator_defers_weight_changes_to_adapter():
     torch.manual_seed(0)
     model = _TwoLinearModel()
     w1_before = model.fc1.weight.data.clone()
@@ -352,7 +353,10 @@ def test_hqq_estimator_updates_weights_in_place():
 
     est = HQQEstimator(group_size=32, nbits=4, num_iter=2)
     est.prepare(model)
-    est.estimate(graph=None, registry=None, recipe=None)
+    plan = est.estimate(graph=None, registry=None, recipe=None)
+    torch.testing.assert_close(model.fc1.weight, w1_before, rtol=0, atol=0)
+    torch.testing.assert_close(model.fc2.weight, w2_before, rtol=0, atol=0)
+    WeightAssignmentAdapter().apply(model, plan)
 
     assert not torch.allclose(model.fc1.weight.data, w1_before)
     assert not torch.allclose(model.fc2.weight.data, w2_before)
@@ -391,17 +395,20 @@ def test_hqq_estimator_with_weight_transform():
     est.prepare(model)
     plan = est.estimate(graph=None, registry=None, recipe=None)
 
+    assert not collected
+    WeightAssignmentAdapter().apply(model, plan)
     assert "fc1" in collected
     assert "fc2" in collected
     assert len(plan.weight_assignments) == 2
 
 
-def test_hqq_estimator_weight_transform_none_skips_plan():
+def test_hqq_estimator_without_format_returns_selected_values():
     model = _TwoLinearModel()
     est = HQQEstimator(weight_transform=None, group_size=32, num_iter=1)
     est.prepare(model)
     plan = est.estimate(graph=None, registry=None, recipe=None)
-    assert plan.weight_assignments == {}
+    assert set(plan.weight_assignments) == {"fc1", "fc2"}
+    WeightAssignmentAdapter().apply(model, plan)
 
 
 def test_hqq_estimator_shared_weight_processed_once():
@@ -424,7 +431,9 @@ def test_hqq_estimator_shared_weight_processed_once():
 
     est = HQQEstimator(weight_transform=_counting_transform, group_size=32, num_iter=1)
     est.prepare(model)
-    est.estimate(graph=None, registry=None, recipe=None)
+    plan = est.estimate(graph=None, registry=None, recipe=None)
+    assert call_count[0] == 0
+    WeightAssignmentAdapter().apply(model, plan)
 
     assert call_count[0] == 1  # shared weight processed exactly once
 

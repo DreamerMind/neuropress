@@ -59,21 +59,24 @@ class _EstimatorSpec:
 
 
 def _get_transform_entry(
-    transform_fn: Callable[..., Any],
+    transform: str | Callable[..., Any],
 ) -> WeightTransformEntry | None:
-    """Look up the ``WeightTransformEntry`` for *transform_fn*.
+    """Look up the ``WeightTransformEntry`` for *transform*.
 
     Args:
-        transform_fn: The callable stored in the estimator's
+        transform: The registry key or callable stored in the estimator's
             ``weight_transform`` field.
 
     Returns:
         The matching ``WeightTransformEntry``, or ``None`` if not found.
     """
     from neuropress.estimator_configs import WEIGHT_TRANSFORM_REGISTRY
+    from neuropress.transforms import weight_only  # noqa: F401
 
+    if isinstance(transform, str):
+        return WEIGHT_TRANSFORM_REGISTRY.get(transform)
     for entry in WEIGHT_TRANSFORM_REGISTRY.values():
-        if entry.transform is transform_fn:
+        if entry.transform is transform:
             return entry
     return None
 

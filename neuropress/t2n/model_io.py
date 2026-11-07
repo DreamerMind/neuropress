@@ -108,6 +108,7 @@ class MixedPrecisionModuleSpec(BaseModel):
     split_sizes: list[int]
     precision_nbits: list[int]
     has_bias: bool
+    shares_branches_with: str | None = None
 
 
 class MixedPrecisionSplitTransform(BaseModel):
@@ -378,11 +379,19 @@ def _replay_mixed_precision_split(
         precision_nbits: list[int] = spec.precision_nbits
         has_bias: bool = spec.has_bias
 
-        sub_linears = nn.ModuleList(
-            [nn.Linear(sz, out, bias=False) for sz in split_sizes]
-        )
-        # Placeholder tensors — overwritten by load_state_dict.
-        column_perm = torch.zeros(sum(split_sizes), dtype=torch.long)
+        # A tied module reuses its sibling's branches, which the checkpoint
+        # stores once.  Modules are recorded in application order.
+        source = spec.shares_branches_with
+        if source is not None:
+            sibling = model.get_submodule(source)
+            sub_linears = sibling.sub_linears
+            column_perm = sibling.column_perm
+        else:
+            sub_linears = nn.ModuleList(
+                [nn.Linear(sz, out, bias=False) for sz in split_sizes]
+            )
+            # Placeholder tensor - overwritten by load_state_dict.
+            column_perm = torch.zeros(sum(split_sizes), dtype=torch.long)
         bias = torch.zeros(out) if has_bias else None
 
         mpl = MixedPrecisionLinear(
@@ -530,6 +539,11 @@ def load_quantized_model(
     # -----------------------------------------------------------------------
     # Step 4: QTensor parameters — reconstruct and assign directly.
     # -----------------------------------------------------------------------
+    saved_paths = set(qt_param_paths) | set(regular_state)
+    tied_paths: dict[int, list[str]] = {}
+    for path, param in model.named_parameters(remove_duplicate=False):
+        tied_paths.setdefault(id(param), []).append(path)
+
     for param_path, entry in qt_entries.items():
         serde = _SERDE_REGISTRY.get(entry.type)
         if serde is None:
@@ -542,7 +556,12 @@ def load_quantized_model(
             tk: all_tensors[f"{param_path}{_QT_SEP}{tk}"] for tk in entry.tensor_keys
         }
         q = serde.from_parts(sub_tensors, entry.metadata)
-        _set_param(model, param_path, q)
+        # A checkpoint stores a tied parameter once, so names it does not list
+        # share this tensor.  Names it does list hold their own saved values.
+        previous = model.get_parameter(param_path)
+        for path in tied_paths[id(previous)]:
+            if path == param_path or path not in saved_paths:
+                _set_param(model, path, q)
 
     # -----------------------------------------------------------------------
     # Step 5: Re-attach manifest.

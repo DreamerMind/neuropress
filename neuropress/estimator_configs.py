@@ -30,7 +30,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
-import torch
 from pydantic import Field
 from torch import nn
 
@@ -42,7 +41,7 @@ from .estimators import (
     VPTQGroupEstimator,
 )
 from .methods.correction_mode import CorrectionMode
-from .qscheme.zp_scale import ZpScaleScheme
+from .plan import QuantizedWeight
 from .recipe_config import EstimatorConfig, estimator_config
 
 # ---------------------------------------------------------------------------
@@ -100,37 +99,22 @@ def _resolve_module_class(target: str) -> type[nn.Module]:
 
 @dataclass(frozen=True)
 class WeightTransformEntry:
-    """Registry entry pairing a weight-transform callable with an optional filter.
+    """Destination-format conversion and target constraints.
 
-    Attributes:
-        transform: Callable ``(weight, name) -> value | None`` applied to the
-            quantization-corrected weight after each layer.  Return *None* to
-            skip a layer from the plan.
-        filter_fn: Optional extra filter ``(name, module) -> bool`` applied in
-            addition to the estimator's ``module_classes`` check.  Use this to
-            enforce backend-specific shape constraints (e.g. group-size
-            divisibility for tract Q4_0).
-        quantized_transform: Optional GPTQ adapter receiving the selected scheme
-            alongside the weights, so packing does not recalibrate them.
-        storage_bits: Effective bits per weight on disk, *including* all
-            quantization-metadata overhead (scales, zero-points).  For example,
-            4-bit packed weights with one f16 scale per 32-element group cost
-            4 + 16/32 = 4.5 effective bpw, so ``storage_bits=4.5``.  ``None``
-            means unknown; size estimation falls back to the estimator's
-            quantization ``nbits``.
-        group_size: Per-group quantization group size used by this transform
-            (e.g. 32 for all Q4_0 variants).  Used by module filters to
-            enforce divisibility constraints.  ``None`` means the transform
-            uses per-channel granularity.
+    transform receives a QuantizedWeight assignment and module name. It must
+    preserve the selected codes and scheme, apart from rounding required by
+    the storage format. It runs in the model adapter, not the estimator.
+    filter_fn selects compatible modules. storage_bits includes metadata
+    overhead; group_size describes the destination storage blocks. nbits and
+    symmetric, when set, are the scheme the format can store.
     """
 
-    transform: Callable[[torch.Tensor, str], Any | None]
+    transform: Callable[[QuantizedWeight, str], Any | None]
     filter_fn: Callable[[str, nn.Module], bool] | None = None
     storage_bits: float | None = None
     group_size: int | None = None
-    quantized_transform: (
-        Callable[[torch.Tensor, ZpScaleScheme, str], Any | None] | None
-    ) = None
+    nbits: int | None = None
+    symmetric: bool | None = None
 
 
 WEIGHT_TRANSFORM_REGISTRY: dict[str, WeightTransformEntry] = {}
@@ -152,6 +136,42 @@ registered by :mod:`neuropress.transforms.weight_only` on import::
 """
 
 
+def _resolve_weight_transform(
+    key: str | None,
+    *,
+    nbits: int,
+    symmetric: bool,
+    group_size: int,
+) -> WeightTransformEntry | None:
+    """Return the registry entry for *key*, checking the scheme it must store.
+
+    Failing here spares the estimation work a mismatch would otherwise waste,
+    since conversion only runs in the adapter.
+
+    Raises:
+        ValueError: If *key* is unregistered or the format cannot store the
+            configured scheme.
+    """
+    if key is None:
+        return None
+    entry = WEIGHT_TRANSFORM_REGISTRY.get(key)
+    if entry is None:
+        raise ValueError(
+            f"Unknown weight transform {key!r}. "
+            f"Available: {sorted(WEIGHT_TRANSFORM_REGISTRY)}"
+        )
+    if entry.nbits is not None and nbits != entry.nbits:
+        raise ValueError(f"{key} requires nbits={entry.nbits}, got {nbits}")
+    if entry.symmetric is not None and symmetric != entry.symmetric:
+        raise ValueError(f"{key} requires symmetric={entry.symmetric}, got {symmetric}")
+    if entry.group_size is not None and group_size % entry.group_size:
+        raise ValueError(
+            f"{key} requires group_size divisible by {entry.group_size}, "
+            f"got {group_size}"
+        )
+    return entry
+
+
 # ---------------------------------------------------------------------------
 # Concrete estimator configs
 # ---------------------------------------------------------------------------
@@ -159,21 +179,10 @@ registered by :mod:`neuropress.transforms.weight_only` on import::
 
 @estimator_config("gptq")
 class GptqEstimatorConfig(EstimatorConfig):
-    """JSON-serialisable config for :class:`.GPTQEstimator`.
+    """JSON configuration for GPTQ estimation and its destination format.
 
-    Attributes:
-        type: Discriminator field, always ``"gptq"``.
-        target: Module class to quantize (``"linear"``, ``"conv2d"``,
-            ``"embedding"``).
-        group_size: Preferred group size for per-group granularity.
-        nbits: Quantization bit-width.
-        symmetric: Whether to use symmetric quantization.
-        damp_percent: Initial Hessian dampening fraction.
-        damp_auto_increment: Dampening increment on Cholesky failure.
-        weight_transform: Optional key into :data:`WEIGHT_TRANSFORM_REGISTRY`.
-            When set, the matching :class:`WeightTransformEntry` supplies both
-            the ``weight_transform`` callable (stored in the plan) and the
-            optional ``filter_fn`` (extra module-selection constraint).
+    weight_transform is a registry key resolved by the model adapter. Format
+    constraints select compatible modules before estimation.
     """
 
     type: Literal["gptq"] = "gptq"
@@ -194,23 +203,19 @@ class GptqEstimatorConfig(EstimatorConfig):
             :data:`WEIGHT_TRANSFORM_REGISTRY`.
 
         Raises:
-            ValueError: If :attr:`weight_transform` is set but not registered.
+            ValueError: If :attr:`weight_transform` is unregistered or cannot
+                store the configured scheme.
         """
-        entry: WeightTransformEntry | None = None
-        if self.weight_transform is not None:
-            entry = WEIGHT_TRANSFORM_REGISTRY.get(self.weight_transform)
-            if entry is None:
-                raise ValueError(
-                    f"Unknown weight transform {self.weight_transform!r}. "
-                    f"Available: {sorted(WEIGHT_TRANSFORM_REGISTRY)}"
-                )
+        entry = _resolve_weight_transform(
+            self.weight_transform,
+            nbits=self.nbits,
+            symmetric=self.symmetric,
+            group_size=self.group_size,
+        )
         return GPTQEstimator(
             module_classes=(_resolve_module_class(self.target),),
             filter_fn=entry.filter_fn if entry is not None else None,
-            weight_transform=entry.transform if entry is not None else None,
-            quantized_weight_transform=entry.quantized_transform
-            if entry is not None
-            else None,
+            weight_transform=self.weight_transform,
             group_size=self.group_size,
             nbits=self.nbits,
             symmetric=self.symmetric,
@@ -264,22 +269,10 @@ class GptqPanelEstimatorConfig(EstimatorConfig):
 
 @estimator_config("min_max_zp_weight")
 class MinMaxZpWeightEstimatorConfig(EstimatorConfig):
-    """JSON-serialisable config for :class:`.MinMaxZpWeightEstimator`.
+    """JSON configuration for min/max estimation and its destination format.
 
-    Attributes:
-        type: Discriminator field, always ``"min_max_zp_weight"``.
-        target: Module class to quantize (``"linear"``, ``"conv2d"``,
-            ``"embedding"``).
-        nbits: Quantization bit-width.
-        symmetric: Whether to use symmetric quantization.
-        weight_transform: Optional key into :data:`WEIGHT_TRANSFORM_REGISTRY`.
-            When set, the matching :class:`WeightTransformEntry` supplies both
-            the ``weight_transform`` callable (stored in the plan) and the
-            optional ``filter_fn`` (extra module-selection constraint).
-        group_size: Group size used by the weight transform for per-group
-            quantization scale storage.  Ignored when *weight_transform* is
-            ``None``.  Should match the transform's own group size (e.g. 32
-            for all Q4_0 variants).
+    Named formats use group_size weight groups. Without a named format,
+    quantization is per-tensor. Conversion runs in the model adapter.
     """
 
     type: Literal["min_max_zp_weight"] = "min_max_zp_weight"
@@ -298,20 +291,19 @@ class MinMaxZpWeightEstimatorConfig(EstimatorConfig):
             from :data:`WEIGHT_TRANSFORM_REGISTRY`.
 
         Raises:
-            ValueError: If :attr:`weight_transform` is set but not registered.
+            ValueError: If :attr:`weight_transform` is unregistered or cannot
+                store the configured scheme.
         """
-        entry: WeightTransformEntry | None = None
-        if self.weight_transform is not None:
-            entry = WEIGHT_TRANSFORM_REGISTRY.get(self.weight_transform)
-            if entry is None:
-                raise ValueError(
-                    f"Unknown weight transform {self.weight_transform!r}. "
-                    f"Available: {sorted(WEIGHT_TRANSFORM_REGISTRY)}"
-                )
+        entry = _resolve_weight_transform(
+            self.weight_transform,
+            nbits=self.nbits,
+            symmetric=self.symmetric,
+            group_size=self.group_size,
+        )
         return MinMaxZpWeightEstimator(
             module_classes=(_resolve_module_class(self.target),),
             filter_fn=entry.filter_fn if entry is not None else None,
-            weight_transform=entry.transform if entry is not None else None,
+            weight_transform=self.weight_transform,
             nbits=self.nbits,
             symmetric=self.symmetric,
             group_size=self.group_size,
@@ -358,20 +350,19 @@ class HqqEstimatorConfig(EstimatorConfig):
             :data:`WEIGHT_TRANSFORM_REGISTRY`.
 
         Raises:
-            ValueError: If :attr:`weight_transform` is set but not registered.
+            ValueError: If :attr:`weight_transform` is unregistered or cannot
+                store the configured scheme.
         """
-        entry: WeightTransformEntry | None = None
-        if self.weight_transform is not None:
-            entry = WEIGHT_TRANSFORM_REGISTRY.get(self.weight_transform)
-            if entry is None:
-                raise ValueError(
-                    f"Unknown weight transform {self.weight_transform!r}. "
-                    f"Available: {sorted(WEIGHT_TRANSFORM_REGISTRY)}"
-                )
+        entry = _resolve_weight_transform(
+            self.weight_transform,
+            nbits=self.nbits,
+            symmetric=self.symmetric,
+            group_size=self.group_size,
+        )
         return HQQEstimator(
             module_classes=(_resolve_module_class(self.target),),
             filter_fn=entry.filter_fn if entry is not None else None,
-            weight_transform=entry.transform if entry is not None else None,
+            weight_transform=self.weight_transform,
             group_size=self.group_size,
             nbits=self.nbits,
             symmetric=self.symmetric,
