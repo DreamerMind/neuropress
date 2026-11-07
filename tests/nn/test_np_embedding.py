@@ -29,7 +29,7 @@ def _pack_nibbles(values: torch.Tensor, nbits: int) -> torch.Tensor:
     return packed
 
 
-def _build_packed_embedding(V=4, D=32, nbits=4, group_size=8, backend="compile"):
+def _build_packed_embedding(V=4, D=64, nbits=4, group_size=32, backend="compile"):
     torch.manual_seed(0)
     n_groups = D // group_size
     quant_values = torch.randint(0, 2**nbits, (V, D))
@@ -63,7 +63,7 @@ class TestToQTensor:
         emb.to_qtensor()
 
     def test_roundtrip_matches_forward_dequant(self):
-        V, D, nbits, group_size = 4, 32, 4, 8
+        V, D, nbits, group_size = 4, 64, 4, 32
         emb, packed, scale = _build_packed_embedding(V, D, nbits, group_size)
 
         q = emb.to_qtensor()
@@ -110,7 +110,7 @@ class TestFromEmbeddingRelowerRoundtrip:
         from neuropress.t2n.packing import BitPacking4
 
         torch.manual_seed(0)
-        V, D, group_size = 4, 32, 8
+        V, D, group_size = 4, 64, 32
         weight_f = torch.randn(V, D, dtype=torch.float16)
         q_scheme = qscale_per_group_f16_min_max_calibration(
             weight_f, n_bits=4, group_size=group_size

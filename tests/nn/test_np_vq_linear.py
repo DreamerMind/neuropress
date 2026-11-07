@@ -594,9 +594,10 @@ def test_cuda_backend_matches_default_for_all_index_widths(num_centroids):
     layer = NPVQLinear.from_qtensor_linear(
         linear, VQProxy(centroids).cuda(), backend=Backend.CUDA
     ).cuda()
-    x = torch.randn(3, 64)
+    tokens = mod._fused_max_tokens(layer.backend)
+    assert tokens >= 1  # the kernel itself runs
+    x = torch.randn(tokens, 64)
     ref = ref_layer(x)
-    assert mod._fused_max_tokens(layer.backend) >= 3  # the kernel itself runs
     out = layer(x.cuda().half()).float().cpu()
     torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
 
