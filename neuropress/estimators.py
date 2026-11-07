@@ -39,6 +39,7 @@ except ImportError:
 
 import torch
 from torch import nn
+from torch_to_nnef.exceptions import T2NErrorImpossibleQuantization
 
 from .calibration.probe import StatisticRequest, StatisticsRegistry
 from .estimator import QuantizationParamEstimator
@@ -50,6 +51,7 @@ from .methods.hqq import HQQCalibration
 from .methods.zp_scale_calib import NormZpScaleCalibration
 from .plan import QuantizationPlan
 from .qscheme.descriptor import Granularity
+from .qscheme.zp_scale import ZpScaleScheme
 from .quantization.cache import CacheStageDescriptor, NullCacheManager
 from .quantization.spans import timed_span
 from .recipe import QuantizationRecipe
@@ -120,7 +122,7 @@ def _gptq_layer(
     symmetric: bool,
     damp_percent: float,
     damp_auto_increment: float,
-) -> None:
+) -> ZpScaleScheme:
     """Apply GPTQ to *mod*, updating its weight in-place to dequantized floats.
 
     Granularity is chosen per layer: per-group when ``in_features`` is
@@ -160,7 +162,7 @@ def _gptq_layer(
     calib.device = device
     calib.init()
     registry.inject(calib, name)
-    calib.compute_qscheme()
+    return calib.compute_qscheme()
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +188,8 @@ class GPTQEstimator(QuantizationParamEstimator):
             value is stored in :attr:`.QuantizationPlan.weight_assignments`.
             Return *None* to skip a layer from the plan.  If *None*, GPTQ
             updates weights in-place and no plan entries are created.
+        quantized_weight_transform: Optional ``(weight, qscheme, name)`` adapter
+            that preserves the GPTQ grid. Takes precedence over weight_transform.
         group_size: Preferred group size for per-group granularity.  Layers
             whose ``in_features`` is not divisible by *group_size* fall back
             to per-channel granularity.
@@ -198,6 +202,9 @@ class GPTQEstimator(QuantizationParamEstimator):
     module_classes: tuple[type[nn.Module], ...] = field(default=(nn.Linear,))
     filter_fn: Callable[[str, nn.Module], bool] | None = None
     weight_transform: Callable[[torch.Tensor, str], Any] | None = None
+    quantized_weight_transform: (
+        Callable[[torch.Tensor, ZpScaleScheme, str], Any] | None
+    ) = None
     group_size: int = 128
     nbits: int = 4
     symmetric: bool = True
@@ -267,7 +274,8 @@ class GPTQEstimator(QuantizationParamEstimator):
         """Run GPTQ per layer and return a :class:`.QuantizationPlan`.
 
         Weights are updated in-place to GPTQ-corrected dequantized floats.
-        If *weight_transform* is set, its output is stored in the plan's
+        A *quantized_weight_transform* receives the selected scheme and takes
+        precedence over *weight_transform*. Its output is stored in the plan's
         ``weight_assignments``.
 
         Args:
@@ -321,7 +329,7 @@ class GPTQEstimator(QuantizationParamEstimator):
 
                 try:
                     with timed_span(spans, "gptq.layer", layer=name):
-                        _gptq_layer(
+                        qscheme = _gptq_layer(
                             name,
                             mod,
                             registry,
@@ -349,7 +357,19 @@ class GPTQEstimator(QuantizationParamEstimator):
                 if _RICH:
                     progress.advance(task_id)
 
-                if self.weight_transform is not None:
+                if self.quantized_weight_transform is not None:
+                    try:
+                        q = self.quantized_weight_transform(mod.weight, qscheme, name)
+                    except (
+                        T2NErrorImpossibleQuantization,
+                        ValueError,
+                        AssertionError,  # torch_to_nnef's QTensor shape checks
+                    ) as exc:
+                        LOGGER.error("'%s' keeps GPTQ float weights: %s", name, exc)
+                        q = None
+                    if q is not None:
+                        assignments[name] = q
+                elif self.weight_transform is not None:
                     if mod.weight.dim() < 2:
                         LOGGER.warning(
                             "Skipping weight_transform for '%s': %dD weight %s",

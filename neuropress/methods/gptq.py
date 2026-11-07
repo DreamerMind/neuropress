@@ -455,9 +455,10 @@ class GPTQCalibration(CalibrationMethodOnActivation[T_SUPPORTED_QSCHEMES]):
         if math.isnan(avg_loss):
             raise ValueError("GPTQ: NaN loss encountered")
 
+        # Read before postprocessing restores the original weight layout.
+        n_cols = q_data.quant_weights.shape[1]
         self._quantize_postprocess(q_data)
 
-        n_cols = q_data.quant_weights.shape[-1]
         final_qscheme = self.build_global_tensor_qscheme(q_data.qschemes, n_cols)
 
         if self.offload_intermediate_tensor_on_disk:
