@@ -22,6 +22,7 @@ from .smooth_quant import (
     apply_smooth_quant,
     compute_smooth_scales,
 )
+from .ternary import TernaryGPTQCalibration, TernaryScaleCalibration
 from .zp_scale_calib import (
     MinMaxZpScaleCalibration,
     NormZpScaleCalibration,
@@ -39,6 +40,8 @@ METHOD_REGISTRY.update(
         "gptq": GPTQCalibration,
         "gptq_mixed": GPTQMixedPrecisionCalibration,
         "hqq": HQQCalibration,
+        "ternary": TernaryScaleCalibration,
+        "ternary_gptq": TernaryGPTQCalibration,
     }
 )
 
@@ -59,6 +62,8 @@ __all__ = [
     "QBlockOutput",
     "QProcessingData",
     "QuantizerScore",
+    "TernaryGPTQCalibration",
+    "TernaryScaleCalibration",
     "ZpScaleCalibration",
     "absorb_scale_into_prev",
     "apply_scale_to_linear",

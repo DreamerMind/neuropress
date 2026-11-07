@@ -147,6 +147,68 @@ class HadamardRotationStep(PreprocessingStep):
         )
 
 
+@dataclass
+class TernaryHadamardStep(PreprocessingStep):
+    """Apply the blockwise signed-Hadamard basis used by ternary kernels."""
+
+    block_size: int = 1024
+    seed: int = 1234
+    module_suffixes: tuple[str, ...] | None = None
+    dense_modules: tuple[str, ...] = ("lm_head",)
+
+    def apply(self, model: nn.Module, calibration_data: list[dict[str, Any]]) -> None:
+        """Fold signed block-Hadamard transforms into selected linears."""
+        from .transforms.ternary_hadamard import (
+            DENSE_MODULES_ATTR,
+            PRISM_TERNARY_SOURCE_SUFFIXES,
+            TernaryHadamardInputLinear,
+            apply_ternary_hadamard,
+            is_prism_ternary_source_module,
+            matches_module_list,
+        )
+
+        suffixes = (
+            PRISM_TERNARY_SOURCE_SUFFIXES
+            if self.module_suffixes is None
+            else self.module_suffixes
+        )
+
+        def is_candidate(name: str) -> bool:
+            if self.module_suffixes is None:
+                return is_prism_ternary_source_module(name)
+            return name.rsplit(".", 1)[-1] in suffixes
+
+        dense = tuple(
+            name
+            for name, module in model.named_modules()
+            if isinstance(module, nn.Linear)
+            and is_candidate(name)
+            and matches_module_list(name, self.dense_modules)
+        )
+
+        def module_filter(name: str, _module: nn.Linear) -> bool:
+            return is_candidate(name) and name not in dense
+
+        apply_ternary_hadamard(
+            model,
+            block_size=self.block_size,
+            seed=self.seed,
+            module_filter=module_filter,
+            strict_width=True,
+        )
+        setattr(model, DENSE_MODULES_ATTR, dense)
+
+        # Folding replaced lm_head.weight, so a tie with the embedding is
+        # already broken; keep the config truthful for save/export.
+        config = getattr(model, "config", None)
+        if (
+            config is not None
+            and getattr(config, "tie_word_embeddings", False)
+            and isinstance(getattr(model, "lm_head", None), TernaryHadamardInputLinear)
+        ):
+            config.tie_word_embeddings = False
+
+
 # ---------------------------------------------------------------------------
 # Serialisable config hierarchy (JSON-round-trippable counterparts)
 # ---------------------------------------------------------------------------
@@ -268,6 +330,30 @@ class HadamardRotationStepConfig(PreprocessingStepConfig):
         )
 
 
+@preprocessing_step_config("ternary_hadamard")
+class TernaryHadamardStepConfig(PreprocessingStepConfig):
+    """Serializable config for :class:`TernaryHadamardStep`."""
+
+    type: Literal["ternary_hadamard"] = "ternary_hadamard"
+    block_size: Literal[1024] = 1024
+    seed: int = 1234
+    module_suffixes: list[str] | None = None
+    dense_modules: list[str] = ["lm_head"]
+
+    def build(self) -> TernaryHadamardStep:
+        """Build a blockwise ternary Hadamard preprocessing step."""
+        return TernaryHadamardStep(
+            block_size=self.block_size,
+            seed=self.seed,
+            module_suffixes=(
+                tuple(self.module_suffixes)
+                if self.module_suffixes is not None
+                else None
+            ),
+            dense_modules=tuple(self.dense_modules),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Runtime registry (step class lookup by name)
 # ---------------------------------------------------------------------------
@@ -276,4 +362,5 @@ PREPROCESSING_REGISTRY: dict[str, type[PreprocessingStep]] = {
     "smooth_quant": SmoothQuantStep,
     "hadamard_rotation": HadamardRotationStep,
     "down_proj_smooth": DownProjSmoothStep,
+    "ternary_hadamard": TernaryHadamardStep,
 }

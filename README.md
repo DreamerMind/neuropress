@@ -181,6 +181,85 @@ See all keys with `neuropress-eval list`.  Built-in entries:
 | `open_text_c4_gptq_panel_q4q2_linear_256samples` | GPTQ mixed Q4/Q2 linear (3.0 avg bpw) |
 | `speech_librispeech_gptq_q4_0_256samples` | GPTQ Q4_0 (LibriSpeech, 256 samples) |
 
+### Ternary PTQ for vLLM
+
+NeuroPress includes a Bonsai-style path that combines blockwise signed
+Hadamard preprocessing, strict ternary GPTQ, group-128 FP16 scales, and export
+to the [`prism_ternary`](https://github.com/fraserprice/bonsai-vllm) vLLM
+checkpoint layout.
+
+```python
+from neuropress import QuantizationPipeline, QuantizationRecipeConfig
+from neuropress.formats import export_prism_ternary_checkpoint
+
+recipe = QuantizationRecipeConfig.model_validate(
+    {
+        "calibration": {"dataset": "c4", "seq_len": 2048, "n_samples": 128},
+        "preprocessing": [
+            {"type": "ternary_hadamard", "block_size": 1024, "seed": 1234}
+        ],
+        "estimator": {
+            "type": "ternary_gptq",
+            "group_size": 128,
+            "threshold_ratio": 0.4,
+        },
+        "kernel_lowering": None,
+    }
+).build()
+
+quantized = QuantizationPipeline(recipe).run(model, calibration_batches)
+export_prism_ternary_checkpoint(
+    quantized,
+    "./model-ternary-vllm",
+    base_config="./base-hf-checkpoint",
+)
+```
+
+The exported checkpoint stores codes `0/1/2` as 16 two-bit lanes per int32,
+uses one FP16 scale for every 128 columns, and embeds the shared sign vectors
+in `config.json`. Code `3` is reserved and never emitted. Install the vLLM
+plugin before serving the result. The exporter deliberately refuses ordinary
+2-bit affine weights; its input must already be strict ternary after GPTQ.
+The `0.4` threshold is an empirical Bonsai-format match, not a published Prism
+hyperparameter. By default the estimator also searches `threshold_grid`
+(`0.3` to `0.6`) for every group and keeps the ratio with the lowest
+Hessian-weighted error; pass `"threshold_grid": []` to use `threshold_ratio`
+alone.
+
+Calibration is block-sequential by default (`"sequential": true`): decoder
+blocks are quantized in order, each Hessian is collected after the
+projections that run before it have been quantized, and the quantized block's
+outputs feed the next block. Set `"sequential": false` to collect every
+Hessian from the unquantized model in a single global pass.
+
+`ternary_hadamard` leaves the modules in `dense_modules` (default
+`["lm_head"]`) unwrapped. The exporter keeps them in the checkpoint's dense
+weights and lists them under `quantization_config.dense_modules`; the vLLM
+plugin must honor that key to load them as ordinary linears. When `lm_head`
+is made ternary on a model with tied embeddings, the Hadamard fold unties it
+and the exported config sets `tie_word_embeddings` to `false`.
+
+The current exporter is intentionally text-only: it omits the vision tower to
+match the plugin's verified serving path. Start vLLM with
+`--language-model-only`. Multimodal export should only be added after the
+plugin's visual-layer selection and a complete image request have been tested
+end to end.
+
+The ternary recipe shares Hessians between sibling projections with
+identical inputs. Sequential calibration keeps only one block's Hessians
+resident. For the global pass on large models, `"offload_hessians": true`
+offloads each unique Hessian between calibration updates. This bounds
+resident memory at the cost of heavy disk traffic and temporary disk space
+(roughly the sum of the unique FP32 Hessian sizes); point the system
+temporary directory at a volume with enough free space. Export is transactional and packs weights in row
+chunks, so a failed validation does not leave a partial checkpoint.
+
+The asynchronous Hessian prefetch path uses the scoped residency API merged in
+`torch-to-nnef` PR 354. Until that API appears in a release after 0.24.8,
+`uv sync` from this repository uses the pinned upstream commit in
+`tool.uv.sources`. Installations resolved only from released package metadata
+remain correct but log a warning and reload Hessians synchronously.
+
 ---
 
 ## Cloud GPU runner (`neuropress-cloud`)

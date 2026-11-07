@@ -174,17 +174,14 @@ class HessianAccumulator(Collector):
         hessian = hessian + data_f.matmul(data_f.t())
 
         if self.offload_intermediate_tensor_on_disk:
-            try:
-                from torch_to_nnef.tensor.offload import OffloadedTensor
+            from torch_to_nnef.tensor.offload import OffloadedTensor
 
-                if isinstance(self.hessian, OffloadedTensor):
-                    self.hessian.update_values(hessian)
-                else:
-                    self.hessian = OffloadedTensor.from_original_tensor(
-                        hessian, f"{self.name}.hessian", self.offload_dir
-                    )
-            except Exception:
-                self.hessian = hessian
+            if isinstance(self.hessian, OffloadedTensor):
+                self.hessian.update_values(hessian)
+            else:
+                self.hessian = OffloadedTensor.from_original_tensor(
+                    hessian, f"{self.name}.hessian", self.offload_dir
+                )
         else:
             self.hessian = hessian
 

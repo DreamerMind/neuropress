@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import typing
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -18,6 +19,15 @@ from .collectors import (
     StatField,
     StatisticRequest,
 )
+
+
+def _cleanup_offloaded(value: Any) -> None:
+    """Remove disk payloads reachable from a collected statistic."""
+    values = value.values() if isinstance(value, dict) else (value,)
+    for item in values:
+        offload_path = getattr(item, "offload_path", None)
+        if offload_path is not None:
+            Path(offload_path).unlink(missing_ok=True)
 
 
 class StatisticsRegistry:
@@ -194,6 +204,10 @@ class StatisticsRegistry:
                         model(*batch)
                     else:
                         model(batch)
+        except Exception:
+            for collector in collectors.values():
+                _cleanup_offloaded(collector.result())
+            raise
         finally:
             for h in hooks:
                 h.remove()
@@ -223,3 +237,15 @@ class StatisticsRegistry:
         """Return True if the statistic for *request* has been collected."""
         dedupe_key = f"{request.target_key}::{request.stat_type}"
         return dedupe_key in self._stats
+
+    def release(self, request: StatisticRequest) -> None:
+        """Drop a statistic and remove any disk-backed tensor payloads."""
+        dedupe_key = f"{request.target_key}::{request.stat_type}"
+        value = self._stats.pop(dedupe_key, None)
+        _cleanup_offloaded(value)
+
+    def release_all(self) -> None:
+        """Drop all collected statistics and their disk-backed payloads."""
+        for value in self._stats.values():
+            _cleanup_offloaded(value)
+        self._stats.clear()

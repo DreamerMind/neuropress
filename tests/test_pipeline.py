@@ -48,7 +48,7 @@ class _SimpleModel(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def _make_recipe():
+def _make_recipe(estimator=None):
     return QuantizationRecipe(
         allowed_weight_qschemes=[
             QSchemeDescriptor(
@@ -59,7 +59,7 @@ def _make_recipe():
             )
         ],
         allowed_activation_qschemes=[],
-        param_estimator=_IdentityEstimator(),
+        param_estimator=estimator or _IdentityEstimator(),
         adapter=_IdentityAdapter(),
     )
 
@@ -71,6 +71,23 @@ def test_pipeline_runs():
     calib_data = [torch.randn(2, 8) for _ in range(3)]
     result = pipeline.run(model, calib_data)
     assert isinstance(result, nn.Module)
+
+
+def test_pipeline_skips_calibration_forward_when_no_statistics_are_requested():
+    class CountingModel(_SimpleModel):
+        def __init__(self):
+            super().__init__()
+            self.forward_calls = 0
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            self.forward_calls += 1
+            return super().forward(x)
+
+    model = CountingModel()
+    pipeline = QuantizationPipeline(_make_recipe())
+    pipeline.run(model, [torch.randn(2, 8) for _ in range(3)])
+
+    assert model.forward_calls == 1
 
 
 def test_pipeline_output_matches_input_api():
@@ -93,3 +110,24 @@ def test_graph_is_built():
     provider = RuntimeModuleGraphProvider()
     graph = provider.build(model, torch.randn(1, 8))
     assert len(graph.nodes) >= 3  # fc1, relu, fc2 at minimum
+
+
+class _SequentialEstimator(_IdentityEstimator):
+    def __init__(self):
+        self.seen_batches = 0
+
+    def declare_statistics(self):
+        raise AssertionError("sequential estimators skip statistic declaration")
+
+    def calibrate_sequential(self, model, calibration_data):
+        self.seen_batches = sum(1 for _ in calibration_data)
+        return True
+
+
+def test_pipeline_hands_all_batches_to_a_sequential_estimator():
+    estimator = _SequentialEstimator()
+    QuantizationPipeline(_make_recipe(estimator)).run(
+        _SimpleModel(), [torch.randn(2, 8) for _ in range(3)]
+    )
+
+    assert estimator.seen_batches == 3
