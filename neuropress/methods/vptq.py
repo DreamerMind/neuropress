@@ -164,8 +164,10 @@ def importance_weighted_assign(
             return _assign_kernel(
                 weight, centroids, imp_f32, rows, n_groups, vector_len, dev, bias=bias
             )
-        except RuntimeError:
-            LOGGER.warning("CUDA assign kernel unavailable, falling back to cdist")
+        except RuntimeError as exc:
+            from ..kernels import warn_kernel_fallback
+
+            warn_kernel_fallback("kmeans_assign", "chunked torch.cdist", exc)
 
     # ------------------------------------------------------------------
     # Fallback: chunked torch.cdist (CPU or VL != 4).

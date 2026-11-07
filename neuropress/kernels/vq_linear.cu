@@ -91,6 +91,7 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
  *   bits=4:  two 4-bit indices per byte (nibble-packed).
  *   bits=8:  one 8-bit index per byte.
  *   bits=12: two 12-bit indices per 3 bytes.
+ *   bits=10/14/15/16: generic LSB-first bit-stream read.
  *            even flat → byte[flat*3/2],      low nibble of byte[flat*3/2+1]
  *            odd  flat → high nibble of byte[(flat>>1)*3+1], byte[(flat>>1)*3+2]
  */
@@ -102,6 +103,16 @@ __device__ __forceinline__ int unpack_idx(const uint8_t *__restrict__ packed,
   } else if constexpr (BITS == 4) {
     const uint8_t byte = __ldg(&packed[flat >> 1]);
     return (flat & 1) ? (int)(byte >> 4) : (int)(byte & 0xF);
+  } else if constexpr (BITS != 12) {
+    // Generic width (10, 14, 15, 16): read only the bytes the index spans, so
+    // the last index never reads past the end of the buffer.
+    const long long bit_start = (long long)flat * BITS;
+    const long long b0 = bit_start >> 3;
+    const int off = (int)(bit_start & 7);
+    uint32_t w = (uint32_t)__ldg(&packed[b0]) |
+                 ((uint32_t)__ldg(&packed[b0 + 1]) << 8);
+    if (off + BITS > 16) w |= (uint32_t)__ldg(&packed[b0 + 2]) << 16;
+    return (int)((w >> off) & ((1u << BITS) - 1u));
   } else {
     // BITS == 12: 2 indices per 3 bytes, LSB-first bit-stream.
     const int half = flat >> 1;
@@ -246,6 +257,18 @@ static void _vq_launch(const scalar_t *x, const uint8_t *packed,
     case 12:
       VQ_LAUNCH(12, 4);
       return;
+    case 10:
+      VQ_LAUNCH(10, 4);
+      return;
+    case 14:
+      VQ_LAUNCH(14, 4);
+      return;
+    case 15:
+      VQ_LAUNCH(15, 4);
+      return;
+    case 16:
+      VQ_LAUNCH(16, 4);
+      return;
     }
   } else if (vector_len == 8) {
     switch (bits) {
@@ -258,12 +281,24 @@ static void _vq_launch(const scalar_t *x, const uint8_t *packed,
     case 12:
       VQ_LAUNCH(12, 8);
       return;
+    case 10:
+      VQ_LAUNCH(10, 8);
+      return;
+    case 14:
+      VQ_LAUNCH(14, 8);
+      return;
+    case 15:
+      VQ_LAUNCH(15, 8);
+      return;
+    case 16:
+      VQ_LAUNCH(16, 8);
+      return;
     }
   }
 #undef VQ_LAUNCH
 
   TORCH_CHECK(false, "vq_linear: unsupported bits=", bits,
-              " vector_len=", vector_len, ".  Must be bits={4,8,12}, VL={4,8}.");
+              " vector_len=", vector_len, ".  Must be bits={4,8,10,12,14,15,16}, VL={4,8}.");
 }
 
 // Specialised half2 dispatch for fp16 + VL=4.
@@ -288,6 +323,16 @@ static void _vq_launch_h2(const __half *x, const uint8_t *packed,
         <<<grid, _VQ_BLOCK, 0, stream>>>(x, packed, centroids, bias, y, M, N,
                                          n_groups);
     return;
+#define VQ_H2(B)                                                               \
+  case B:                                                                      \
+    _vq_linear_h2<B><<<grid, _VQ_BLOCK, 0, stream>>>(x, packed, centroids,      \
+                                                     bias, y, M, N, n_groups); \
+    return;
+    VQ_H2(10)
+    VQ_H2(14)
+    VQ_H2(15)
+    VQ_H2(16)
+#undef VQ_H2
   }
   TORCH_CHECK(false, "vq_linear: unsupported bits=", bits);
 }
@@ -309,8 +354,10 @@ torch::Tensor vq_linear(torch::Tensor x, torch::Tensor packed_indices,
   TORCH_CHECK(x.dim() == 2, "vq_linear: x must be 2-D [M, K].");
   TORCH_CHECK(centroids.dtype() == torch::kFloat16,
               "vq_linear: centroids must be float16.");
-  TORCH_CHECK(bits == 4 || bits == 8 || bits == 12,
-              "vq_linear: bits must be 4, 8, or 12, got ", bits, ".");
+  TORCH_CHECK(bits == 4 || bits == 8 || bits == 10 || bits == 12 || bits == 14 ||
+                  bits == 15 || bits == 16,
+              "vq_linear: bits must be one of 4, 8, 10, 12, 14, 15, 16, got ",
+              bits, ".");
   TORCH_CHECK(vector_len == 4 || vector_len == 8,
               "vq_linear: vector_len must be 4 or 8, got ", vector_len, ".");
 
@@ -323,7 +370,8 @@ torch::Tensor vq_linear(torch::Tensor x, torch::Tensor packed_indices,
   // Derive N (out_features) from packed_indices size.
   const int total_bytes = packed_indices.numel();
   // General formula: floor(total_bytes * 8 / bits).
-  // Correct for bits=4 (×2), bits=8 (×1), and bits=12 (×2/3 with padding).
+  // Exact for every width: the stream pads by fewer than 8 bits, less than
+  // one index.
   const int total_indices = (int)(((long long)total_bytes * 8) / bits);
   TORCH_CHECK(total_indices % n_groups == 0,
               "vq_linear: packed_indices size mismatch.");

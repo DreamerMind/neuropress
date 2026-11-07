@@ -26,6 +26,9 @@ dependencies = [
     "pydantic>=2.0",
     "safetensors>=0.7.0",
     "pyyaml>=6.0",
+    # Builds the CUDA kernels at first use; without it they silently fall
+    # back to much slower PyTorch paths.
+    "ninja>=1.11",
 ]
 
 [project.optional-dependencies]

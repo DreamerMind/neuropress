@@ -52,7 +52,7 @@ from .methods.zp_scale_calib import NormZpScaleCalibration
 from .plan import F16_MIN_POSITIVE, QuantizationPlan, QuantizedWeight
 from .qscheme.descriptor import Granularity
 from .qscheme.zp_scale import ZpScaleScheme
-from .quantization.cache import CacheStageDescriptor
+from .quantization.cache import CacheStageDescriptor, NullCacheManager
 from .quantization.spans import timed_span
 from .recipe import QuantizationRecipe
 
@@ -806,6 +806,12 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
         default=False, init=False, repr=False, compare=False
     )
     _corrector: Any = field(default=None, init=False, repr=False, compare=False)
+    # Hessian diagonals derived from the full Hessian, keyed by layer name.
+    # Valid only for the registry they came from (see _get_diag_h).
+    _diag_h_memo: dict[str, torch.Tensor | None] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    _diag_h_registry: Any = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         """Apply defaults and build optional sub-objects after dataclass init."""
@@ -1399,8 +1405,17 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
         if not (self.use_hessian_weighting and self.proxy_selector == ProxySelector.L2):
             return None
         if self.gptq_correction_iters:
-            h = self._get_full_hessian(name, K, registry)
-            return h.diagonal().float() if h is not None else None
+            # Fetching the full [K, K] Hessian costs ~0.8 s at K=14336 and this
+            # runs on every E-step, so keep the diagonal per layer instead.
+            if self._diag_h_registry is not registry:
+                self._diag_h_memo = {}
+                self._diag_h_registry = registry
+            if name not in self._diag_h_memo:
+                h = self._get_full_hessian(name, K, registry)
+                self._diag_h_memo[name] = (
+                    h.diagonal().float().clone() if h is not None else None
+                )
+            return self._diag_h_memo[name]
         cache = self._cache
         # Try cache first (warm on resumed runs).
         cached = cache.load("hessian_diag", name)
@@ -1455,8 +1470,10 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
             h = h.to_base_tensor()
         if h.shape != (K, K):
             return None
-        # Persist for next run (CPU float32 to avoid GPU-memory pinning).
-        cache.save("hessian", name, {"hessian": h.cpu().float()})
+        # Persist for next run (CPU float32 to avoid GPU-memory pinning).  The
+        # null cache discards it, so skip the [K, K] host copy entirely.
+        if not isinstance(cache, NullCacheManager):
+            cache.save("hessian", name, {"hessian": h.cpu().float()})
         return h
 
     def _gptq_corrected_assign(

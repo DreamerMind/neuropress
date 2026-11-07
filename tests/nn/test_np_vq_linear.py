@@ -412,3 +412,208 @@ def test_tiered_forward_cuda_tiered_skipped_without_cuda():
     x = torch.randn(2, 32)
     with pytest.raises(RuntimeError, match="CUDA"):
         layer(x)
+
+
+# ---------------------------------------------------------------------------
+# Large-M switch: fused kernels for decode, dequant + GEMM for prefill
+# ---------------------------------------------------------------------------
+
+
+def _fused_layer_with_spies(
+    monkeypatch, backend, lut_max_tokens=16, triton_max_tokens=0
+):
+    import neuropress.nn.np_vq_linear as mod
+
+    monkeypatch.setattr(mod, "_FUSED_MAX_TOKENS", 16)
+    monkeypatch.setattr(mod, "_LUT_MAX_TOKENS", lut_max_tokens)
+    monkeypatch.setattr(mod, "_TRITON_MAX_TOKENS", triton_max_tokens)
+    linear = _make_linear_with_vq(out_features=16, in_features=32)
+    proxy = VQProxy(linear.weight.qscheme.centroids)
+    layer = NPVQLinear.from_qtensor_linear(linear, proxy, backend=backend)
+    calls = []
+    fused = {
+        Backend.CUDA_WMMA: "_forward_cuda_wmma",
+        Backend.CUDA_LUT: "_forward_cuda_lut",
+        Backend.CUDA: "_forward_cuda",
+    }[backend]
+    monkeypatch.setattr(layer, fused, lambda x: calls.append("fused") or x[..., :16])
+    monkeypatch.setattr(
+        layer, "_forward_dequant_gemm", lambda x: calls.append("dense") or x[..., :16]
+    )
+    monkeypatch.setattr(
+        layer, "_forward_triton", lambda x: calls.append("triton") or x[..., :16]
+    )
+    return layer, calls
+
+
+@pytest.mark.parametrize("backend", [Backend.CUDA_WMMA, Backend.CUDA])
+def test_mid_sized_batches_use_triton_band(monkeypatch, backend):
+    layer, calls = _fused_layer_with_spies(monkeypatch, backend, triton_max_tokens=64)
+    layer(torch.randn(16, 32))  # fused
+    layer(torch.randn(17, 32))  # triton
+    layer(torch.randn(64, 32))  # triton, at its threshold
+    layer(torch.randn(65, 32))  # decode + GEMM
+    assert calls == ["fused", "triton", "triton", "dense"]
+
+
+def test_lut_layers_skip_triton_band(monkeypatch):
+    layer, calls = _fused_layer_with_spies(
+        monkeypatch, Backend.CUDA_LUT, lut_max_tokens=0, triton_max_tokens=64
+    )
+    layer(torch.randn(8, 32))
+    assert calls == ["dense"]
+
+
+def test_triton_failure_falls_back_once(monkeypatch):
+    import sys
+    import types
+
+    import neuropress.nn.np_vq_linear as mod
+
+    monkeypatch.setattr(mod, "_triton_failed", False)
+    linear = _make_linear_with_vq(out_features=16, in_features=32)
+    layer = NPVQLinear.from_qtensor_linear(
+        linear, VQProxy(linear.weight.qscheme.centroids), backend=Backend.CUDA_WMMA
+    )
+    calls = []
+
+    def _boom(*args, **kwargs):
+        calls.append("triton")
+        raise RuntimeError("no triton here")
+
+    # A stand-in module: CPU-only installs have no Triton to import.
+    fake = types.ModuleType("neuropress.kernels.vq_triton")
+    fake.vq_gemm_triton = _boom
+    monkeypatch.setitem(sys.modules, "neuropress.kernels.vq_triton", fake)
+    monkeypatch.setattr(
+        layer, "_forward_dequant_gemm", lambda x: calls.append("dense") or x[..., :16]
+    )
+    x = torch.randn(4, 32, dtype=torch.bfloat16)
+    layer._forward_triton(x)
+    layer._forward_triton(x)
+    assert calls == ["triton", "dense", "dense"]
+
+
+@pytest.mark.parametrize("backend", [Backend.CUDA_WMMA, Backend.CUDA_LUT, Backend.CUDA])
+def test_fused_backend_keeps_kernel_up_to_threshold(monkeypatch, backend):
+    layer, calls = _fused_layer_with_spies(monkeypatch, backend)
+    layer(torch.randn(1, 32))
+    layer(torch.randn(2, 8, 32))  # 16 tokens, at the threshold
+    assert calls == ["fused", "fused"]
+
+
+@pytest.mark.parametrize("backend", [Backend.CUDA_WMMA, Backend.CUDA_LUT, Backend.CUDA])
+def test_fused_backend_switches_to_dequant_gemm_above_threshold(monkeypatch, backend):
+    layer, calls = _fused_layer_with_spies(monkeypatch, backend)
+    layer(torch.randn(17, 32))
+    layer(torch.randn(2, 9, 32))  # leading dims count as tokens
+    assert calls == ["dense", "dense"]
+
+
+def test_lut_backend_uses_dequant_gemm_by_default(monkeypatch):
+    """cuda_lut loses to decode + GEMM at every token count, even M=1."""
+    import neuropress.nn.np_vq_linear as mod
+
+    layer, calls = _fused_layer_with_spies(
+        monkeypatch, Backend.CUDA_LUT, lut_max_tokens=mod._LUT_MAX_TOKENS
+    )
+    layer(torch.randn(1, 32))
+    assert calls == ["dense"]
+
+
+def test_large_m_switch_matches_dequant():
+    """The rerouted path computes the same result as the dequantized weight."""
+    import neuropress.nn.np_vq_linear as mod
+
+    linear = _make_linear_with_vq(out_features=16, in_features=32)
+    proxy = VQProxy(linear.weight.qscheme.centroids)
+    layer = NPVQLinear.from_qtensor_linear(linear, proxy, backend=Backend.DEFAULT)
+    x = torch.randn(40, 32)
+    ref = layer(x)
+    out = mod._vq_dequant_linear(
+        x,
+        layer.packed_indices,
+        layer.proxy.centroids,
+        layer.bits,
+        layer.n_vectors,
+        layer.out_features,
+        layer.in_features,
+        layer.bias,
+    )
+    torch.testing.assert_close(out, ref)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("bits", [4, 8, 10, 12, 14, 16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_vq_dequant_kernel_matches_python_decode(bits, dtype):
+    from neuropress.kernels import vq_dequant
+    from neuropress.transforms.vq_packing import IndexPacking
+
+    out_features, in_features, vl = 37, 64, 4  # odd N: last index ends mid-byte
+    nc = min(1 << bits, 4096)
+    n_vectors = out_features * in_features // vl
+    idx = torch.randint(0, nc, (n_vectors,), device="cuda")
+    centroids = torch.randn(nc, vl, device="cuda", dtype=torch.float16)
+    packed = IndexPacking.pack(idx, bits)
+    ref = centroids[idx].reshape(out_features, in_features).to(dtype)
+    out = vq_dequant(packed, centroids, bits, out_features, in_features, dtype)
+    assert out.dtype == dtype
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_dequant_gemm_forward_matches_default():
+    linear = _make_linear_with_vq(out_features=48, in_features=64, num_centroids=16)
+    centroids = linear.weight.qscheme.centroids
+    ref_layer = NPVQLinear.from_qtensor_linear(
+        linear, VQProxy(centroids), backend=Backend.DEFAULT
+    )
+    # The proxy is shared across layers, not a child module: move it separately.
+    layer = NPVQLinear.from_qtensor_linear(
+        linear, VQProxy(centroids).cuda(), backend=Backend.DEFAULT
+    ).cuda()
+    x = torch.randn(100, 64)
+    ref = ref_layer(x)
+    out = layer._forward_dequant_gemm(x.cuda())
+    torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("num_centroids", [16, 256, 1024, 4096, 16384])
+def test_cuda_backend_matches_default_for_all_index_widths(num_centroids):
+    import neuropress.nn.np_vq_linear as mod
+
+    linear = _make_linear_with_vq(
+        out_features=24, in_features=64, num_centroids=num_centroids
+    )
+    centroids = linear.weight.qscheme.centroids
+    ref_layer = NPVQLinear.from_qtensor_linear(
+        linear, VQProxy(centroids), backend=Backend.DEFAULT
+    )
+    layer = NPVQLinear.from_qtensor_linear(
+        linear, VQProxy(centroids).cuda(), backend=Backend.CUDA
+    ).cuda()
+    x = torch.randn(3, 64)
+    ref = ref_layer(x)
+    assert mod._fused_max_tokens(layer.backend) >= 3  # the kernel itself runs
+    out = layer(x.cuda().half()).float().cpu()
+    torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_triton_forward_matches_dequant_gemm():
+    """Same bf16 input through both paths: only accumulation order differs."""
+    pytest.importorskip("triton")
+    linear = _make_linear_with_vq(out_features=48, in_features=64, num_centroids=16)
+    layer = NPVQLinear.from_qtensor_linear(
+        linear,
+        VQProxy(linear.weight.qscheme.centroids).cuda(),
+        backend=Backend.DEFAULT,
+    ).cuda()
+    x = torch.randn(2, 50, 64, device="cuda", dtype=torch.bfloat16)
+    ref = layer._forward_dequant_gemm(x).float()
+    out = layer._forward_triton(x).float()
+    assert out.shape == (2, 50, 48)
+    # bf16 has an 8-bit mantissa: allow two units in the last place.
+    torch.testing.assert_close(out, ref, rtol=2 * 2**-8, atol=1e-2)

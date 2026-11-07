@@ -10,7 +10,7 @@ Available functions:
         (scale-only) and asymmetric (scale + zero_point) schemes.
 
     :func:`vq_linear` — fused VQ-weight linear (``vq_linear.cu``).
-        Unpacks 4, 8, or 12-bit codebook indices, gathers centroids, and
+        Unpacks 4- to 16-bit codebook indices, gathers centroids, and
         accumulates — without materialising the float weight matrix.
 
     :func:`dequantize_vq_weight` — materialise a fp16 weight matrix from
@@ -230,7 +230,7 @@ def vq_linear(
             Length = ``N * n_groups`` for ``bits=8``, or
             ``ceil(N * n_groups / 2)`` for ``bits=4``.
         centroids: Codebook ``[num_centroids, vector_len]`` float16, on CUDA.
-        bits: Bits per index — 4, 8, or 12.
+        bits: Bits per index: 4, 8, 10, 12, 14, 15 or 16.
         vector_len: Number of weight elements per VQ vector.
         bias: Optional float bias ``[N]`` (any float dtype).
 
@@ -424,6 +424,109 @@ def vq_lut_gather(
         ``[M, N]`` float32 CUDA tensor.
     """
     return _load_lut_extension().vq_lut_gather(lut, packed_indices, bits, out_features)
+
+
+# ---------------------------------------------------------------------------
+# Fallback reporting
+# ---------------------------------------------------------------------------
+
+_warned_fallbacks: set[str] = set()
+
+
+def warn_kernel_fallback(kernel: str, fallback: str, exc: BaseException) -> None:
+    """Warn once per *kernel* that it is unavailable and *fallback* runs instead.
+
+    Fallback paths can be one to two orders of magnitude slower, so the
+    message carries the underlying error and the usual fix (the JIT build
+    needs ``ninja`` and ``nvcc``).  Later calls for the same kernel are silent.
+    """
+    if kernel in _warned_fallbacks:
+        return
+    _warned_fallbacks.add(kernel)
+    log.warning(
+        "CUDA kernel %s unavailable (%s); using %s instead, which can be much "
+        "slower. The JIT build needs ninja (pip install ninja) and nvcc on PATH "
+        "or under CUDA_HOME.",
+        kernel,
+        exc,
+        fallback,
+    )
+
+
+# ---------------------------------------------------------------------------
+# VQ one-pass weight decode extension (vq_dequant.cu)
+# ---------------------------------------------------------------------------
+
+_vq_dequant_ext: object = None
+_vq_dequant_build_failed: bool = False
+
+
+def _load_dequant_extension() -> object:
+    """JIT-build (once) and return the ``neuropress_vq_dequant_kernels`` extension."""
+    global _vq_dequant_ext, _vq_dequant_build_failed
+    if _vq_dequant_ext is not None:
+        return _vq_dequant_ext
+    if _vq_dequant_build_failed:
+        raise RuntimeError(
+            "neuropress_vq_dequant_kernels failed to build on a previous attempt. "
+            "Ensure CUDA is available and the CUDA toolkit is installed."
+        )
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available.  vq_dequant requires a CUDA device.")
+    from torch.utils.cpp_extension import load
+
+    src = Path(__file__).parent / "vq_dequant.cu"
+    try:
+        log.info("JIT-building neuropress_vq_dequant_kernels from %s …", src)
+        _vq_dequant_ext = load(
+            name="neuropress_vq_dequant_kernels",
+            sources=[str(src)],
+            extra_cuda_cflags=["-O3", "-std=c++20", "-arch=native"],
+            extra_cflags=["-O3", "-std=c++20"],
+            verbose=False,
+        )
+        log.info("neuropress_vq_dequant_kernels built successfully.")
+    except Exception as exc:
+        _vq_dequant_build_failed = True
+        raise RuntimeError(
+            f"Failed to JIT-build neuropress_vq_dequant_kernels: {exc}"
+        ) from exc
+    return _vq_dequant_ext
+
+
+def vq_dequant(
+    packed_indices: torch.Tensor,
+    centroids: torch.Tensor,
+    bits: int,
+    out_features: int,
+    in_features: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Decode a packed VQ weight to a dense ``[out_features, in_features]`` tensor.
+
+    One kernel launch: each thread reads one ``bits``-wide index from the
+    LSB-first bit-stream and writes its centroid row converted to *dtype*.
+
+    Args:
+        packed_indices: 1-D ``uint8`` CUDA bit-stream from
+            :meth:`~neuropress.transforms.vq_packing.IndexPacking.pack`.
+        centroids: ``[NC, VL]`` float16 CUDA codebook.
+        bits: Bits per index, in ``[4, 16]``.
+        out_features: Output dimension N.
+        in_features: Input dimension K (``N * K`` divisible by VL).
+        dtype: ``torch.bfloat16``, ``torch.float16`` or ``torch.float32``.
+
+    Returns:
+        ``[out_features, in_features]`` CUDA tensor of *dtype*.
+    """
+    return _load_dequant_extension().vq_dequant(
+        packed_indices.contiguous(),
+        centroids.contiguous(),
+        bits,
+        out_features,
+        in_features,
+        dtype,
+    )
 
 
 # ---------------------------------------------------------------------------

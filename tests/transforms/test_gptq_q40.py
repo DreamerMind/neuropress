@@ -4,6 +4,7 @@ import torch
 from torch import nn
 from torch_to_nnef.inference_target import TractNNEF
 from torch_to_nnef.nnef_io.tensor import DatBinHeader
+from torch_to_nnef.tensor.quant.qtract import QTensorTractScaleOnly
 
 import neuropress.transforms.weight_only  # noqa: F401
 from neuropress.adapter import WeightAssignmentAdapter
@@ -82,3 +83,37 @@ def test_q40_rejects_incompatible_gptq_scheme(group_size, symmetric):
             QuantizedWeight(scheme.quantize_as_u8(weight), scheme, weight.dtype),
             "weight",
         )
+
+
+def _run_q40_gptq(scale_first_block: float):
+    torch.manual_seed(7)
+    model = nn.Sequential(nn.Linear(64, 16, bias=False)).eval()
+    with torch.no_grad():
+        model[0].weight[:, :32] *= scale_first_block
+    original = model[0].weight.detach().clone()
+    estimator = GptqEstimatorConfig(
+        group_size=32, weight_transform="q4_0_packed"
+    ).build()
+    recipe = QuantizationRecipe(
+        param_estimator=estimator, adapter=WeightAssignmentAdapter()
+    )
+    QuantizationPipeline(recipe).run(model, [torch.randn(8, 64, 64)])
+    return model, original
+
+
+def test_q40_keeps_groups_whose_scale_underflows_f16():
+    model, original = _run_q40_gptq(1e-9)
+    q = model[0].weight
+    assert isinstance(q, QTensorTractScaleOnly)
+    assert torch.all(q.qscheme.scale > 0)
+    decoded = q.decompress()
+    assert torch.all(decoded[:, :32].abs() < 1e-6)
+    assert (decoded[:, :32] - original[:, :32]).abs().max() < 1e-6
+    assert (decoded[:, 32:] - original[:, 32:]).abs().max() < 0.2
+
+
+def test_q40_skips_layer_whose_scale_overflows_f16():
+    model, _ = _run_q40_gptq(1e7)
+    weight = model[0].weight
+    assert not isinstance(weight, QTensorTractScaleOnly)
+    assert torch.isfinite(weight).all()
