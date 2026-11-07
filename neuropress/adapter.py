@@ -47,8 +47,8 @@ class WeightAssignmentAdapter(ModuleQuantizationAdapter):
     when no format is selected. Mixed affine panels replace named Linear
     modules with homogeneous-precision branches. Pre-packed tensors remain
     valid assignments. Tied siblings the plan does not name stay unchanged.
-    A scale or offset outside the destination's range keeps that weight as
-    float rather than discarding the other estimated layers.
+    A weight its destination cannot store stays float rather than discarding
+    the other estimated layers, and is recorded in the plan's kept_float.
     """
 
     @torch.no_grad()
@@ -66,6 +66,7 @@ class WeightAssignmentAdapter(ModuleQuantizationAdapter):
             The same *model* with the replaced weights.
         """
         if plan.is_empty():
+            self._report_kept_float(plan)
             return model
         from .transforms.split_mixed_linear import record_mixed_split
         from .transforms.vq import QTensorTractVQ
@@ -75,19 +76,23 @@ class WeightAssignmentAdapter(ModuleQuantizationAdapter):
         assignments = list(plan.weight_assignments.items())
         total = len(assignments)
         log_every = max(1, total // 10)
-        converted: dict[int, tuple[str, Any]] = {}
+        converted_tensors: dict[int, torch.Tensor] = {}
+        converted_branches: dict[int, tuple[str, Any]] = {}
         for i, (name, q_weight) in enumerate(assignments):
             mod = module_map.get(name)
             if mod is None:
                 continue
             key = id(q_weight)
             if isinstance(q_weight, QuantizedWeight):
+                q_weight = q_weight.on_scheme_device()
                 if isinstance(q_weight.scheme, QSchemeGroup) and isinstance(
                     mod, nn.Linear
                 ):
-                    source, branches = converted.get(key, (name, None))
-                    mixed = self._mixed_linear(name, mod, q_weight, branches)
-                    converted[key] = (
+                    source, branches = converted_branches.get(key, (name, None))
+                    mixed = self._mixed_linear(
+                        name, mod, q_weight, branches, plan.kept_float
+                    )
+                    converted_branches[key] = (
                         source,
                         (mixed.column_perm, mixed.sub_linears),
                     )
@@ -98,10 +103,10 @@ class WeightAssignmentAdapter(ModuleQuantizationAdapter):
                         None if source == name else {name: source},
                     )
                     continue
-                if key in converted:
-                    mod._parameters["weight"] = converted[key][1]
+                if key in converted_tensors:
+                    mod._parameters["weight"] = converted_tensors[key]
                     continue
-                q_weight = self._convert(q_weight, name, mod.weight)
+                q_weight = self._convert(q_weight, name, mod.weight, plan.kept_float)
                 if q_weight is None:
                     continue
             if isinstance(q_weight, QTensorTractVQ):
@@ -119,14 +124,11 @@ class WeightAssignmentAdapter(ModuleQuantizationAdapter):
                 # `name`, so any such sibling was never meant to change.
                 # update_by_name(..., tie_replacements=False) updates only
                 # the named module, matching the QTensorTractVQ branch above.
-                converted[key] = (
-                    name,
-                    updater.update_by_name(
-                        f"{name}.weight" if name else "weight",
-                        q_weight,
-                        tie_replacements=False,
-                        enforce_tensor_consistency=False,
-                    ),
+                converted_tensors[key] = updater.update_by_name(
+                    f"{name}.weight" if name else "weight",
+                    q_weight,
+                    tie_replacements=False,
+                    enforce_tensor_consistency=False,
                 )
             if (i + 1) % log_every == 0 or (i + 1) == total:
                 LOGGER.info(
@@ -135,16 +137,31 @@ class WeightAssignmentAdapter(ModuleQuantizationAdapter):
                     total,
                     name,
                 )
+        self._report_kept_float(plan)
         return model
 
     @staticmethod
+    def _report_kept_float(plan: QuantizationPlan) -> None:
+        if plan.kept_float:
+            LOGGER.warning(
+                "%d selected layers stayed float, which size estimates do not "
+                "reflect: %s",
+                len(plan.kept_float),
+                ", ".join(sorted(plan.kept_float)),
+            )
+
+    @staticmethod
     def _convert(
-        weight: QuantizedWeight, name: str, current: torch.Tensor
+        weight: QuantizedWeight,
+        name: str,
+        current: torch.Tensor,
+        kept_float: dict[str, str],
     ) -> torch.Tensor | None:
         try:
             result = WeightAssignmentAdapter._materialize(weight, name)
-        except T2NErrorImpossibleQuantization as exc:
+        except (T2NErrorImpossibleQuantization, ValueError) as exc:
             LOGGER.error("'%s' keeps its selected values as float: %s", name, exc)
+            kept_float[name] = str(exc)
             result = weight.dequantize()
         if isinstance(current, OffloadedTensor) and not isinstance(
             result, OffloadedTensor | type(None)
@@ -180,6 +197,7 @@ class WeightAssignmentAdapter(ModuleQuantizationAdapter):
         mod: nn.Linear,
         weight: QuantizedWeight,
         branches: tuple[torch.Tensor, nn.ModuleList] | None,
+        kept_float: dict[str, str],
     ) -> Any:
         """Build a split module, reusing a tied sibling's *branches* if given."""
         from .transforms.split_mixed_linear import (
@@ -211,6 +229,7 @@ class WeightAssignmentAdapter(ModuleQuantizationAdapter):
                     bits,
                     mod.out_features,
                     weight,
+                    kept_float,
                 )
                 for index, bits in enumerate(precisions)
             )
@@ -226,6 +245,7 @@ class WeightAssignmentAdapter(ModuleQuantizationAdapter):
         bits: int,
         out_features: int,
         weight: QuantizedWeight,
+        kept_float: dict[str, str],
     ) -> nn.Linear:
         from .transforms.weight_only import (
             Q4_X_GROUP_SIZE,
@@ -258,15 +278,14 @@ class WeightAssignmentAdapter(ModuleQuantizationAdapter):
                     block_size=Q4_X_GROUP_SIZE if aligned else width,
                 )
                 q.export_as_float = True
-        except T2NErrorImpossibleQuantization as exc:
+        except (T2NErrorImpossibleQuantization, ValueError) as exc:
             LOGGER.error("'%s' keeps its selected values as float: %s", path, exc)
+            kept_float[path] = str(exc)
             q = sub.dequantize()
+        # A meta shell: the weight is replaced at once, and allocating it here
+        # would add a full float copy of the branch at peak memory.
         linear = nn.Linear(
-            len(columns),
-            out_features,
-            bias=False,
-            device=codes.device,
-            dtype=weight.dtype,
+            len(columns), out_features, bias=False, device="meta", dtype=weight.dtype
         )
         ModTensorUpdater(linear).update_by_ref(
             linear.weight, q, enforce_tensor_consistency=False

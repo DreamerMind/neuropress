@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -24,6 +24,9 @@ class QuantizedWeight:
     slices of its flattened matrix. Storage conversion belongs to the adapter.
     Callable destinations support legacy Python weight transforms.
 
+    Codes wait for the adapter on the CPU, as they take one byte per weight for
+    the whole model; the scheme stays where it was computed.
+
     transposed marks a weight stored as the transpose of its scheme's layout,
     as in the transformers Conv1D: scheme groups then run along the weight's
     first dimension, which flat per-block storage formats cannot express.
@@ -38,6 +41,16 @@ class QuantizedWeight:
     @property
     def _scheme_codes(self) -> torch.Tensor:
         return self.codes.t() if self.transposed else self.codes
+
+    def on_scheme_device(self) -> QuantizedWeight:
+        """Return this assignment with its codes on the scheme's device."""
+        scheme = self.scheme
+        if isinstance(scheme, QSchemeGroup):
+            scheme = scheme.panels[0].qscheme
+        device = scheme.scale.device
+        if self.codes.device == device:
+            return self
+        return replace(self, codes=self.codes.to(device))
 
     def __post_init__(self) -> None:
         if self.codes.dtype != torch.uint8:
@@ -57,7 +70,7 @@ class QuantizedWeight:
 
     def dequantize(self) -> torch.Tensor:
         """Materialize the selected values without recalibration."""
-        scheme_codes = self._scheme_codes
+        scheme_codes = self.on_scheme_device()._scheme_codes
         if isinstance(self.scheme, ZpScaleScheme):
             result = self.scheme.dequantize(scheme_codes, self.dtype)
             return result.t() if self.transposed else result
@@ -79,12 +92,15 @@ class QuantizationPlan(BaseModel):
 
     Weight assignments contain codes and a scheme, or an already-materialized
     tensor. Activation assignments contain affine schemes or panel layouts.
+    kept_float names selected layers that stayed float, with the reason. Size
+    estimates are computed from the recipe alone and do not reflect them.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     weight_assignments: dict[str, QuantizedWeight | torch.Tensor] = {}
     activation_assignments: dict[str, ZpScaleScheme | QSchemeGroup | torch.Tensor] = {}
+    kept_float: dict[str, str] = {}
 
     def is_empty(self) -> bool:
         """Return True if no assignments have been made."""

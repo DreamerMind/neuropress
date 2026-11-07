@@ -151,6 +151,10 @@ def _specs_for_transform_estimator(
                 if entry.storage_bits is not None
                 else estimator.nbits
             )
+            if entry.asymmetric_storage_bits is not None and not getattr(
+                estimator, "symmetric", True
+            ):
+                sbits = float(entry.asymmetric_storage_bits)
             group_size: int | None = entry.group_size  # None = per-channel
             filter_fn = _combine_filters(estimator.filter_fn, entry.filter_fn)
             label = (
@@ -220,10 +224,12 @@ def _parse_specs(estimator: QuantizationParamEstimator) -> list[_EstimatorSpec]:
             weight_cols = functools.reduce(operator.mul, w.shape[1:])
             return weight_cols >= _gs and weight_cols % _gs == 0
 
-        # target_bpw is the average weight-quantization bpw (mix of Q4/Q2);
-        # add one f16 scale per group (16 bits / group_size weights).
-        scale_bpw = 16.0 / group_size
-        effective_bpw = estimator.target_bpw + scale_bpw
+        # target_bpw is the average weight-quantization bpw (mix of Q4/Q2).
+        # Branches store one f16 scale per block, and asymmetric ones also an
+        # f16 offset. Groups divisible by 32 use 32-value blocks.
+        block_size = 32 if group_size % 32 == 0 else group_size
+        metadata_values = 1 if estimator.symmetric else 2
+        effective_bpw = estimator.target_bpw + metadata_values * 16.0 / block_size
         specs = []
         for mod_cls in estimator.module_classes:
             specs.append(

@@ -67,6 +67,20 @@ _F16_MAX_EXACT_OFFSET = 2047.0
 # ---------------------------------------------------------------------------
 
 
+def _weight_identity(weight: torch.Tensor) -> tuple[str, int]:
+    """Return a key shared only by tensors holding the same weight.
+
+    Only plain materialized tensors have a stable storage address. Offloaded
+    and quantized tensors reload into transient buffers whose addresses get
+    reused across unrelated layers, and meta tensors have no storage, so those
+    are tied only when they are the same object.
+    """
+    if type(weight) in (torch.Tensor, nn.Parameter):
+        if not weight.is_meta and weight.numel() > 0:
+            return "storage", weight.data_ptr()
+    return "object", id(weight)
+
+
 def _walk_targets(
     model: nn.Module,
     module_classes: tuple[type, ...],
@@ -77,7 +91,7 @@ def _walk_targets(
     *tied_to* names the first target holding the same weight storage, or is
     ``None`` for that first target itself.
     """
-    first_by_ptr: dict[int, str] = {}
+    first_by_weight: dict[tuple[str, int], str] = {}
     for name, mod in model.named_modules():
         if not isinstance(mod, module_classes):
             continue
@@ -86,7 +100,7 @@ def _walk_targets(
         w = getattr(mod, "weight", None)
         tied_to = None
         if w is not None:
-            tied_to = first_by_ptr.setdefault(w.data_ptr(), name)
+            tied_to = first_by_weight.setdefault(_weight_identity(w), name)
             tied_to = None if tied_to == name else tied_to
         yield name, mod, tied_to
 
@@ -99,8 +113,8 @@ def collect_target_modules(
     """Return an ordered dict of target modules, deduplicating tied weights.
 
     Iterates ``model.named_modules()`` in traversal order and keeps the
-    *first* name encountered for each unique weight storage pointer.
-    Subsequent modules whose ``weight.data_ptr()`` was already seen are
+    *first* name encountered for each unique weight.
+    Subsequent modules whose weight was already seen are
     dropped - this handles tied-weight pairs such as ``embed_tokens`` /
     ``lm_head`` automatically without model-specific ``exclude_lm_head``
     flags.  See :func:`collect_tied_aliases` for the dropped names.
@@ -199,7 +213,7 @@ def _gptq_layer(
     registry.inject(calib, name)
     _, scheme, *_ = calib.compute_quantization()
     return QuantizedWeight(
-        calib.quantized_codes,
+        calib.quantized_codes.cpu(),
         scheme,
         _w.dtype,
         transposed=_is_conv1d_transpose(type(mod)),
@@ -310,6 +324,7 @@ class GPTQEstimator(QuantizationParamEstimator):
         """
         ids_seen: set[int] = set()
         assignments: dict[str, Any] = {}
+        kept_float: dict[str, str] = {}
         cache = self._cache
         spans = self._spans
 
@@ -361,6 +376,7 @@ class GPTQEstimator(QuantizationParamEstimator):
                         )
                 except Exception as exc:
                     LOGGER.error("GPTQ failed for '%s': %s - skipping", name, exc)
+                    kept_float[name] = str(exc)
                     if _RICH:
                         progress.advance(task_id)
                     continue
@@ -381,7 +397,8 @@ class GPTQEstimator(QuantizationParamEstimator):
                 )
 
         return QuantizationPlan(
-            weight_assignments=_add_tied_aliases(assignments, self._tied_aliases)
+            weight_assignments=_add_tied_aliases(assignments, self._tied_aliases),
+            kept_float=kept_float,
         )
 
 
@@ -442,7 +459,7 @@ def _gptq_panel_layer(
     registry.inject(calib, name)
     _, scheme, *_ = calib.compute_quantization()
     return QuantizedWeight(
-        calib.quantized_codes,
+        calib.quantized_codes.cpu(),
         scheme,
         _w.dtype,
         transposed=_is_conv1d_transpose(type(mod)),
@@ -515,6 +532,7 @@ class GPTQPanelEstimator(QuantizationParamEstimator):
     ) -> QuantizationPlan:
         """Return mixed weight assignments; defer layer splitting to the adapter."""
         assignments = {}
+        kept_float: dict[str, str] = {}
         for name, mod in self._target_modules.items():
             try:
                 assignment = _gptq_panel_layer(
@@ -531,11 +549,13 @@ class GPTQPanelEstimator(QuantizationParamEstimator):
                 )
             except Exception as exc:
                 LOGGER.error("Panel GPTQ failed for '%s': %s - skipping", name, exc)
+                kept_float[name] = str(exc)
                 continue
             if assignment is not None:
                 assignments[name] = assignment
         return QuantizationPlan(
-            weight_assignments=_add_tied_aliases(assignments, self._tied_aliases)
+            weight_assignments=_add_tied_aliases(assignments, self._tied_aliases),
+            kept_float=kept_float,
         )
 
 
@@ -595,6 +615,7 @@ class MinMaxZpWeightEstimator(QuantizationParamEstimator):
     ) -> QuantizationPlan:
         """Return selected codes and schemes without mutating model weights."""
         assignments = {}
+        kept_float: dict[str, str] = {}
         for name, mod in self._target_modules.items():
             w = mod.weight.detach().float()
             grouped = (
@@ -603,26 +624,29 @@ class MinMaxZpWeightEstimator(QuantizationParamEstimator):
             )
             width = self.group_size if grouped else w.numel()
             if w.numel() % width:
-                raise ValueError(
-                    f"{name}: weight size is not divisible by group size {width}"
-                )
+                reason = f"weight size is not divisible by group size {width}"
+                LOGGER.warning("Min/max skipping '%s': %s", name, reason)
+                kept_float[name] = reason
+                continue
             groups = w.reshape(-1, 1, 1, width)
             try:
                 zero, scale = self._grid(groups, grouped)
             except T2NErrorImpossibleQuantization as exc:
                 LOGGER.error("Min/max skipping '%s': %s", name, exc)
+                kept_float[name] = str(exc)
                 continue
             scheme = ZpScaleScheme(
                 zero, scale, self.nbits, list(groups.shape), list(scale.shape)
             )
             assignments[name] = QuantizedWeight(
-                scheme.quantize_as_u8(w),
+                scheme.quantize_as_u8(w).cpu(),
                 scheme,
                 mod.weight.dtype,
                 self.weight_transform,
             )
         return QuantizationPlan(
-            weight_assignments=_add_tied_aliases(assignments, self._tied_aliases)
+            weight_assignments=_add_tied_aliases(assignments, self._tied_aliases),
+            kept_float=kept_float,
         )
 
     def _grid(
@@ -3033,6 +3057,7 @@ class CompositeEstimator(QuantizationParamEstimator):
         for est in self.estimators:
             plan = est.estimate(graph, registry, recipe)
             merged.weight_assignments.update(plan.weight_assignments)
+            merged.kept_float.update(plan.kept_float)
             merged.activation_assignments.update(plan.activation_assignments)
         return merged
 
@@ -3084,7 +3109,7 @@ def _hqq_layer(
     calib.update(w.data)
     qscheme = calib.compute_qscheme()
 
-    return QuantizedWeight(qscheme.quantize_as_u8(w.detach()), qscheme, w.dtype)
+    return QuantizedWeight(qscheme.quantize_as_u8(w.detach()).cpu(), qscheme, w.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -3145,6 +3170,7 @@ class HQQEstimator(QuantizationParamEstimator):
         """Return HQQ codes, schemes and destinations without replacing weights."""
         ids_seen: set[int] = set()
         assignments: dict[str, Any] = {}
+        kept_float: dict[str, str] = {}
 
         for name, mod in self._target_modules.items():
             raw_weight = mod.weight
@@ -3171,6 +3197,7 @@ class HQQEstimator(QuantizationParamEstimator):
                 )
             except Exception as exc:
                 LOGGER.error("HQQ failed for '%s': %s - skipping", name, exc)
+                kept_float[name] = str(exc)
                 continue
 
             assignments[name] = QuantizedWeight(
@@ -3181,5 +3208,6 @@ class HQQEstimator(QuantizationParamEstimator):
             )
 
         return QuantizationPlan(
-            weight_assignments=_add_tied_aliases(assignments, self._tied_aliases)
+            weight_assignments=_add_tied_aliases(assignments, self._tied_aliases),
+            kept_float=kept_float,
         )

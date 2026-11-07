@@ -105,13 +105,16 @@ class WeightTransformEntry:
     preserve the selected codes and scheme, apart from rounding required by
     the storage format. It runs in the model adapter, not the estimator.
     filter_fn selects compatible modules. storage_bits includes metadata
-    overhead; group_size describes the destination storage blocks. nbits and
-    symmetric, when set, are the scheme the format can store.
+    overhead; asymmetric_storage_bits replaces it for asymmetric schemes that
+    must also store an offset per block. group_size describes the destination
+    storage blocks. nbits and symmetric, when set, are the scheme the format
+    can store.
     """
 
     transform: Callable[[QuantizedWeight, str], Any | None]
     filter_fn: Callable[[str, nn.Module], bool] | None = None
     storage_bits: float | None = None
+    asymmetric_storage_bits: float | None = None
     group_size: int | None = None
     nbits: int | None = None
     symmetric: bool | None = None
@@ -256,6 +259,11 @@ class GptqPanelEstimatorConfig(EstimatorConfig):
             A :class:`.GPTQPanelEstimator` targeting the module class named by
             :attr:`target`.
         """
+        unsupported = sorted(set(self.possible_nbits) - {2, 4, 8})
+        if unsupported:
+            raise ValueError(
+                f"Mixed-precision panels support 2, 4 and 8 bits, got {unsupported}"
+            )
         return GPTQPanelEstimator(
             module_classes=(_resolve_module_class(self.target),),
             group_size=self.group_size,

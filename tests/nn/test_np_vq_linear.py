@@ -595,7 +595,7 @@ def test_cuda_backend_matches_default_for_all_index_widths(num_centroids):
         linear, VQProxy(centroids).cuda(), backend=Backend.CUDA
     ).cuda()
     tokens = mod._fused_max_tokens(layer.backend)
-    assert tokens >= 1  # the kernel itself runs
+    assert tokens >= 2  # the kernel itself runs on a real batch
     x = torch.randn(tokens, 64)
     ref = ref_layer(x)
     out = layer(x.cuda().half()).float().cpu()

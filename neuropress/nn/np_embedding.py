@@ -61,7 +61,7 @@ import torch.nn.functional as F
 
 from .backends import Backend, EmbeddingBackend
 from .np_linear import (
-    _pack_u8,
+    _kernel_blob,
     _resolve_backend,  # noqa: F401
     _unpack_u8,
 )
@@ -326,7 +326,7 @@ class NPEmbedding(nn.Module):
             zero_point = None
         elif isinstance(weight_q, QTensorScaleZp):
             qtype = "asym"
-            zero_point = weight_q.qscheme.zero_point.detach().clone()
+            zero_point = weight_q.qscheme.per_group_zero_point().detach()
         else:
             raise TypeError(
                 f"Unsupported weight type {type(weight_q).__name__!r}. "
@@ -351,15 +351,7 @@ class NPEmbedding(nn.Module):
             float(embed_scale_buf.item()) if embed_scale_buf is not None else 1.0
         )
 
-        # decompress_to_u8() always returns canonical one-value-per-byte data
-        # regardless of whether the source QTensor's u8_blob is itself
-        # nibble-packed (e.g. via BitPacking4, used by the "q4_0_packed"
-        # weight transform) or not (e.g. a QTensor round-tripped through
-        # to_qtensor()/from_parts(), which carries no compressor). Repacking
-        # ourselves from this canonical form -- rather than assuming
-        # weight_q.u8_blob is already in NPEmbedding's packed layout --
-        # keeps this correct in both cases.
-        u8_blob = _pack_u8(weight_q.decompress_to_u8(), weight_q.qscheme.n_bits)
+        u8_blob = _kernel_blob(weight_q)
 
         return cls(
             u8_blob=u8_blob,

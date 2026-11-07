@@ -2,6 +2,7 @@
 
 import math
 import tarfile
+from dataclasses import replace
 from unittest.mock import patch
 
 import nnef
@@ -9,7 +10,10 @@ import pytest
 import torch
 from torch import nn
 from torch_to_nnef import export_model_to_nnef
-from torch_to_nnef.exceptions import T2NErrorNotImplemented
+from torch_to_nnef.exceptions import (
+    T2NErrorImpossibleQuantization,
+    T2NErrorNotImplemented,
+)
 from torch_to_nnef.inference_target import TractNNEF
 from torch_to_nnef.tensor.offload import OffloadedTensor
 from torch_to_nnef.tensor.quant.base import QScalePerGroupF16
@@ -20,7 +24,9 @@ import neuropress.transforms.weight_only  # noqa: F401
 from neuropress.adapter import WeightAssignmentAdapter
 from neuropress.calibration.probe import StatisticsRegistry
 from neuropress.estimator_configs import (
+    WEIGHT_TRANSFORM_REGISTRY,
     GptqEstimatorConfig,
+    GptqPanelEstimatorConfig,
     HqqEstimatorConfig,
     MinMaxZpWeightEstimatorConfig,
 )
@@ -29,17 +35,24 @@ from neuropress.estimators import (
     GPTQPanelEstimator,
     HQQEstimator,
     MinMaxZpWeightEstimator,
+    collect_target_modules,
+    collect_tied_aliases,
 )
-from neuropress.eval.size_estimate import collect_estimates
+from neuropress.eval.size_estimate import _parse_specs, collect_estimates
 from neuropress.nn.np_embedding import NPEmbedding
-from neuropress.nn.np_linear import NPLinear
+from neuropress.nn.np_linear import NPLinear, _kernel_blob, _pack_u8
+from neuropress.plan import QuantizationPlan, QuantizedWeight
+from neuropress.qscheme.group import PanelSpec, QSchemeGroup, TensorSlice
+from neuropress.qscheme.zp_scale import ZpScaleScheme
 from neuropress.t2n.model_io import (
     attach_manifest,
     load_quantized_model,
     save_quantized_model,
 )
+from neuropress.t2n.packing import BitPacking
+from neuropress.t2n.qtensors import _SERDE_REGISTRY, qtensor_shape
 from neuropress.transforms.split_mixed_linear import MixedPrecisionLinear
-from neuropress.transforms.weight_only import QTensorScaleZp
+from neuropress.transforms.weight_only import QTensorScaleZp, _affine_from_assignment
 
 
 def estimate(estimator, model, batches=()):
@@ -556,3 +569,370 @@ def test_conversion_never_quantizes_a_placeholder():
     q = model[0].weight
     assert q.shape == (16, 64)
     assert q.dtype == torch.float32
+
+
+# ---------------------------------------------------------------------------
+# Second review round
+# ---------------------------------------------------------------------------
+
+
+class _ParallelLinears(nn.Module):
+    def __init__(self, count=3):
+        super().__init__()
+        self.layers = nn.ModuleList(nn.Linear(32, 8, bias=False) for _ in range(count))
+
+    def forward(self, x):
+        return sum(layer(x) for layer in self.layers)
+
+
+def _offload_all(model, directory):
+    for index, layer in enumerate(model.layers):
+        layer.weight = nn.Parameter(
+            OffloadedTensor.from_original_tensor(
+                layer.weight.data, f"w{index}", offload_dir=directory
+            ),
+            requires_grad=False,
+        )
+
+
+def test_offloaded_layers_are_not_tied_by_reused_addresses(tmp_path, monkeypatch):
+    torch.manual_seed(0)
+    model = _ParallelLinears().eval()
+    originals = [layer.weight.detach().clone() for layer in model.layers]
+    _offload_all(model, tmp_path)
+    # Reloads land in transient buffers, so an address says nothing about identity.
+    monkeypatch.setattr(OffloadedTensor, "data_ptr", lambda self: 1, raising=False)
+
+    assert len(collect_target_modules(model, (nn.Linear,))) == 3
+    assert collect_tied_aliases(model, (nn.Linear,)) == {}
+
+    estimator = minmax()
+    plan = estimate(estimator, model)
+    WeightAssignmentAdapter().apply(model, plan)
+    for layer, original in zip(model.layers, originals, strict=True):
+        assert (layer.weight.to_base_tensor().decompress() - original).abs().max() < 0.1
+
+
+def test_tied_offloaded_layers_stay_tied(tmp_path):
+    model = _ParallelLinears(2).eval()
+    _offload_all(model, tmp_path)
+    model.layers[1].weight = model.layers[0].weight
+    assert collect_tied_aliases(model, (nn.Linear,)) == {"layers.0": ["layers.1"]}
+
+
+def test_meta_weights_are_not_tied():
+    with torch.device("meta"):
+        model = _ParallelLinears().eval()
+    assert len(collect_target_modules(model, (nn.Linear,))) == 3
+
+
+def test_conv1d_per_channel_fallback_keeps_a_uniform_scheme():
+    torch.manual_seed(0)
+    model = nn.Sequential(Conv1D(10, 64)).eval()
+    original = model[0].weight.detach().clone()
+    plan = estimate(
+        GPTQEstimator(module_classes=(Conv1D,), group_size=32),
+        model,
+        [torch.randn(8, 16, 64)],
+    )
+    decoded = plan.weight_assignments["0"].dequantize()
+    assert decoded.shape == original.shape
+    assert (decoded - original).abs().max() < 0.2
+
+
+@pytest.mark.parametrize("bits", [[1, 4], [3, 4]])
+def test_panel_config_rejects_widths_the_formats_cannot_store(bits):
+    with pytest.raises(ValueError, match="support 2, 4 and 8 bits"):
+        GptqPanelEstimatorConfig(possible_nbits=bits).build()
+
+
+def test_affine_format_reports_unsupported_widths():
+    scheme = ZpScaleScheme(
+        torch.full((16, 1, 2, 1), 4.0),
+        torch.ones(16, 1, 2, 1),
+        3,
+        [16, 1, 2, 32],
+        [16, 1, 2, 1],
+    )
+    codes = torch.zeros(16, 64, dtype=torch.uint8)
+    with pytest.raises(ValueError, match="do not support 3 bits"):
+        _affine_from_assignment(
+            QuantizedWeight(codes, scheme, torch.float32), "x", nbits=3
+        )
+
+
+def test_unpackable_mixed_branch_stays_float():
+    # 2-bit packing needs a multiple of 4 values; 5 rows of 6 columns has 30.
+    scheme = ZpScaleScheme(
+        torch.full((5, 1, 1, 1), 2.0),
+        torch.ones(5, 1, 1, 1),
+        2,
+        [5, 1, 1, 6],
+        [5, 1, 1, 1],
+    )
+    four_bits = ZpScaleScheme(
+        torch.full((5, 1, 1, 1), 8.0),
+        torch.ones(5, 1, 1, 1),
+        4,
+        [5, 1, 1, 32],
+        [5, 1, 1, 1],
+    )
+    group = QSchemeGroup(
+        panels=[
+            PanelSpec(region=TensorSlice(dim=1, start=0, end=6), qscheme=scheme),
+            PanelSpec(region=TensorSlice(dim=1, start=6, end=38), qscheme=four_bits),
+        ]
+    )
+    model = nn.Sequential(nn.Linear(38, 5, bias=False)).eval()
+    codes = torch.full((5, 38), 3, dtype=torch.uint8)
+    assignment = QuantizedWeight(codes, group, torch.float32)
+    plan = QuantizationPlan(weight_assignments={"0": assignment})
+    WeightAssignmentAdapter().apply(model, plan)
+    assert isinstance(model[0], MixedPrecisionLinear)
+    assert "0.sub_linears.0" in plan.kept_float or "0.sub_linears.1" in plan.kept_float
+    assert torch.isfinite(model[0](torch.ones(1, 38))).all()
+
+
+def test_packing_refuses_shapes_it_cannot_restore():
+    # 48 values pack evenly, but a last dimension of 6 is not divisible by 4,
+    # so the blob would be flat and decode flat.
+    scale = torch.ones(8, 1, 1, 1)
+    scheme = ZpScaleScheme(
+        torch.full_like(scale, 2.0), scale, 2, [8, 1, 1, 6], list(scale.shape)
+    )
+    codes = torch.ones(8, 6, dtype=torch.uint8)
+    with pytest.raises(ValueError, match="cannot restore weight shape"):
+        _affine_from_assignment(
+            QuantizedWeight(codes, scheme, torch.float32), "x", nbits=2, block_size=6
+        )
+
+
+def test_format_rejection_keeps_the_other_layers(caplog):
+    torch.manual_seed(0)
+
+    class Convs(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.rejected = nn.Conv2d(64, 8, 1, bias=False)
+            self.kept = nn.Conv2d(64, 8, 1, bias=False)
+
+        def forward(self, x):
+            return self.rejected(x) + self.kept(x)
+
+    model = Convs().eval()
+    plan = estimate(
+        GptqEstimatorConfig(target="conv2d", weight_transform="q4_0_packed").build(),
+        model,
+        [torch.randn(8, 64, 4, 4)],
+    )
+    with caplog.at_level("WARNING", logger="neuropress.adapter"):
+        WeightAssignmentAdapter().apply(model, plan)
+    assert set(plan.kept_float) == {"rejected", "kept"}
+    assert torch.isfinite(model.rejected.weight).all()
+    assert "2 selected layers stayed float" in caplog.text
+
+
+def test_minmax_skips_only_layers_it_cannot_group():
+    class Layers(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.compatible = nn.Embedding(32, 32)
+            self.incompatible = nn.Embedding(33, 32)
+
+    model = Layers()
+    plan = estimate(
+        MinMaxZpWeightEstimatorConfig(
+            target="embedding",
+            nbits=4,
+            symmetric=True,
+            group_size=64,
+            weight_transform="q4_0_packed",
+        ).build(),
+        model,
+    )
+    assert set(plan.weight_assignments) == {"compatible"}
+    assert "group size 64" in plan.kept_float["incompatible"]
+
+
+def test_tied_mixed_linear_and_embedding_keep_valid_weights():
+    plan_source = _mixed_plan()
+    assignment = plan_source.weight_assignments["0"]
+    for names in (("linear", "emb"), ("emb", "linear")):
+        rows, cols = assignment.codes.shape
+        holder = nn.ModuleDict(
+            {
+                "linear": nn.Linear(cols, rows, bias=False),
+                "emb": nn.Embedding(rows, cols),
+            }
+        )
+        plan = QuantizationPlan(weight_assignments=dict.fromkeys(names, assignment))
+        WeightAssignmentAdapter().apply(holder, plan)
+        assert isinstance(holder["linear"], MixedPrecisionLinear)
+        assert isinstance(holder["emb"].weight, torch.Tensor)
+        assert holder["emb"].weight.shape == (rows, cols)
+
+
+def _mixed_plan(bits=(2, 4)):
+    torch.manual_seed(1)
+    model = nn.Sequential(nn.Linear(128, 16, bias=False)).eval()
+    estimator = GPTQPanelEstimator(
+        module_classes=(nn.Linear,),
+        group_size=32,
+        possible_nbits=list(bits),
+        target_bpw=3.0,
+    )
+    return estimate(estimator, model, [torch.randn(8, 16, 128)])
+
+
+def _stored_bits_per_weight(q):
+    total = q.u8_blob.numel() + 2 * q.qscheme.scale.numel()
+    zero_point = getattr(q.qscheme, "zero_point", None)
+    if zero_point is not None:
+        total += 2 * zero_point.numel()
+    return 8 * total / math.prod(qtensor_shape(q))
+
+
+def test_symmetric_affine_storage_matches_declared_size():
+    model = nn.Sequential(nn.Linear(64, 16, bias=False))
+    plan = estimate(minmax("q2_0_packed", symmetric=True, nbits=2), model)
+    WeightAssignmentAdapter().apply(model, plan)
+    q = model[0].weight
+    assert q.qscheme.zero_point.numel() == 1
+    assert _stored_bits_per_weight(q) == pytest.approx(
+        WEIGHT_TRANSFORM_REGISTRY["q2_0_packed"].storage_bits, abs=0.02
+    )
+
+
+def test_asymmetric_affine_size_estimate_counts_its_offsets():
+    model = nn.Sequential(nn.Linear(64, 16, bias=False))
+    plan = estimate(minmax("q2_0_packed", symmetric=False, nbits=2), model)
+    WeightAssignmentAdapter().apply(model, plan)
+    assert _stored_bits_per_weight(model[0].weight) == pytest.approx(3.0, abs=0.01)
+    specs = _parse_specs(minmax("q2_0_packed", symmetric=False, nbits=2))
+    assert {spec.storage_bits for spec in specs} == {3.0}
+
+
+@pytest.mark.parametrize(
+    "group_size, symmetric, expected",
+    [(32, True, 0.5), (64, True, 0.5), (16, True, 1.0), (32, False, 1.0)],
+)
+def test_panel_size_estimate_counts_stored_metadata(group_size, symmetric, expected):
+    estimator = GPTQPanelEstimator(
+        group_size=group_size, target_bpw=3.0, symmetric=symmetric
+    )
+    specs = _parse_specs(estimator)
+    assert specs[0].storage_bits == pytest.approx(3.0 + expected)
+
+
+def test_constant_zero_point_lowers_and_persists(tmp_path):
+    torch.manual_seed(2)
+    model = nn.Sequential(nn.Linear(64, 16, bias=False)).eval()
+    plan = estimate(minmax("q4_1_packed", symmetric=True), model)
+    WeightAssignmentAdapter().apply(model, plan)
+    q = model[0].weight
+    assert q.qscheme.zero_point.numel() == 1
+    x = torch.randn(4, 64)
+    expected = model(x)
+
+    lowered = NPLinear.from_linear(model[0], backend="compile")
+    assert lowered.zero_point.numel() == q.qscheme.scale.numel()
+    torch.testing.assert_close(lowered(x), expected, rtol=1e-3, atol=1e-3)
+    restored = lowered.to_qtensor()
+    assert restored.qscheme.zero_point.numel() == 1
+
+    serde = _SERDE_REGISTRY["QTensorScaleZp"]
+    rebuilt = serde.from_parts(serde.to_tensors(q), serde.to_metadata(q))
+    torch.testing.assert_close(rebuilt.decompress(), q.decompress(), rtol=0, atol=0)
+
+
+def test_underflowed_affine_blocks_decode_to_zero():
+    scale = torch.tensor([1e-12, 1.0]).reshape(-1, 1, 1, 1)
+    scheme = ZpScaleScheme(
+        torch.full_like(scale, 2.0), scale, 4, [2, 1, 1, 32], list(scale.shape)
+    )
+    codes = torch.full((2, 32), 15, dtype=torch.uint8)
+    q = _affine_from_assignment(
+        QuantizedWeight(codes, scheme, torch.float32), "x", nbits=4
+    )
+    decoded = q.decompress()
+    assert torch.all(decoded[0] == 0)
+    assert torch.all(decoded[1] == 13)
+
+
+def test_affine_format_rejects_codes_decoding_outside_f16():
+    scale = torch.full((1, 1, 1, 1), 10000.0)
+    scheme = ZpScaleScheme(
+        torch.full_like(scale, 8.0), scale, 4, [1, 1, 1, 32], list(scale.shape)
+    )
+    codes = torch.zeros(1, 32, dtype=torch.uint8)
+    with pytest.raises(T2NErrorImpossibleQuantization, match="decode outside"):
+        _affine_from_assignment(
+            QuantizedWeight(codes, scheme, torch.float32), "x", nbits=4
+        )
+
+
+def test_codes_follow_the_scheme_device_only_when_needed():
+    scheme = ZpScaleScheme(
+        torch.full((1, 1, 1, 1), 8.0),
+        torch.ones(1, 1, 1, 1),
+        4,
+        [1, 1, 1, 32],
+        [1, 1, 1, 1],
+    )
+    weight = QuantizedWeight(
+        torch.zeros(1, 32, dtype=torch.uint8), scheme, torch.float32
+    )
+    assert weight.on_scheme_device() is weight
+    moved = replace(
+        weight,
+        scheme=scheme.__class__(
+            scheme.zero_point.to("meta"),
+            scheme.scale.to("meta"),
+            4,
+            [1, 1, 1, 32],
+            [1, 1, 1, 1],
+        ),
+    )
+    assert moved.on_scheme_device().codes.is_meta
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_plan_keeps_codes_on_cpu_and_adapter_restores_the_device():
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(64, 16, bias=False)).eval().cuda()
+    plan = estimate(
+        GPTQEstimator(group_size=32, weight_transform="q4_0_packed"),
+        model,
+        [torch.randn(8, 16, 64, device="cuda")],
+    )
+    assert plan.weight_assignments["0"].codes.device.type == "cpu"
+    WeightAssignmentAdapter().apply(model, plan)
+    assert model[0].weight.u8_blob.device.type == "cuda"
+
+
+@pytest.mark.parametrize("format_name", ["q4_0_packed", "q4_1_packed"])
+def test_persistence_does_not_decompress_codes(format_name):
+    model = nn.Sequential(nn.Linear(64, 16, bias=False))
+    plan = estimate(minmax(format_name, symmetric=format_name == "q4_0_packed"), model)
+    WeightAssignmentAdapter().apply(model, plan)
+    q = model[0].weight
+    serde = _SERDE_REGISTRY[type(q).__name__]
+    with patch.object(BitPacking, "decompress", side_effect=AssertionError):
+        metadata = serde.to_metadata(q)
+        rebuilt = serde.from_parts(serde.to_tensors(q), metadata)
+    assert qtensor_shape(rebuilt) == (16, 64)
+    assert metadata["shape"] == "[16, 64]"
+
+
+@pytest.mark.parametrize("format_name", ["q4_0_packed", "q4_0"])
+def test_lowering_reuses_a_blob_in_the_kernel_layout(format_name):
+    torch.manual_seed(4)
+    model = nn.Sequential(nn.Linear(64, 16, bias=False))
+    plan = estimate(minmax(format_name), model)
+    WeightAssignmentAdapter().apply(model, plan)
+    q = model[0].weight
+    expected = _pack_u8(q.decompress_to_u8(), 4)
+    torch.testing.assert_close(_kernel_blob(q), expected, rtol=0, atol=0)
+    if format_name == "q4_0_packed":
+        with patch.object(BitPacking, "decompress", side_effect=AssertionError):
+            assert _kernel_blob(q) is q.u8_blob

@@ -197,18 +197,28 @@ def load_qtensor(path: str | Path) -> Any:
 # ---------------------------------------------------------------------------
 
 
+def qtensor_shape(q: Any) -> tuple[int, ...]:
+    """Return a QTensor's decoded shape without decompressing its codes."""
+    shape = getattr(q, "decompressed_shape", None)
+    if shape is None:
+        with torch._C.DisableTorchFunctionSubclass():
+            shape = q.shape
+    return tuple(shape)
+
+
 def _scalar_packing_metadata(q: Any) -> dict[str, str]:
     from .packing import BitPacking
 
     if any(not isinstance(c, BitPacking) for c in q.u8_compressors):
         raise ValueError("Scalar tensor persistence requires BitPacking compressors")
     return {
-        "shape": json.dumps(list(q.decompress_to_u8().shape)),
+        "shape": json.dumps(list(qtensor_shape(q))),
         "packing": json.dumps([c.nbits for c in q.u8_compressors]),
     }
 
 
-def _scalar_codes(tensors, metadata):
+def _scalar_layout(tensors, metadata):
+    """Return the decoded shape and compressors of a persisted scalar tensor."""
     from .packing import BitPacking
 
     blob = tensors["u8_blob"]
@@ -218,12 +228,13 @@ def _scalar_codes(tensors, metadata):
         count = tensors["scale"].numel() * int(metadata["group_size"])
         bits = [int(metadata["n_bits"])] if blob.numel() < count else []
     compressors = [BitPacking(n) for n in bits]
+    if "shape" in metadata:
+        return torch.Size(json.loads(metadata["shape"])), compressors
+    # Checkpoints from before the shape was recorded.
     codes = blob
     for compressor in reversed(compressors):
         codes = compressor.decompress(codes)
-    if "shape" in metadata:
-        codes = codes.reshape(json.loads(metadata["shape"]))
-    return codes, compressors
+    return codes.shape, compressors
 
 
 def qtensor_from_blob(
@@ -324,11 +335,11 @@ class _QTractScaleOnlySerde(QTensorSerde):
         dtype = getattr(torch, metadata["dequant_to_dtype"])
 
         qscheme = QScalePerGroupF16(group_size=group_size, scale=scale, n_bits=n_bits)
-        codes, compressors = _scalar_codes(tensors, metadata)
+        shape, compressors = _scalar_layout(tensors, metadata)
         return qtensor_from_blob(
             QTensorTractScaleOnly,
             u8_blob,
-            codes.shape,
+            shape,
             qscheme,
             dtype,
             compressors,
@@ -389,11 +400,11 @@ class _QTensorScaleZpSerde(QTensorSerde):
         qscheme = QScaleZpPerGroupF16(
             group_size=group_size, scale=scale, zero_point=zero_point, n_bits=n_bits
         )
-        codes, compressors = _scalar_codes(tensors, metadata)
+        shape, compressors = _scalar_layout(tensors, metadata)
         q = qtensor_from_blob(
             QTensorScaleZp,
             u8_blob,
-            codes.shape,
+            shape,
             qscheme,
             dtype,
             compressors,

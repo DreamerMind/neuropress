@@ -223,7 +223,10 @@ class GPTQCalibration(CalibrationMethodOnActivation[T_SUPPORTED_QSCHEMES]):
             return 0
         if gt is GranularityType.PER_CHANNEL:
             assert self.weight_tensor is not None
-            return self.weight_tensor.data.shape[-1]
+            width = self.weight_tensor.data.shape[-1]
+            # Transposed layouts (Conv1D) keep columns in the first dimension,
+            # and a uniform scheme cannot describe a partial last group.
+            return width if self.columns % width == 0 else self.columns
         raise NotImplementedError(self.granularity)
 
     @cached_property
@@ -467,6 +470,7 @@ class GPTQCalibration(CalibrationMethodOnActivation[T_SUPPORTED_QSCHEMES]):
         if _is_conv1d_transpose(self.module_class):
             codes = codes.t()
         self.quantized_codes = codes.reshape(self.weight_tensor.shape)
+        # Read before postprocessing restores the original weight layout.
         n_cols = q_data.quant_weights.shape[1]
         self._quantize_postprocess(q_data)
 
