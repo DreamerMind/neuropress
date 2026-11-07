@@ -105,13 +105,16 @@ class WeightTransformEntry:
     preserve the selected codes and scheme, apart from rounding required by
     the storage format. It runs in the model adapter, not the estimator.
     filter_fn selects compatible modules. storage_bits includes metadata
-    overhead; group_size describes the destination storage blocks.
+    overhead; group_size describes the destination storage blocks. nbits and
+    symmetric, when set, are the scheme the format can store.
     """
 
     transform: Callable[[QuantizedWeight, str], Any | None]
     filter_fn: Callable[[str, nn.Module], bool] | None = None
     storage_bits: float | None = None
     group_size: int | None = None
+    nbits: int | None = None
+    symmetric: bool | None = None
 
 
 WEIGHT_TRANSFORM_REGISTRY: dict[str, WeightTransformEntry] = {}
@@ -131,6 +134,42 @@ registered by :mod:`neuropress.transforms.weight_only` on import::
         group_size=32,
     )
 """
+
+
+def _resolve_weight_transform(
+    key: str | None,
+    *,
+    nbits: int,
+    symmetric: bool,
+    group_size: int,
+) -> WeightTransformEntry | None:
+    """Return the registry entry for *key*, checking the scheme it must store.
+
+    Failing here spares the estimation work a mismatch would otherwise waste,
+    since conversion only runs in the adapter.
+
+    Raises:
+        ValueError: If *key* is unregistered or the format cannot store the
+            configured scheme.
+    """
+    if key is None:
+        return None
+    entry = WEIGHT_TRANSFORM_REGISTRY.get(key)
+    if entry is None:
+        raise ValueError(
+            f"Unknown weight transform {key!r}. "
+            f"Available: {sorted(WEIGHT_TRANSFORM_REGISTRY)}"
+        )
+    if entry.nbits is not None and nbits != entry.nbits:
+        raise ValueError(f"{key} requires nbits={entry.nbits}, got {nbits}")
+    if entry.symmetric is not None and symmetric != entry.symmetric:
+        raise ValueError(f"{key} requires symmetric={entry.symmetric}, got {symmetric}")
+    if entry.group_size is not None and group_size % entry.group_size:
+        raise ValueError(
+            f"{key} requires group_size divisible by {entry.group_size}, "
+            f"got {group_size}"
+        )
+    return entry
 
 
 # ---------------------------------------------------------------------------
@@ -164,16 +203,15 @@ class GptqEstimatorConfig(EstimatorConfig):
             :data:`WEIGHT_TRANSFORM_REGISTRY`.
 
         Raises:
-            ValueError: If :attr:`weight_transform` is set but not registered.
+            ValueError: If :attr:`weight_transform` is unregistered or cannot
+                store the configured scheme.
         """
-        entry: WeightTransformEntry | None = None
-        if self.weight_transform is not None:
-            entry = WEIGHT_TRANSFORM_REGISTRY.get(self.weight_transform)
-            if entry is None:
-                raise ValueError(
-                    f"Unknown weight transform {self.weight_transform!r}. "
-                    f"Available: {sorted(WEIGHT_TRANSFORM_REGISTRY)}"
-                )
+        entry = _resolve_weight_transform(
+            self.weight_transform,
+            nbits=self.nbits,
+            symmetric=self.symmetric,
+            group_size=self.group_size,
+        )
         return GPTQEstimator(
             module_classes=(_resolve_module_class(self.target),),
             filter_fn=entry.filter_fn if entry is not None else None,
@@ -253,16 +291,15 @@ class MinMaxZpWeightEstimatorConfig(EstimatorConfig):
             from :data:`WEIGHT_TRANSFORM_REGISTRY`.
 
         Raises:
-            ValueError: If :attr:`weight_transform` is set but not registered.
+            ValueError: If :attr:`weight_transform` is unregistered or cannot
+                store the configured scheme.
         """
-        entry: WeightTransformEntry | None = None
-        if self.weight_transform is not None:
-            entry = WEIGHT_TRANSFORM_REGISTRY.get(self.weight_transform)
-            if entry is None:
-                raise ValueError(
-                    f"Unknown weight transform {self.weight_transform!r}. "
-                    f"Available: {sorted(WEIGHT_TRANSFORM_REGISTRY)}"
-                )
+        entry = _resolve_weight_transform(
+            self.weight_transform,
+            nbits=self.nbits,
+            symmetric=self.symmetric,
+            group_size=self.group_size,
+        )
         return MinMaxZpWeightEstimator(
             module_classes=(_resolve_module_class(self.target),),
             filter_fn=entry.filter_fn if entry is not None else None,
@@ -313,16 +350,15 @@ class HqqEstimatorConfig(EstimatorConfig):
             :data:`WEIGHT_TRANSFORM_REGISTRY`.
 
         Raises:
-            ValueError: If :attr:`weight_transform` is set but not registered.
+            ValueError: If :attr:`weight_transform` is unregistered or cannot
+                store the configured scheme.
         """
-        entry: WeightTransformEntry | None = None
-        if self.weight_transform is not None:
-            entry = WEIGHT_TRANSFORM_REGISTRY.get(self.weight_transform)
-            if entry is None:
-                raise ValueError(
-                    f"Unknown weight transform {self.weight_transform!r}. "
-                    f"Available: {sorted(WEIGHT_TRANSFORM_REGISTRY)}"
-                )
+        entry = _resolve_weight_transform(
+            self.weight_transform,
+            nbits=self.nbits,
+            symmetric=self.symmetric,
+            group_size=self.group_size,
+        )
         return HQQEstimator(
             module_classes=(_resolve_module_class(self.target),),
             filter_fn=entry.filter_fn if entry is not None else None,

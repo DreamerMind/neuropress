@@ -12,6 +12,9 @@ from pydantic import BaseModel, ConfigDict
 from .qscheme.group import QSchemeGroup
 from .qscheme.zp_scale import ZpScaleScheme
 
+F16_MIN_POSITIVE: float = 2.0**-24
+"""Smallest positive f16 value, used for scales that would round to zero."""
+
 
 @dataclass(frozen=True)
 class QuantizedWeight:
@@ -20,18 +23,27 @@ class QuantizedWeight:
     Codes retain the original weight shape. Mixed schemes describe column
     slices of its flattened matrix. Storage conversion belongs to the adapter.
     Callable destinations support legacy Python weight transforms.
+
+    transposed marks a weight stored as the transpose of its scheme's layout,
+    as in the transformers Conv1D: scheme groups then run along the weight's
+    first dimension, which flat per-block storage formats cannot express.
     """
 
     codes: torch.Tensor
     scheme: ZpScaleScheme | QSchemeGroup
     dtype: torch.dtype
     destination: str | Callable[[torch.Tensor, str], Any] | None = None
+    transposed: bool = False
+
+    @property
+    def _scheme_codes(self) -> torch.Tensor:
+        return self.codes.t() if self.transposed else self.codes
 
     def __post_init__(self) -> None:
         if self.codes.dtype != torch.uint8:
             raise ValueError("Quantized weight codes must be uint8")
         if isinstance(self.scheme, QSchemeGroup):
-            columns = self.codes.numel() // self.codes.shape[0]
+            columns = self.codes.numel() // self._scheme_codes.shape[0]
             offset = 0
             for panel in sorted(self.scheme.panels, key=lambda p: p.region.start):
                 region = panel.region
@@ -45,9 +57,11 @@ class QuantizedWeight:
 
     def dequantize(self) -> torch.Tensor:
         """Materialize the selected values without recalibration."""
+        scheme_codes = self._scheme_codes
         if isinstance(self.scheme, ZpScaleScheme):
-            return self.scheme.dequantize(self.codes, self.dtype)
-        codes = self.codes.reshape(self.codes.shape[0], -1)
+            result = self.scheme.dequantize(scheme_codes, self.dtype)
+            return result.t() if self.transposed else result
+        codes = scheme_codes.reshape(scheme_codes.shape[0], -1)
         result = torch.empty_like(codes, dtype=self.dtype)
         for panel in self.scheme.panels:
             region = panel.region
@@ -56,7 +70,8 @@ class QuantizedWeight:
             result[:, region.start : region.end] = panel.qscheme.dequantize(
                 codes[:, region.start : region.end], self.dtype
             )
-        return result.reshape(self.codes.shape)
+        result = result.reshape(scheme_codes.shape)
+        return result.t() if self.transposed else result
 
 
 class QuantizationPlan(BaseModel):

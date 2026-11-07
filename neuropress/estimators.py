@@ -6,8 +6,8 @@ import contextlib
 import logging
 import math
 import operator
-from collections.abc import Callable
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field, replace
 from functools import reduce
 from typing import Any
 
@@ -39,16 +39,17 @@ except ImportError:
 
 import torch
 from torch import nn
+from torch_to_nnef.exceptions import T2NErrorImpossibleQuantization
 
 from .calibration.probe import StatisticRequest, StatisticsRegistry
 from .estimator import QuantizationParamEstimator
 from .graph.graph import QGraph
 from .methods.correction_mode import CorrectionMode
-from .methods.gptq import GPTQCalibration
+from .methods.gptq import GPTQCalibration, _is_conv1d_transpose
 from .methods.gptq_panel import GPTQMixedPrecisionCalibration
 from .methods.hqq import HQQCalibration
 from .methods.zp_scale_calib import NormZpScaleCalibration
-from .plan import QuantizationPlan, QuantizedWeight
+from .plan import F16_MIN_POSITIVE, QuantizationPlan, QuantizedWeight
 from .qscheme.descriptor import Granularity
 from .qscheme.zp_scale import ZpScaleScheme
 from .quantization.cache import CacheStageDescriptor
@@ -57,10 +58,37 @@ from .recipe import QuantizationRecipe
 
 LOGGER = logging.getLogger(__name__)
 
+_F16_MAX_EXACT_OFFSET = 2047.0
+"""Every integer up to this magnitude is exact in f16, so offsets stay exact."""
+
 
 # ---------------------------------------------------------------------------
 # Shared target-collection utility
 # ---------------------------------------------------------------------------
+
+
+def _walk_targets(
+    model: nn.Module,
+    module_classes: tuple[type, ...],
+    filter_fn: Callable[[str, nn.Module], bool] | None,
+) -> Iterator[tuple[str, nn.Module, str | None]]:
+    """Yield ``(name, module, tied_to)`` for every module selected as a target.
+
+    *tied_to* names the first target holding the same weight storage, or is
+    ``None`` for that first target itself.
+    """
+    first_by_ptr: dict[int, str] = {}
+    for name, mod in model.named_modules():
+        if not isinstance(mod, module_classes):
+            continue
+        if filter_fn is not None and not filter_fn(name, mod):
+            continue
+        w = getattr(mod, "weight", None)
+        tied_to = None
+        if w is not None:
+            tied_to = first_by_ptr.setdefault(w.data_ptr(), name)
+            tied_to = None if tied_to == name else tied_to
+        yield name, mod, tied_to
 
 
 def collect_target_modules(
@@ -73,9 +101,9 @@ def collect_target_modules(
     Iterates ``model.named_modules()`` in traversal order and keeps the
     *first* name encountered for each unique weight storage pointer.
     Subsequent modules whose ``weight.data_ptr()`` was already seen are
-    silently dropped - this handles tied-weight pairs such as
-    ``embed_tokens`` / ``lm_head`` automatically without model-specific
-    ``exclude_lm_head`` flags.
+    dropped - this handles tied-weight pairs such as ``embed_tokens`` /
+    ``lm_head`` automatically without model-specific ``exclude_lm_head``
+    flags.  See :func:`collect_tied_aliases` for the dropped names.
 
     Args:
         model: Model to inspect.
@@ -85,25 +113,44 @@ def collect_target_modules(
     Returns:
         ``{name: module}`` dict in model traversal order, deduplicated.
     """
-    seen_ptrs: set[int] = set()
     result: dict[str, nn.Module] = {}
-    for name, mod in model.named_modules():
-        if not isinstance(mod, module_classes):
-            continue
-        if filter_fn is not None and not filter_fn(name, mod):
-            continue
-        w = getattr(mod, "weight", None)
-        if w is not None:
-            ptr = w.data_ptr()
-            if ptr in seen_ptrs:
-                LOGGER.info(
-                    "collect_target_modules: skipping '%s' — tied weight already collected",
-                    name,
-                )
-                continue
-            seen_ptrs.add(ptr)
-        result[name] = mod
+    for name, mod, tied_to in _walk_targets(model, module_classes, filter_fn):
+        if tied_to is None:
+            result[name] = mod
+        else:
+            LOGGER.info(
+                "collect_target_modules: skipping '%s' - tied weight already collected",
+                name,
+            )
     return result
+
+
+def collect_tied_aliases(
+    model: nn.Module,
+    module_classes: tuple[type, ...],
+    filter_fn: Callable[[str, nn.Module], bool] | None = None,
+) -> dict[str, list[str]]:
+    """Map each deduplicated target to the other targets sharing its weight.
+
+    Estimators that leave parameters untouched until the adapter runs list
+    these names too, so every selected module receives the assignment.  Tied
+    modules that are not selected targets are absent and stay unchanged.
+    """
+    aliases: dict[str, list[str]] = {}
+    for name, _, tied_to in _walk_targets(model, module_classes, filter_fn):
+        if tied_to is not None:
+            aliases.setdefault(tied_to, []).append(name)
+    return aliases
+
+
+def _add_tied_aliases(
+    assignments: dict[str, Any], aliases: dict[str, list[str]]
+) -> dict[str, Any]:
+    for name, tied in aliases.items():
+        if name in assignments:
+            for alias in tied:
+                assignments[alias] = assignments[name]
+    return assignments
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +198,12 @@ def _gptq_layer(
     calib.init()
     registry.inject(calib, name)
     _, scheme, *_ = calib.compute_quantization()
-    return QuantizedWeight(calib.quantized_codes, scheme, _w.dtype)
+    return QuantizedWeight(
+        calib.quantized_codes,
+        scheme,
+        _w.dtype,
+        transposed=_is_conv1d_transpose(type(mod)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +233,9 @@ class GPTQEstimator(QuantizationParamEstimator):
     _target_modules: dict[str, nn.Module] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
+    _tied_aliases: dict[str, list[str]] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
     _device: torch.device | None = field(
         default=None, init=False, repr=False, compare=False
     )
@@ -197,6 +252,18 @@ class GPTQEstimator(QuantizationParamEstimator):
         self._target_modules = collect_target_modules(
             model, self.module_classes, self.filter_fn
         )
+        self._tied_aliases = collect_tied_aliases(
+            model, self.module_classes, self.filter_fn
+        )
+        if isinstance(self.weight_transform, str) and (
+            self.weight_transform != "identity"
+        ):
+            for name, mod in self._target_modules.items():
+                if _is_conv1d_transpose(type(mod)):
+                    raise ValueError(
+                        f"'{name}': format {self.weight_transform!r} cannot keep "
+                        "Conv1D scale groups; use a callable weight_transform"
+                    )
         LOGGER.info(
             "GPTQEstimator: %d target modules (device=%s)",
             len(self._target_modules),
@@ -309,14 +376,13 @@ class GPTQEstimator(QuantizationParamEstimator):
                 if _RICH:
                     progress.advance(task_id)
 
-                assignments[name] = QuantizedWeight(
-                    assignment.codes,
-                    assignment.scheme,
-                    assignment.dtype,
-                    self.weight_transform,
+                assignments[name] = replace(
+                    assignment, destination=self.weight_transform
                 )
 
-        return QuantizationPlan(weight_assignments=assignments)
+        return QuantizationPlan(
+            weight_assignments=_add_tied_aliases(assignments, self._tied_aliases)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +441,12 @@ def _gptq_panel_layer(
     calib.init()
     registry.inject(calib, name)
     _, scheme, *_ = calib.compute_quantization()
-    return QuantizedWeight(calib.quantized_codes, scheme, _w.dtype)
+    return QuantizedWeight(
+        calib.quantized_codes,
+        scheme,
+        _w.dtype,
+        transposed=_is_conv1d_transpose(type(mod)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +474,9 @@ class GPTQPanelEstimator(QuantizationParamEstimator):
     _target_modules: dict[str, nn.Module] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
+    _tied_aliases: dict[str, list[str]] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
     _device: torch.device | None = field(
         default=None, init=False, repr=False, compare=False
     )
@@ -415,6 +489,9 @@ class GPTQPanelEstimator(QuantizationParamEstimator):
         """
         self._device = next(model.parameters()).device
         self._target_modules = collect_target_modules(
+            model, self.module_classes, self.filter_fn
+        )
+        self._tied_aliases = collect_tied_aliases(
             model, self.module_classes, self.filter_fn
         )
         LOGGER.info(
@@ -439,21 +516,27 @@ class GPTQPanelEstimator(QuantizationParamEstimator):
         """Return mixed weight assignments; defer layer splitting to the adapter."""
         assignments = {}
         for name, mod in self._target_modules.items():
-            assignment = _gptq_panel_layer(
-                name,
-                mod,
-                registry,
-                self._device,
-                self.group_size,
-                self.possible_nbits,
-                self.target_bpw,
-                self.symmetric,
-                self.damp_percent,
-                self.damp_auto_increment,
-            )
+            try:
+                assignment = _gptq_panel_layer(
+                    name,
+                    mod,
+                    registry,
+                    self._device,
+                    self.group_size,
+                    self.possible_nbits,
+                    self.target_bpw,
+                    self.symmetric,
+                    self.damp_percent,
+                    self.damp_auto_increment,
+                )
+            except Exception as exc:
+                LOGGER.error("Panel GPTQ failed for '%s': %s - skipping", name, exc)
+                continue
             if assignment is not None:
                 assignments[name] = assignment
-        return QuantizationPlan(weight_assignments=assignments)
+        return QuantizationPlan(
+            weight_assignments=_add_tied_aliases(assignments, self._tied_aliases)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +563,9 @@ class MinMaxZpWeightEstimator(QuantizationParamEstimator):
     _target_modules: dict[str, nn.Module] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
+    _tied_aliases: dict[str, list[str]] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     def prepare(self, model: nn.Module) -> None:
         """Discover target modules.
@@ -488,6 +574,9 @@ class MinMaxZpWeightEstimator(QuantizationParamEstimator):
             model: The model that will be passed to the pipeline.
         """
         self._target_modules = collect_target_modules(
+            model, self.module_classes, self.filter_fn
+        )
+        self._tied_aliases = collect_tied_aliases(
             model, self.module_classes, self.filter_fn
         )
         LOGGER.info(
@@ -518,22 +607,11 @@ class MinMaxZpWeightEstimator(QuantizationParamEstimator):
                     f"{name}: weight size is not divisible by group size {width}"
                 )
             groups = w.reshape(-1, 1, 1, width)
-            if self.symmetric:
-                maximum = groups.abs().amax(dim=-1, keepdim=True)
-                scale = torch.where(
-                    maximum == 0,
-                    torch.ones_like(maximum),
-                    maximum / (2 ** (self.nbits - 1) - 1),
-                )
-                zero = torch.full_like(scale, 2 ** (self.nbits - 1))
-            else:
-                low = groups.amin(dim=-1, keepdim=True)
-                high = groups.amax(dim=-1, keepdim=True)
-                span = high - low
-                scale = torch.where(
-                    span == 0, torch.ones_like(span), span / (2**self.nbits - 1)
-                )
-                zero = -low / scale
+            try:
+                zero, scale = self._grid(groups, grouped)
+            except T2NErrorImpossibleQuantization as exc:
+                LOGGER.error("Min/max skipping '%s': %s", name, exc)
+                continue
             scheme = ZpScaleScheme(
                 zero, scale, self.nbits, list(groups.shape), list(scale.shape)
             )
@@ -543,7 +621,44 @@ class MinMaxZpWeightEstimator(QuantizationParamEstimator):
                 mod.weight.dtype,
                 self.weight_transform,
             )
-        return QuantizationPlan(weight_assignments=assignments)
+        return QuantizationPlan(
+            weight_assignments=_add_tied_aliases(assignments, self._tied_aliases)
+        )
+
+    def _grid(
+        self, groups: torch.Tensor, stored_in_f16: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(zero, scale)`` per group.
+
+        When a format stores the grid in f16, codes must be selected against
+        the stored values or they decode differently.  So the scale is rounded
+        to f16 first, and an asymmetric offset is an integer f16 holds exactly.
+        A group far from zero relative to its range therefore gets a coarser
+        scale, as the offset cannot reach it otherwise.
+        """
+        half_range = 2 ** (self.nbits - 1)
+        if self.symmetric:
+            maximum = groups.abs().amax(dim=-1, keepdim=True)
+            scale = maximum / (half_range - 1)
+        else:
+            low = groups.amin(dim=-1, keepdim=True)
+            scale = (groups.amax(dim=-1, keepdim=True) - low) / (2**self.nbits - 1)
+            if stored_in_f16:
+                scale = torch.maximum(scale, low.abs() / _F16_MAX_EXACT_OFFSET)
+        scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+        if stored_in_f16:
+            rounded = scale.to(torch.float16)
+            if not torch.isfinite(rounded).all():
+                raise T2NErrorImpossibleQuantization(
+                    "weight range is too large for f16 scales"
+                )
+            scale = rounded.masked_fill(rounded == 0, F16_MIN_POSITIVE).to(scale.dtype)
+        if self.symmetric:
+            return torch.full_like(scale, half_range), scale
+        zero = -low / scale
+        if stored_in_f16:
+            zero = zero.round().clamp(-_F16_MAX_EXACT_OFFSET, _F16_MAX_EXACT_OFFSET)
+        return zero, scale
 
 
 # ---------------------------------------------------------------------------
@@ -2982,6 +3097,9 @@ class HQQEstimator(QuantizationParamEstimator):
     _target_modules: dict[str, nn.Module] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
+    _tied_aliases: dict[str, list[str]] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     def prepare(self, model: nn.Module) -> None:
         """Discover target modules in *model*.
@@ -2990,6 +3108,9 @@ class HQQEstimator(QuantizationParamEstimator):
             model: The model that will be passed to the pipeline.
         """
         self._target_modules = collect_target_modules(
+            model, self.module_classes, self.filter_fn
+        )
+        self._tied_aliases = collect_tied_aliases(
             model, self.module_classes, self.filter_fn
         )
         LOGGER.info("HQQEstimator: %d target modules", len(self._target_modules))
@@ -3042,4 +3163,6 @@ class HQQEstimator(QuantizationParamEstimator):
                 self.weight_transform,
             )
 
-        return QuantizationPlan(weight_assignments=assignments)
+        return QuantizationPlan(
+            weight_assignments=_add_tied_aliases(assignments, self._tied_aliases)
+        )

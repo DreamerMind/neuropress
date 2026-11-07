@@ -226,6 +226,62 @@ def _scalar_codes(tensors, metadata):
     return codes, compressors
 
 
+def qtensor_from_blob(
+    cls: type,
+    blob: torch.Tensor,
+    shape: torch.Size,
+    qscheme: Any,
+    dtype: torch.dtype,
+    compressors: list[Any],
+    nnef_name: str | None = None,
+) -> Any:
+    """Wrap stored codes in a QTensor without quantizing a placeholder.
+
+    The QTensor constructor quantizes and compresses a float tensor it then
+    keeps as storage. Stored codes need neither step: reads decompress u8_blob,
+    so the uninitialized shell is never touched and its pages stay non-resident,
+    the same placeholder torch_to_nnef uses when reloading offloaded QTensors.
+    It stays a real allocation so pickling and torch.save keep working.
+    """
+    from torch_to_nnef.tensor.quant.qtract import QTensorTractScaleOnly
+
+    q = cls.__new__(
+        cls,
+        torch.empty(tuple(shape), dtype=dtype),
+        qscheme,
+        dequant_to_dtype=dtype,
+    )
+    q.u8_compressors = list(compressors)
+    q.u8_blob = blob
+    q.qscheme = qscheme
+    q.dequant_to_dtype = dtype
+    q.nnef_name = nnef_name
+    q.requires_grad = False
+    if issubclass(cls, QTensorTractScaleOnly):
+        q.decompressed_shape = torch.Size(shape)
+        q.specific_machine = None
+    return q
+
+
+def scalar_qtensor_from_codes(
+    type_name: str,
+    codes: torch.Tensor,
+    scale: torch.Tensor,
+    zero_point: torch.Tensor | None,
+    metadata: dict[str, str],
+) -> Any:
+    """Rebuild a scalar QTensor from unpacked codes in its recorded storage format."""
+    from .packing import BitPacking
+
+    blob = codes
+    for bits in json.loads(metadata.get("packing", "[]")):
+        blob = BitPacking(bits).compress(blob)
+    tensors = {"u8_blob": blob, "scale": scale.reshape(-1, 1)}
+    if zero_point is not None:
+        tensors["zero_point"] = zero_point.reshape(-1, 1)
+    return _SERDE_REGISTRY[type_name].from_parts(tensors, metadata)
+
+
 class _QTractScaleOnlySerde(QTensorSerde):
     """Persist Q4_0 codes, scales, shape and packing without requantization."""
 
@@ -269,18 +325,15 @@ class _QTractScaleOnlySerde(QTensorSerde):
 
         qscheme = QScalePerGroupF16(group_size=group_size, scale=scale, n_bits=n_bits)
         codes, compressors = _scalar_codes(tensors, metadata)
-        q = QTensorTractScaleOnly(
-            torch.zeros_like(codes, dtype=dtype),
+        return qtensor_from_blob(
+            QTensorTractScaleOnly,
+            u8_blob,
+            codes.shape,
             qscheme,
-            dequant_to_dtype=dtype,
-            u8_compressors=compressors,
+            dtype,
+            compressors,
+            metadata.get("nnef_name") or None,
         )
-        q.u8_blob = u8_blob
-
-        nnef_name = metadata.get("nnef_name")
-        if nnef_name:
-            q.nnef_name = nnef_name
-        return q
 
 
 # Register the built-in handler on module import.
@@ -315,6 +368,7 @@ class _QTensorScaleZpSerde(QTensorSerde):
             "group_size": str(q.qscheme.group_size),
             "dequant_to_dtype": str(q.dequant_to_dtype).replace("torch.", ""),
             "nnef_name": q.nnef_name or "",
+            "export_as_float": "1" if q.export_as_float else "0",
         }
 
     def from_parts(
@@ -336,17 +390,16 @@ class _QTensorScaleZpSerde(QTensorSerde):
             group_size=group_size, scale=scale, zero_point=zero_point, n_bits=n_bits
         )
         codes, compressors = _scalar_codes(tensors, metadata)
-        q = QTensorScaleZp(
-            torch.zeros_like(codes, dtype=dtype),
+        q = qtensor_from_blob(
+            QTensorScaleZp,
+            u8_blob,
+            codes.shape,
             qscheme,
-            dequant_to_dtype=dtype,
-            u8_compressors=compressors,
+            dtype,
+            compressors,
+            metadata.get("nnef_name") or None,
         )
-        q.u8_blob = u8_blob
-
-        nnef_name = metadata.get("nnef_name")
-        if nnef_name:
-            q.nnef_name = nnef_name
+        q.export_as_float = metadata.get("export_as_float") == "1"
         return q
 
 

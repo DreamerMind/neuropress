@@ -9,8 +9,8 @@ Weight transforms (registered into :data:`.WEIGHT_TRANSFORM_REGISTRY`)
 -----------------------------------------------------------------------
 - :mod:`.weight_only` — tract Q4 / Q2 quantization (``"q4_0"`` /
   ``"q4_0_unpacked"``, ``"q4_0_packed"``, ``"q2_0_packed"``, ``"identity"``
-  keys); also exports :func:`_make_packed_qtensor` for use by
-  :class:`~neuropress.estimators.GPTQPanelEstimator`.
+  keys); also exports :func:`_make_packed_qtensor`, which recalibrates float
+  weights into a packed tensor.
 
 Importing this package registers all weight transforms as a side effect.
 """

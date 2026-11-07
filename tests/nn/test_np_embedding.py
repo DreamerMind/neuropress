@@ -94,13 +94,11 @@ class TestFromEmbeddingRelowerRoundtrip:
     """Regression coverage for the re-lowering crash found immediately after
     fixing to_qtensor(): save_quantized_model() unlowers (to_qtensor), saves,
     then re-lowers (from_embedding again) for the returned model to keep
-    running fast. to_qtensor()'s output QTensor carries no u8_compressors
-    (unlike the original, genuinely BitPacking4-compressed embedding), but
+    running fast. to_qtensor() once returned no u8_compressors, while
     from_embedding() assumed its input's u8_blob was always already in
-    NPEmbedding's packed layout -- true for the original QTensor, false for
-    the round-tripped one. Re-lowering then crashed with a shape mismatch
-    inside _emb_dequant during the *next* eval, exactly like this test's
-    second from_embedding() call reproduces.
+    NPEmbedding's packed layout. Re-lowering then crashed with a shape mismatch
+    inside _emb_dequant during the *next* eval. to_qtensor() now restores the
+    original storage format, and from_embedding() must accept either layout.
     """
 
     def test_relower_after_to_qtensor_roundtrip(self):
@@ -134,9 +132,10 @@ class TestFromEmbeddingRelowerRoundtrip:
         actual1 = emb1(torch.arange(V)).float()
         assert torch.allclose(actual1, expected, atol=5e-2)
 
-        # First "unlower" (save) -- q2 carries no compressor.
+        # First "unlower" (save) -- q2 keeps the stored packing.
         q2 = emb1.to_qtensor()
-        assert q2.u8_compressors == []
+        assert q2.u8_compressors
+        torch.testing.assert_close(q2.u8_blob, q1.u8_blob, rtol=0, atol=0)
 
         # Then "re-lower" -- previously crashed here (shape mismatch in
         # _emb_dequant at the *next* forward call) because from_embedding()
