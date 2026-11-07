@@ -72,6 +72,9 @@ Q4_X_GROUP_SIZE: int = 32
 _F16_MIN_POSITIVE: float = 2.0**-24
 """Smallest positive f16 value, used for scales that would round to zero."""
 
+_F16_MAX: float = 65504.0
+"""Largest finite f16 value; tract and f16 kernels decode weights in this range."""
+
 
 def _identity_transform(weight: torch.Tensor, name: str) -> torch.Tensor:
     """Return the GPTQ-corrected *weight* unchanged.
@@ -203,30 +206,48 @@ def _make_q4_0_packed_tensor(
     return offloaded_tensor_qtensor(_calib, weight, suffix_name)
 
 
-def _f16_block_scales(scale: torch.Tensor, blocks: int, name: str) -> torch.Tensor:
+def _f16_block_scales(
+    scale: torch.Tensor, blocks: int, name: str, max_steps: torch.Tensor | float
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Round per-group scales to f16 and repeat them for each storage block.
 
-    A scale below the f16 range belongs to a group of near-zero weights, so it
-    is raised to the smallest positive f16 value instead of failing the layer.
+    A scale below the f16 range belongs to a group of near-zero weights. It is
+    raised to the smallest positive f16 value, and the returned per-block mask
+    tells the caller to store those blocks as exact zeros: their codes were
+    chosen for a far smaller scale and would otherwise decode thousands of
+    times too large.
+
+    Args:
+        scale: Per-group scales.
+        blocks: Storage blocks per group.
+        name: Layer name for messages.
+        max_steps: Largest distance in steps between a code and the offset.
+
+    Returns:
+        ``(scales, underflow)``, both shaped ``[n_blocks, 1]``.
 
     Raises:
         T2NErrorImpossibleQuantization: If a scale is negative, NaN or above
-            the f16 range.
+            the f16 range, or a code would decode outside that range.
     """
     scales = scale.reshape(-1, 1).repeat_interleave(blocks, dim=0).to(torch.float16)
     if not torch.all(torch.isfinite(scales) & (scales >= 0)):
         raise T2NErrorImpossibleQuantization(
             f"{name}: quantization scales are not representable in f16"
         )
+    if torch.any(scales.float() * max_steps > _F16_MAX):
+        raise T2NErrorImpossibleQuantization(
+            f"{name}: quantized weights would decode outside the f16 range"
+        )
     underflow = scales == 0
     if underflow.any():
         LOGGER.warning(
-            "%s: raised %d scales to the smallest positive f16 value",
+            "%s: storing %d blocks as zero, their scales are below the f16 range",
             name,
             int(underflow.sum()),
         )
         scales = scales.masked_fill(underflow, _F16_MIN_POSITIVE)
-    return scales
+    return scales, underflow
 
 
 @torch.no_grad()
@@ -240,7 +261,9 @@ def _q4_0_from_gptq(
     """Preserve GPTQ's 4-bit codes and scales in tract Q4_0.
 
     Scales round to the format's f16 representation; codes are never
-    recalibrated. Larger groups repeat their scale for each 32-value block.
+    recalibrated, except that blocks whose scale is below the f16 range are
+    stored as exact zeros. Larger groups repeat their scale for each 32-value
+    block.
 
     Raises:
         ValueError: If the scheme cannot be expressed in Q4_0.
@@ -255,8 +278,14 @@ def _q4_0_from_gptq(
         raise ValueError(
             "Q4_0 requires symmetric 4-bit GPTQ with groups divisible by 32"
         )
+    scales, underflow = _f16_block_scales(
+        scheme.scale, group_size // Q4_X_GROUP_SIZE, name, max_steps=8.0
+    )
     codes = scheme.quantize_as_u8(weight)
-    scales = _f16_block_scales(scheme.scale, group_size // Q4_X_GROUP_SIZE, name)
+    if underflow.any():
+        blocks = codes.reshape(-1, Q4_X_GROUP_SIZE).clone()
+        blocks[underflow.flatten()] = 8
+        codes = blocks.reshape(codes.shape)
     shape = weight.shape
 
     def _wrap(w: torch.Tensor) -> QTensorTractScaleOnly:

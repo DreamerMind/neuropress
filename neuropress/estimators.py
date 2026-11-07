@@ -360,7 +360,11 @@ class GPTQEstimator(QuantizationParamEstimator):
                 if self.quantized_weight_transform is not None:
                     try:
                         q = self.quantized_weight_transform(mod.weight, qscheme, name)
-                    except T2NErrorImpossibleQuantization as exc:
+                    except (
+                        T2NErrorImpossibleQuantization,
+                        ValueError,
+                        AssertionError,  # torch_to_nnef's QTensor shape checks
+                    ) as exc:
                         LOGGER.error("'%s' keeps GPTQ float weights: %s", name, exc)
                         q = None
                     if q is not None:

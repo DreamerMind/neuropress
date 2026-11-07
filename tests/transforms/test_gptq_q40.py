@@ -103,7 +103,8 @@ def test_q40_keeps_groups_whose_scale_underflows_f16():
     assert isinstance(q, QTensorTractScaleOnly)
     assert torch.all(q.qscheme.scale > 0)
     decoded = q.decompress()
-    assert torch.all(decoded[:, :32].abs() < 1e-6)
+    # Stored as exact zeros: the error stays bounded by the real weights.
+    assert torch.all(decoded[:, :32] == 0)
     assert (decoded[:, :32] - original[:, :32]).abs().max() < 1e-6
     assert (decoded[:, 32:] - original[:, 32:]).abs().max() < 0.2
 
@@ -113,3 +114,63 @@ def test_q40_skips_layer_whose_scale_overflows_f16():
     weight = model[0].weight
     assert not isinstance(weight, QTensorTractScaleOnly)
     assert torch.isfinite(weight).all()
+
+
+def test_q40_skips_layer_that_would_decode_outside_f16():
+    # A scale near 2e4 is representable, but code 0 decodes to about -1.6e5.
+    model, _ = _run_q40_gptq(1e6)
+    weight = model[0].weight
+    assert not isinstance(weight, QTensorTractScaleOnly)
+    assert torch.isfinite(weight).all()
+
+
+def _run_conv2d(format_name, kernel):
+    torch.manual_seed(3)
+    model = nn.Sequential(nn.Conv2d(64, 16, kernel, bias=False)).eval()
+    original = model[0].weight.detach().clone()
+    estimator = GptqEstimatorConfig(
+        target="conv2d", group_size=32, weight_transform=format_name
+    ).build()
+    recipe = QuantizationRecipe(
+        param_estimator=estimator, adapter=WeightAssignmentAdapter()
+    )
+    QuantizationPipeline(recipe).run(model, [torch.randn(8, 64, 8, 8)])
+    return model[0].weight, original
+
+
+@pytest.mark.parametrize("kernel", [1, 3])
+def test_q40_pipeline_handles_conv2d(kernel):
+    q, original = _run_conv2d("q4_0", kernel)
+    assert isinstance(q, QTensorTractScaleOnly)
+    decoded = q.decompress()
+    assert decoded.shape == original.shape
+    assert (decoded - original).abs().max() < 0.2
+
+
+@pytest.mark.parametrize("kernel", [1, 3])
+def test_q40_packed_conv2d_does_not_abort_the_run(kernel):
+    weight, original = _run_conv2d("q4_0_packed", kernel)
+    assert weight.shape == original.shape
+    assert torch.isfinite(weight).all()
+
+
+def test_q40_rejection_keeps_other_layers():
+    torch.manual_seed(5)
+
+    class Branches(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.compatible = nn.Linear(96, 8, bias=False)
+            self.rejected = nn.Linear(64, 8, bias=False)
+
+        def forward(self, x):
+            return self.compatible(x[..., :96]) + self.rejected(x[..., :64])
+
+    model = Branches().eval()
+    estimator = GptqEstimatorConfig(group_size=48, weight_transform="q4_0").build()
+    recipe = QuantizationRecipe(
+        param_estimator=estimator, adapter=WeightAssignmentAdapter()
+    )
+    QuantizationPipeline(recipe).run(model, [torch.randn(8, 96)])
+    assert not isinstance(model.compatible.weight, QTensorTractScaleOnly)
+    assert isinstance(model.rejected.weight, QTensorTractScaleOnly)
