@@ -53,6 +53,7 @@ from torch_to_nnef.exceptions import (
 )
 from torch_to_nnef.tensor.quant import fp_to_tract_q4_0_with_min_max_calibration
 from torch_to_nnef.tensor.quant.base import (
+    QScalePerGroupF16,
     QScheme,
     QTensor,
     qscale_per_group_f16_min_max_calibration,
@@ -60,12 +61,16 @@ from torch_to_nnef.tensor.quant.base import (
 from torch_to_nnef.tensor.quant.qtract import QTensorTractScaleOnly
 
 from ..estimator_configs import WEIGHT_TRANSFORM_REGISTRY, WeightTransformEntry
+from ..qscheme.zp_scale import ZpScaleScheme
 from ..t2n.packing import BitPacking2, BitPacking4
 
 LOGGER = logging.getLogger(__name__)
 
 Q4_X_GROUP_SIZE: int = 32
 """Column-group size required by the tract Q4_0 format."""
+
+_F16_MIN_POSITIVE: float = 2.0**-24
+"""Smallest positive f16 value, used for scales that would round to zero."""
 
 
 def _identity_transform(weight: torch.Tensor, name: str) -> torch.Tensor:
@@ -198,6 +203,76 @@ def _make_q4_0_packed_tensor(
     return offloaded_tensor_qtensor(_calib, weight, suffix_name)
 
 
+def _f16_block_scales(scale: torch.Tensor, blocks: int, name: str) -> torch.Tensor:
+    """Round per-group scales to f16 and repeat them for each storage block.
+
+    A scale below the f16 range belongs to a group of near-zero weights, so it
+    is raised to the smallest positive f16 value instead of failing the layer.
+
+    Raises:
+        T2NErrorImpossibleQuantization: If a scale is negative, NaN or above
+            the f16 range.
+    """
+    scales = scale.reshape(-1, 1).repeat_interleave(blocks, dim=0).to(torch.float16)
+    if not torch.all(torch.isfinite(scales) & (scales >= 0)):
+        raise T2NErrorImpossibleQuantization(
+            f"{name}: quantization scales are not representable in f16"
+        )
+    underflow = scales == 0
+    if underflow.any():
+        LOGGER.warning(
+            "%s: raised %d scales to the smallest positive f16 value",
+            name,
+            int(underflow.sum()),
+        )
+        scales = scales.masked_fill(underflow, _F16_MIN_POSITIVE)
+    return scales
+
+
+@torch.no_grad()
+def _q4_0_from_gptq(
+    weight: torch.Tensor,
+    scheme: ZpScaleScheme,
+    name: str,
+    *,
+    packed: bool = False,
+) -> torch.Tensor:
+    """Preserve GPTQ's 4-bit codes and scales in tract Q4_0.
+
+    Scales round to the format's f16 representation; codes are never
+    recalibrated. Larger groups repeat their scale for each 32-value block.
+
+    Raises:
+        ValueError: If the scheme cannot be expressed in Q4_0.
+        T2NErrorImpossibleQuantization: If a scale is outside the f16 range.
+    """
+    group_size = scheme.calibration_data_shape[-1]
+    if (
+        scheme.nbits != 4
+        or group_size % Q4_X_GROUP_SIZE != 0
+        or not torch.all(scheme.zero_point == 8)
+    ):
+        raise ValueError(
+            "Q4_0 requires symmetric 4-bit GPTQ with groups divisible by 32"
+        )
+    codes = scheme.quantize_as_u8(weight)
+    scales = _f16_block_scales(scheme.scale, group_size // Q4_X_GROUP_SIZE, name)
+    shape = weight.shape
+
+    def _wrap(w: torch.Tensor) -> QTensorTractScaleOnly:
+        q = QTensorTractScaleOnly(
+            w.reshape(shape),
+            qscheme=QScalePerGroupF16(Q4_X_GROUP_SIZE, scales, 4),
+            dequant_to_dtype=w.dtype,
+            u8_compressors=[BitPacking4] if packed else [],
+        )
+        q.u8_blob = BitPacking4.compress(codes) if packed else codes
+        q.nnef_name = f"{name}.weight"
+        return q
+
+    return offloaded_tensor_qtensor(_wrap, weight, "gptq_q4_0")
+
+
 def _safe_q4_0_transform(weight: torch.Tensor, name: str) -> Any:
     """Wrap *weight* as Q4_0, returning *None* on quantization failure.
 
@@ -256,6 +331,7 @@ def _Q4_X_NO_LM_HEAD_FILTER(name: str, mod: nn.Module) -> bool:
 
 WEIGHT_TRANSFORM_REGISTRY["q4_0_unpacked"] = WeightTransformEntry(
     transform=_safe_q4_0_transform,
+    quantized_transform=_q4_0_from_gptq,
     filter_fn=_Q4_X_FILTER,
     # Standard tract Q4_0: one nibble per uint8 byte (unpacked) → 8 storage bits.
     # + f16 scale per 32-element group → 0.5 bpw overhead → 8.5 effective bpw.
@@ -267,6 +343,7 @@ WEIGHT_TRANSFORM_REGISTRY["q4_0"] = WEIGHT_TRANSFORM_REGISTRY["q4_0_unpacked"]
 
 WEIGHT_TRANSFORM_REGISTRY["q4_0_packed"] = WeightTransformEntry(
     transform=_safe_q4_0_packed_transform,
+    quantized_transform=functools.partial(_q4_0_from_gptq, packed=True),
     filter_fn=_Q4_X_FILTER,
     # Bit-packed Q4_0: two nibbles per uint8 byte → 4 storage bits.
     # + scale in f16
@@ -276,6 +353,7 @@ WEIGHT_TRANSFORM_REGISTRY["q4_0_packed"] = WeightTransformEntry(
 
 WEIGHT_TRANSFORM_REGISTRY["q4_0_packed_no_lm_head"] = WeightTransformEntry(
     transform=_safe_q4_0_packed_transform,
+    quantized_transform=functools.partial(_q4_0_from_gptq, packed=True),
     filter_fn=_Q4_X_NO_LM_HEAD_FILTER,
     storage_bits=4.5,
     group_size=Q4_X_GROUP_SIZE,

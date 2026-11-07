@@ -18,7 +18,7 @@ def brute_force_assign(x: torch.Tensor, centroids: torch.Tensor) -> torch.Tensor
 
 
 def _make_inputs(N, k, D, seed=0):
-    g = torch.Generator().manual_seed(seed)
+    g = torch.Generator(device="cuda").manual_seed(seed)
     x = torch.randn(N, D, generator=g, dtype=torch.float32, device="cuda")
     centroids = torch.randn(k, D, generator=g, dtype=torch.float32, device="cuda")
     return x, centroids
