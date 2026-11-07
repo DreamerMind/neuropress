@@ -136,7 +136,7 @@ def test_frequency_sort_weights_match_centroids():
         dequant = qscheme.dequantize(weight_q.u8_blob, torch.float32)
         # Every VL-sized slice of dequant must match one centroid exactly.
         vecs = dequant.reshape(-1, qscheme.vector_len)
-        centroids_f32 = qscheme.centroids.float()
+        centroids_f32 = qscheme.centroids.float().to(dequant.device)
         for vec in vecs:
             diffs = (centroids_f32 - vec.unsqueeze(0)).norm(dim=1)
             assert diffs.min().item() < 1e-4, (
