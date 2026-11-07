@@ -39,6 +39,7 @@ except ImportError:
 
 import torch
 from torch import nn
+from torch_to_nnef.exceptions import T2NErrorImpossibleQuantization
 
 from .calibration.probe import StatisticRequest, StatisticsRegistry
 from .estimator import QuantizationParamEstimator
@@ -357,7 +358,11 @@ class GPTQEstimator(QuantizationParamEstimator):
                     progress.advance(task_id)
 
                 if self.quantized_weight_transform is not None:
-                    q = self.quantized_weight_transform(mod.weight, qscheme, name)
+                    try:
+                        q = self.quantized_weight_transform(mod.weight, qscheme, name)
+                    except T2NErrorImpossibleQuantization as exc:
+                        LOGGER.error("'%s' keeps GPTQ float weights: %s", name, exc)
+                        q = None
                     if q is not None:
                         assignments[name] = q
                 elif self.weight_transform is not None:

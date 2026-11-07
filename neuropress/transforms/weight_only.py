@@ -69,6 +69,9 @@ LOGGER = logging.getLogger(__name__)
 Q4_X_GROUP_SIZE: int = 32
 """Column-group size required by the tract Q4_0 format."""
 
+_F16_MIN_POSITIVE: float = 2.0**-24
+"""Smallest positive f16 value, used for scales that would round to zero."""
+
 
 def _identity_transform(weight: torch.Tensor, name: str) -> torch.Tensor:
     """Return the GPTQ-corrected *weight* unchanged.
@@ -200,6 +203,32 @@ def _make_q4_0_packed_tensor(
     return offloaded_tensor_qtensor(_calib, weight, suffix_name)
 
 
+def _f16_block_scales(scale: torch.Tensor, blocks: int, name: str) -> torch.Tensor:
+    """Round per-group scales to f16 and repeat them for each storage block.
+
+    A scale below the f16 range belongs to a group of near-zero weights, so it
+    is raised to the smallest positive f16 value instead of failing the layer.
+
+    Raises:
+        T2NErrorImpossibleQuantization: If a scale is negative, NaN or above
+            the f16 range.
+    """
+    scales = scale.reshape(-1, 1).repeat_interleave(blocks, dim=0).to(torch.float16)
+    if not torch.all(torch.isfinite(scales) & (scales >= 0)):
+        raise T2NErrorImpossibleQuantization(
+            f"{name}: quantization scales are not representable in f16"
+        )
+    underflow = scales == 0
+    if underflow.any():
+        LOGGER.warning(
+            "%s: raised %d scales to the smallest positive f16 value",
+            name,
+            int(underflow.sum()),
+        )
+        scales = scales.masked_fill(underflow, _F16_MIN_POSITIVE)
+    return scales
+
+
 @torch.no_grad()
 def _q4_0_from_gptq(
     weight: torch.Tensor,
@@ -212,6 +241,10 @@ def _q4_0_from_gptq(
 
     Scales round to the format's f16 representation; codes are never
     recalibrated. Larger groups repeat their scale for each 32-value block.
+
+    Raises:
+        ValueError: If the scheme cannot be expressed in Q4_0.
+        T2NErrorImpossibleQuantization: If a scale is outside the f16 range.
     """
     group_size = scheme.calibration_data_shape[-1]
     if (
@@ -223,13 +256,7 @@ def _q4_0_from_gptq(
             "Q4_0 requires symmetric 4-bit GPTQ with groups divisible by 32"
         )
     codes = scheme.quantize_as_u8(weight)
-    scales = (
-        scheme.scale.reshape(-1, 1)
-        .repeat_interleave(group_size // Q4_X_GROUP_SIZE, dim=0)
-        .to(torch.float16)
-    )
-    if not torch.all(torch.isfinite(scales) & (scales > 0)):
-        raise ValueError("GPTQ scales must be positive and representable in f16")
+    scales = _f16_block_scales(scheme.scale, group_size // Q4_X_GROUP_SIZE, name)
     shape = weight.shape
 
     def _wrap(w: torch.Tensor) -> QTensorTractScaleOnly:
