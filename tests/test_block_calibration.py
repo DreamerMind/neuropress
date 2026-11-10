@@ -390,23 +390,3 @@ def test_block_runner_allows_future_gradient_based_estimators(monkeypatch):
     for i, weight in zip([0, 2], original, strict=True):
         assert not torch.equal(result.model[i].weight, weight)
     assert torch.isfinite(result.student_outputs[0]).all()
-
-
-def test_bonsai_inference_view_uses_exact_f32_weights_without_qtensor_deepcopy():
-    from benchmarks.bonsai_block_calibration import float_view
-
-    torch.manual_seed(27)
-    model = nn.Sequential(
-        nn.Linear(32, 64, bias=False), nn.Linear(64, 32, bias=False)
-    ).eval()
-    QuantizationPipeline(recipe().build()).run(model, [torch.randn(2, 32)])
-    expected = [
-        m.weight.qscheme.dequantize(m.weight.decompress_to_u8(), torch.float32)
-        for m in model
-    ]
-    for _ in range(3):
-        view = float_view(model)
-        for layer, value in zip(view, expected, strict=True):
-            torch.testing.assert_close(layer.weight, value, rtol=0, atol=0)
-        assert view(torch.randn(2, 32)).shape == (2, 32)
-    assert all(hasattr(m.weight, "decompress_to_u8") for m in model)

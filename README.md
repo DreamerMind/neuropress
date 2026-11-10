@@ -520,14 +520,6 @@ Use `target_key=""` to collect paired observations at the block root for a
 whole-block estimator. Collection and stream propagation run without gradients;
 estimation can use autograd, including differentiation through nonlinear blocks.
 
-`benchmarks/bonsai_block_calibration.py` compares the three configurations with
-identical Q4_0 storage and held-out prompts, recording all-token and non-padding
-encoder error separately. It uses only the original checkpoint for teacher
-outputs and never fits on evaluation prompts.
-
-See the [Bonsai comparison](benchmarks/results/bonsai-block-calibration.md) for
-measured quality, reproduction settings and the limits of local teacher fitting.
-
 ### Dependency stages within a block
 
 Set `target_paths` on `BlockQuantizationPipeline` to alternate collection and
@@ -579,7 +571,3 @@ joint optimization across dependent targets should use the default whole-block
 mode. An `inference_model` callback can materialize packed weights for subsequent
 GPU collection without changing the stored model. Stage settings are part of the
 checkpoint fingerprint, and resumed results retain their schedule.
-
-The Bonsai benchmark accepts `--dependency-stages --modes sequential teacher`.
-The three-way report above measures whole-block calibration; it does not measure
-this finer-grained schedule.
