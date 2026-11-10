@@ -343,16 +343,26 @@ def test_block_runner_allows_future_gradient_based_estimators(monkeypatch):
             self.model = model
 
         def declare_statistics(self):
-            return [StatisticRequest(target_key="0", stat_type="paired_samples")]
+            return [StatisticRequest(target_key="", stat_type="paired_samples")]
 
         def estimate(self, graph, registry, recipe):
             samples = registry.get(self.declare_statistics()[0])
-            weight = self.model[0].weight.detach().clone().requires_grad_(True)
-            prediction = torch.nn.functional.linear(samples["inputs"], weight)
-            loss = (prediction - samples["targets"]).square().mean()
-            (gradient,) = torch.autograd.grad(loss, weight)
+            candidate = deepcopy(self.model).requires_grad_(True)
+            loss = (candidate(samples["inputs"]) - samples["targets"]).square().mean()
+            gradients = torch.autograd.grad(loss, tuple(candidate.parameters()))
             return QuantizationPlan(
-                weight_assignments={"0": (weight - 0.1 * gradient).detach()}
+                weight_assignments={
+                    name: (module.weight - 0.1 * gradient).detach()
+                    for (name, module), gradient in zip(
+                        [
+                            (name, mod)
+                            for name, mod in candidate.named_modules()
+                            if isinstance(mod, nn.Linear)
+                        ],
+                        gradients,
+                        strict=True,
+                    )
+                }
             )
 
     class GradientConfig(EstimatorConfig):
@@ -362,12 +372,15 @@ def test_block_runner_allows_future_gradient_based_estimators(monkeypatch):
             return GradientEstimator()
 
     monkeypatch.setitem(COLLECTOR_REGISTRY, "paired_samples", Samples)
-    model = nn.Sequential(nn.Linear(32, 16, bias=False)).eval()
-    original = model[0].weight.detach().clone()
+    model = nn.Sequential(
+        nn.Linear(32, 16, bias=False), nn.Tanh(), nn.Linear(16, 8, bias=False)
+    ).eval()
+    original = [model[i].weight.detach().clone() for i in [0, 2]]
     config = QuantizationRecipeConfig(estimator=GradientConfig(), kernel_lowering=None)
     x = torch.randn(4, 32)
     result = BlockQuantizationPipeline(config).run_block("block", model, [x * 1.5], [x])
-    assert not torch.equal(result.model[0].weight, original)
+    for i, weight in zip([0, 2], original, strict=True):
+        assert not torch.equal(result.model[i].weight, weight)
     assert torch.isfinite(result.student_outputs[0]).all()
 
 
