@@ -1,0 +1,1263 @@
+{
+  "provenance": {
+    "source_commit": "d1c0354366694a0d6f10b96d91d85a59ff379cca",
+    "checkpoint_model_revision": "30bbc032dd26939bff95c3d523477ad5065c3e1a",
+    "dataset_revision": "d816d4a05cb89bde39dd99284c459801e1e7e69a",
+    "calibration_prompts": 256,
+    "held_out_prompts": 32,
+    "seed": 3309,
+    "quantization": "Q4_0, symmetric 4-bit groups of 32, f16 scales, f32 inference view",
+    "reconstruction_damping": 0.01,
+    "selection": "Fixed settings, no tuning on held-out prompts",
+    "environment": {
+      "python": "3.13.7",
+      "machine": "arm64",
+      "system": "Darwin",
+      "packages": {
+        "torch": "2.11.0",
+        "torch-to-nnef": "0.25.0",
+        "transformers": "5.6.2",
+        "safetensors": "0.8.0",
+        "pydantic": "2.14.3"
+      }
+    },
+    "prompts_sha256": "0e9e92053792efa32fbea187aeb5a338069756f221bbe97dd81510e74ee1b7b0"
+  },
+  "summary": {
+    "float": {
+      "all_tokens": {
+        "relative_l2": 0.008925486107684339,
+        "rmse": 0.3747528222013644
+      },
+      "valid_tokens": {
+        "relative_l2": 0.005412640722048226,
+        "rmse": 0.2643428422673294
+      },
+      "per_prompt_relative_l2": [
+        0.006252680377592316,
+        0.006064717876398135,
+        0.006711264335991415,
+        0.01038177921476499,
+        0.005773747024287227,
+        0.007120110506528426,
+        0.009068375387989698,
+        0.005894840063541318,
+        0.008481061344229828,
+        0.008046939695113787,
+        0.01108503280470812,
+        0.01024625479918918,
+        0.005397528970936188,
+        0.006476595615136669,
+        0.0066831037166488845,
+        0.009051705907532336,
+        0.0074758662238820495,
+        0.008070661652529202,
+        0.010980167888098639,
+        0.005818330211903019,
+        0.012808015529601006,
+        0.007454082184459546,
+        0.014982858878520033,
+        0.008266482739337616,
+        0.006150105573885887,
+        0.016417726479128616,
+        0.0060858479973047025,
+        0.006264016705626391,
+        0.01399036486306693,
+        0.009347160560449331,
+        0.006792875754011265,
+        0.007529267209771837
+      ]
+    },
+    "sequential": {
+      "all_tokens": {
+        "relative_l2": 0.008828830008284523,
+        "rmse": 0.3706945394819467
+      },
+      "valid_tokens": {
+        "relative_l2": 0.005283813665414058,
+        "rmse": 0.2580511794616204
+      },
+      "per_prompt_relative_l2": [
+        0.006334563675989055,
+        0.005933335770184505,
+        0.005835449504396571,
+        0.010092863973419875,
+        0.005849034752975288,
+        0.006936389509568053,
+        0.008181058411243142,
+        0.0059184828339371555,
+        0.00838267447124191,
+        0.008037604813796388,
+        0.011117714982649865,
+        0.01312594790963261,
+        0.005442421129541968,
+        0.006527978022426156,
+        0.007075663217201649,
+        0.008482932130192614,
+        0.007371330451017766,
+        0.008243635465664714,
+        0.012258123610288532,
+        0.005641814307584597,
+        0.01273400643782651,
+        0.007538576167403906,
+        0.011123474471915638,
+        0.009192390568925944,
+        0.005971919866693553,
+        0.015858723217537854,
+        0.0060524404085102535,
+        0.006256040300994481,
+        0.013530606750578399,
+        0.009362469051723242,
+        0.007026510244870392,
+        0.007699027379031766
+      ]
+    },
+    "teacher": {
+      "all_tokens": {
+        "relative_l2": 0.026439169791845452,
+        "rmse": 1.1100967921097797
+      },
+      "valid_tokens": {
+        "relative_l2": 0.020828120777571766,
+        "rmse": 1.0172048964949114
+      },
+      "per_prompt_relative_l2": [
+        0.02457952299079512,
+        0.024988979112754977,
+        0.02427442024166574,
+        0.030022765655118345,
+        0.02264626144603379,
+        0.02465165490776256,
+        0.02732410395410776,
+        0.02385791760061033,
+        0.026833164395332777,
+        0.025614695144312666,
+        0.02708487488850925,
+        0.02775842558687812,
+        0.02413913409581458,
+        0.02423350377283138,
+        0.024890433532603232,
+        0.025302220024538257,
+        0.025422145761978106,
+        0.02748811345590305,
+        0.029991501527357203,
+        0.023988473007394553,
+        0.028335598354183523,
+        0.026730849512330172,
+        0.028521398317507426,
+        0.026063110470053552,
+        0.025535946871504886,
+        0.032772656721152496,
+        0.02486663310508434,
+        0.02523919743662899,
+        0.029947634416559198,
+        0.027324243657094665,
+        0.026613452146606383,
+        0.026141407029294295
+      ]
+    }
+  },
+  "integrity": {
+    "float": {
+      "quantized_tensors": 189,
+      "quantized_parameters": 2724986880,
+      "valid_q4_codes_and_f16_scales": true
+    },
+    "sequential": {
+      "quantized_tensors": 189,
+      "quantized_parameters": 2724986880,
+      "valid_q4_codes_and_f16_scales": true,
+      "comparison_to_published_calibration": {
+        "changed_integer_codes": 0,
+        "changed_group_scales": 0
+      }
+    },
+    "teacher": {
+      "quantized_tensors": 189,
+      "quantized_parameters": 2724986880,
+      "valid_q4_codes_and_f16_scales": true
+    }
+  },
+  "per_block": [
+    {
+      "layer": 1,
+      "float": {
+        "seconds": 45.68958400003612,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.03554705644978174,
+          "rmse": 0.006965982194021687
+        },
+        "valid_tokens": {
+          "relative_l2": 0.03544797044338287,
+          "rmse": 0.007529721083737589
+        }
+      },
+      "sequential": {
+        "seconds": 43.543332542001735,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.03554705644978174,
+          "rmse": 0.006965982194021687
+        },
+        "valid_tokens": {
+          "relative_l2": 0.03544797044338287,
+          "rmse": 0.007529721083737589
+        }
+      },
+      "teacher": {
+        "seconds": 45.54364216700196,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.03554705644978174,
+          "rmse": 0.006965982194021687
+        },
+        "valid_tokens": {
+          "relative_l2": 0.03544797044338287,
+          "rmse": 0.007529721083737589
+        }
+      },
+      "seconds": 135.33223095798166
+    },
+    {
+      "layer": 2,
+      "float": {
+        "seconds": 42.81592870800523,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.02820502036966437,
+          "rmse": 0.010459751119158736
+        },
+        "valid_tokens": {
+          "relative_l2": 0.02738708364044308,
+          "rmse": 0.01154916852016896
+        }
+      },
+      "sequential": {
+        "seconds": 44.24169349996373,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.028254922075610523,
+          "rmse": 0.010478257024057051
+        },
+        "valid_tokens": {
+          "relative_l2": 0.027435775444532722,
+          "rmse": 0.011569701916800821
+        }
+      },
+      "teacher": {
+        "seconds": 47.97345754201524,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.02907411281522237,
+          "rmse": 0.010782051566417128
+        },
+        "valid_tokens": {
+          "relative_l2": 0.02830690926789566,
+          "rmse": 0.011937060174499081
+        }
+      },
+      "seconds": 135.57440125005087
+    },
+    {
+      "layer": 3,
+      "float": {
+        "seconds": 45.80949058296392,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.030812922849428024,
+          "rmse": 0.013396497863697211
+        },
+        "valid_tokens": {
+          "relative_l2": 0.030196554786523024,
+          "rmse": 0.014989985370087966
+        }
+      },
+      "sequential": {
+        "seconds": 42.90600987500511,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.030733492529575347,
+          "rmse": 0.013361964037892174
+        },
+        "valid_tokens": {
+          "relative_l2": 0.03010516360965104,
+          "rmse": 0.014944617532136007
+        }
+      },
+      "teacher": {
+        "seconds": 47.176115249982104,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.03273661829945181,
+          "rmse": 0.014232860649291993
+        },
+        "valid_tokens": {
+          "relative_l2": 0.0321766870775371,
+          "rmse": 0.015972950290522255
+        }
+      },
+      "seconds": 136.4063462499762
+    },
+    {
+      "layer": 4,
+      "float": {
+        "seconds": 45.30430725001497,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.04115675981362493,
+          "rmse": 0.019824975890098476
+        },
+        "valid_tokens": {
+          "relative_l2": 0.041071845586743407,
+          "rmse": 0.022509627340465785
+        }
+      },
+      "sequential": {
+        "seconds": 43.4835391669767,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.0411012716189038,
+          "rmse": 0.01979824754395356
+        },
+        "valid_tokens": {
+          "relative_l2": 0.04101205386270686,
+          "rmse": 0.022476858191506
+        }
+      },
+      "teacher": {
+        "seconds": 47.25985745800426,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.044434363203573746,
+          "rmse": 0.02140377870346648
+        },
+        "valid_tokens": {
+          "relative_l2": 0.04443075049304152,
+          "rmse": 0.024350491724146113
+        }
+      },
+      "seconds": 136.57214062503772
+    },
+    {
+      "layer": 5,
+      "float": {
+        "seconds": 46.7671439590049,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.04773670978647218,
+          "rmse": 0.027034778560322815
+        },
+        "valid_tokens": {
+          "relative_l2": 0.04834692457558058,
+          "rmse": 0.03070427358782512
+        }
+      },
+      "sequential": {
+        "seconds": 45.10625741601689,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.04754961673803242,
+          "rmse": 0.026928821967223064
+        },
+        "valid_tokens": {
+          "relative_l2": 0.04815913060404684,
+          "rmse": 0.03058500897004919
+        }
+      },
+      "teacher": {
+        "seconds": 49.57543341699056,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.052951058554346286,
+          "rmse": 0.029987825909133993
+        },
+        "valid_tokens": {
+          "relative_l2": 0.053726263838661914,
+          "rmse": 0.03412059646472792
+        }
+      },
+      "seconds": 141.9716511250008
+    },
+    {
+      "layer": 6,
+      "float": {
+        "seconds": 45.90931262500817,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.05556917695620114,
+          "rmse": 0.035217335724263624
+        },
+        "valid_tokens": {
+          "relative_l2": 0.056717154029373266,
+          "rmse": 0.039876721816395656
+        }
+      },
+      "sequential": {
+        "seconds": 45.14301245799288,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.05520916515621822,
+          "rmse": 0.034989175850046066
+        },
+        "valid_tokens": {
+          "relative_l2": 0.05635116704985894,
+          "rmse": 0.03961940352847515
+        }
+      },
+      "teacher": {
+        "seconds": 50.039936666958965,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.0652009573969285,
+          "rmse": 0.041321540680745714
+        },
+        "valid_tokens": {
+          "relative_l2": 0.0667390475735238,
+          "rmse": 0.04692291917543043
+        }
+      },
+      "seconds": 141.62700895802118
+    },
+    {
+      "layer": 7,
+      "float": {
+        "seconds": 48.27555241697701,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.004302059816634699,
+          "rmse": 0.17871825889333132
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004289626703955321,
+          "rmse": 0.20732487460948817
+        }
+      },
+      "sequential": {
+        "seconds": 51.142301584011875,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.004194251044346126,
+          "rmse": 0.17423961450016506
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004181478825492847,
+          "rmse": 0.20209790571710864
+        }
+      },
+      "teacher": {
+        "seconds": 52.00076316698687,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.003907231538504511,
+          "rmse": 0.1623161107510656
+        },
+        "valid_tokens": {
+          "relative_l2": 0.0038905864827725005,
+          "rmse": 0.1880385894545083
+        }
+      },
+      "seconds": 151.92939829197712
+    },
+    {
+      "layer": 8,
+      "float": {
+        "seconds": 49.95711795898387,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.004397923403381055,
+          "rmse": 0.18270748187114272
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004378010919523443,
+          "rmse": 0.2116039512564678
+        }
+      },
+      "sequential": {
+        "seconds": 52.40748070803238,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.004292604033290312,
+          "rmse": 0.17833209032003544
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004271773793011165,
+          "rmse": 0.2064691546208755
+        }
+      },
+      "teacher": {
+        "seconds": 55.5568317080033,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.004138486669291962,
+          "rmse": 0.17192943322348833
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004111442599402613,
+          "rmse": 0.19871981029514038
+        }
+      },
+      "seconds": 158.46580425003776
+    },
+    {
+      "layer": 9,
+      "float": {
+        "seconds": 50.18955604196526,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.004518315949224617,
+          "rmse": 0.18771274789486073
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004475886000878473,
+          "rmse": 0.21633759403619313
+        }
+      },
+      "sequential": {
+        "seconds": 46.097055791993625,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.004417086714700308,
+          "rmse": 0.18350719476545896
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004372493481890033,
+          "rmse": 0.2113402172497982
+        }
+      },
+      "teacher": {
+        "seconds": 50.140431082982104,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.004649956093414165,
+          "rmse": 0.19318171763419517
+        },
+        "valid_tokens": {
+          "relative_l2": 0.00458811957458722,
+          "rmse": 0.2217622945985934
+        }
+      },
+      "seconds": 147.1189247079892
+    },
+    {
+      "layer": 10,
+      "float": {
+        "seconds": 46.90413737500785,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.004596220859669784,
+          "rmse": 0.1909703300932959
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004518404939143871,
+          "rmse": 0.2184156867043019
+        }
+      },
+      "sequential": {
+        "seconds": 47.39040204096818,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.00449369458360997,
+          "rmse": 0.18671042236036872
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004410970143751366,
+          "rmse": 0.2132223839951323
+        }
+      },
+      "teacher": {
+        "seconds": 46.187677624984644,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.005765245815371657,
+          "rmse": 0.2395426438471196
+        },
+        "valid_tokens": {
+          "relative_l2": 0.005546018013170869,
+          "rmse": 0.2680895911579628
+        }
+      },
+      "seconds": 141.01972420798847
+    },
+    {
+      "layer": 11,
+      "float": {
+        "seconds": 48.697068249981385,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.004644525854741177,
+          "rmse": 0.19297939600465755
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004511809580685,
+          "rmse": 0.21809737574055765
+        }
+      },
+      "sequential": {
+        "seconds": 45.84527304198127,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.004543030499492633,
+          "rmse": 0.18876227826955003
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004401358343192977,
+          "rmse": 0.21275824858690826
+        }
+      },
+      "teacher": {
+        "seconds": 47.583223666995764,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.00772807434283179,
+          "rmse": 0.3211004019789268
+        },
+        "valid_tokens": {
+          "relative_l2": 0.007176853348554449,
+          "rmse": 0.3469235244535716
+        }
+      },
+      "seconds": 142.6352994159679
+    },
+    {
+      "layer": 12,
+      "float": {
+        "seconds": 51.09909175004577,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.004756203165781495,
+          "rmse": 0.19761878441456934
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004546646404585022,
+          "rmse": 0.21977838866158064
+        }
+      },
+      "sequential": {
+        "seconds": 50.55152212502435,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.004657283969056382,
+          "rmse": 0.1935087220958133
+        },
+        "valid_tokens": {
+          "relative_l2": 0.0044324396871037635,
+          "rmse": 0.2142577991745791
+        }
+      },
+      "teacher": {
+        "seconds": 49.73372154100798,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.009668868259791864,
+          "rmse": 0.4017385140130361
+        },
+        "valid_tokens": {
+          "relative_l2": 0.008713736463664015,
+          "rmse": 0.42120956608255505
+        }
+      },
+      "seconds": 151.93874691601377
+    },
+    {
+      "layer": 13,
+      "float": {
+        "seconds": 45.59468795900466,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.004853550753160359,
+          "rmse": 0.2016682707582552
+        },
+        "valid_tokens": {
+          "relative_l2": 0.00457973495255246,
+          "rmse": 0.22138154954807449
+        }
+      },
+      "sequential": {
+        "seconds": 45.5399672499625,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.004758896852746907,
+          "rmse": 0.19773533806883478
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004463795728375831,
+          "rmse": 0.21577711929883184
+        }
+      },
+      "teacher": {
+        "seconds": 50.20092620799551,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.01146292000998546,
+          "rmse": 0.47629197134683793
+        },
+        "valid_tokens": {
+          "relative_l2": 0.01017097073052888,
+          "rmse": 0.491658422170929
+        }
+      },
+      "seconds": 141.8931910409592
+    },
+    {
+      "layer": 14,
+      "float": {
+        "seconds": 47.86636291700415,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.004962369739628933,
+          "rmse": 0.20623504132029227
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004626495352083718,
+          "rmse": 0.2236903534335203
+        }
+      },
+      "sequential": {
+        "seconds": 46.65073150000535,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.0048721093915737625,
+          "rmse": 0.20248384026365362
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004508022442571395,
+          "rmse": 0.21796220610291114
+        }
+      },
+      "teacher": {
+        "seconds": 48.22107487503672,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.012913158934668151,
+          "rmse": 0.5366681658563217
+        },
+        "valid_tokens": {
+          "relative_l2": 0.011326776154661352,
+          "rmse": 0.5476479210463026
+        }
+      },
+      "seconds": 143.28314908401808
+    },
+    {
+      "layer": 15,
+      "float": {
+        "seconds": 47.31027066602837,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.005049180734159811,
+          "rmse": 0.20985181385668153
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004639571184887209,
+          "rmse": 0.22433106646590778
+        }
+      },
+      "sequential": {
+        "seconds": 47.40255649999017,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.004965024813745453,
+          "rmse": 0.2063541627573072
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004534568606146367,
+          "rmse": 0.21925401526182706
+        }
+      },
+      "teacher": {
+        "seconds": 49.93677283299621,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.014691282677981272,
+          "rmse": 0.6105925852483162
+        },
+        "valid_tokens": {
+          "relative_l2": 0.012783638510181649,
+          "rmse": 0.6181104127997203
+        }
+      },
+      "seconds": 145.2320283749723
+    },
+    {
+      "layer": 16,
+      "float": {
+        "seconds": 49.560994458035566,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.005266365302228608,
+          "rmse": 0.2189238412360121
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004693673862758713,
+          "rmse": 0.2269923216052679
+        }
+      },
+      "sequential": {
+        "seconds": 49.13086337497225,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.005163508696712522,
+          "rmse": 0.21464807191812665
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004577165781024355,
+          "rmse": 0.22135783554340552
+        }
+      },
+      "teacher": {
+        "seconds": 50.566606874985155,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.01631263249656699,
+          "rmse": 0.6781193407357978
+        },
+        "valid_tokens": {
+          "relative_l2": 0.013831980003295037,
+          "rmse": 0.6689329819565002
+        }
+      },
+      "seconds": 149.90994525002316
+    },
+    {
+      "layer": 17,
+      "float": {
+        "seconds": 44.99978629098041,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.0064570634979316185,
+          "rmse": 0.272290606001494
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004751308568802728,
+          "rmse": 0.23308846645175607
+        }
+      },
+      "sequential": {
+        "seconds": 43.14015495899366,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.006292761448250933,
+          "rmse": 0.2653620842842879
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004644676548841407,
+          "rmse": 0.22785734040564246
+        }
+      },
+      "teacher": {
+        "seconds": 46.76550562499324,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.01805274114842561,
+          "rmse": 0.7612735772025403
+        },
+        "valid_tokens": {
+          "relative_l2": 0.014586103389485315,
+          "rmse": 0.7155612861867826
+        }
+      },
+      "seconds": 135.4922823330271
+    },
+    {
+      "layer": 18,
+      "float": {
+        "seconds": 44.31547762500122,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.006938314208904425,
+          "rmse": 0.29257157779860465
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004785664471041944,
+          "rmse": 0.2347594164552077
+        }
+      },
+      "sequential": {
+        "seconds": 45.761632166977506,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.006786536004431709,
+          "rmse": 0.28617146569342644
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004677614311499519,
+          "rmse": 0.2294590464531805
+        }
+      },
+      "teacher": {
+        "seconds": 49.70516204199521,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.019678143931653368,
+          "rmse": 0.8297787394587623
+        },
+        "valid_tokens": {
+          "relative_l2": 0.015487528386024296,
+          "rmse": 0.759736322560438
+        }
+      },
+      "seconds": 140.4645741659915
+    },
+    {
+      "layer": 19,
+      "float": {
+        "seconds": 46.78507820900995,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.007182179714533646,
+          "rmse": 0.3028836661633437
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004830393780456528,
+          "rmse": 0.2369720758749959
+        }
+      },
+      "sequential": {
+        "seconds": 50.445221000001766,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.00706318197278687,
+          "rmse": 0.29786534669516973
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004716345206202553,
+          "rmse": 0.23137701911153086
+        }
+      },
+      "teacher": {
+        "seconds": 49.326620500010904,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.021022981007339146,
+          "rmse": 0.886571739259329
+        },
+        "valid_tokens": {
+          "relative_l2": 0.016481290723527053,
+          "rmse": 0.8085480922189918
+        }
+      },
+      "seconds": 147.1191058330005
+    },
+    {
+      "layer": 20,
+      "float": {
+        "seconds": 49.31499874999281,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.007435454245612685,
+          "rmse": 0.313588858036754
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004934711520682146,
+          "rmse": 0.24210284969335774
+        }
+      },
+      "sequential": {
+        "seconds": 45.777951124997344,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.007326147129815773,
+          "rmse": 0.3089788513732918
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004814920010220993,
+          "rmse": 0.23622573490555815
+        }
+      },
+      "teacher": {
+        "seconds": 47.25090379198082,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.022575600172392886,
+          "rmse": 0.9521216113641898
+        },
+        "valid_tokens": {
+          "relative_l2": 0.017765094068590042,
+          "rmse": 0.871576764123175
+        }
+      },
+      "seconds": 142.90352437499678
+    },
+    {
+      "layer": 21,
+      "float": {
+        "seconds": 45.918374333996326,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.00768499302401203,
+          "rmse": 0.3241050991042215
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004991011997578214,
+          "rmse": 0.24485687437696055
+        }
+      },
+      "sequential": {
+        "seconds": 46.32991641602712,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.00756500021772546,
+          "rmse": 0.3190445505452491
+        },
+        "valid_tokens": {
+          "relative_l2": 0.004870519197600216,
+          "rmse": 0.2389455501000572
+        }
+      },
+      "teacher": {
+        "seconds": 48.2813459589961,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.023955295793853148,
+          "rmse": 1.0102850442519722
+        },
+        "valid_tokens": {
+          "relative_l2": 0.018857314477351176,
+          "rmse": 0.9251316334862435
+        }
+      },
+      "seconds": 141.06726224999875
+    },
+    {
+      "layer": 22,
+      "float": {
+        "seconds": 49.33538841601694,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.00800542784738712,
+          "rmse": 0.337623411662452
+        },
+        "valid_tokens": {
+          "relative_l2": 0.005070194745079274,
+          "rmse": 0.24874209924988708
+        }
+      },
+      "sequential": {
+        "seconds": 50.844938958005514,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.007881169656074442,
+          "rmse": 0.33238290793450775
+        },
+        "valid_tokens": {
+          "relative_l2": 0.0049465837729345255,
+          "rmse": 0.24267778530388245
+        }
+      },
+      "teacher": {
+        "seconds": 49.228008583013434,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.0255363723312468,
+          "rmse": 1.076978933833629
+        },
+        "valid_tokens": {
+          "relative_l2": 0.020164889163304427,
+          "rmse": 0.9892828804044635
+        }
+      },
+      "seconds": 149.96871649997775
+    },
+    {
+      "layer": 23,
+      "float": {
+        "seconds": 50.9040799580398,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.008502403079897788,
+          "rmse": 0.35858779025230064
+        },
+        "valid_tokens": {
+          "relative_l2": 0.0051491106981316846,
+          "rmse": 0.25261029781209354
+        }
+      },
+      "sequential": {
+        "seconds": 45.246607166016474,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.008372187524633765,
+          "rmse": 0.3530959654376085
+        },
+        "valid_tokens": {
+          "relative_l2": 0.005023822871863243,
+          "rmse": 0.24646380049218533
+        }
+      },
+      "teacher": {
+        "seconds": 48.441612916998565,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.027707819115869857,
+          "rmse": 1.1685738180261762
+        },
+        "valid_tokens": {
+          "relative_l2": 0.02193297891731534,
+          "rmse": 1.0760103367405938
+        }
+      },
+      "seconds": 145.1657338750083
+    },
+    {
+      "layer": 24,
+      "float": {
+        "seconds": 47.8128182090004,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.009388052087575295,
+          "rmse": 0.3960039700507819
+        },
+        "valid_tokens": {
+          "relative_l2": 0.0054262699006229235,
+          "rmse": 0.26623476854093986
+        }
+      },
+      "sequential": {
+        "seconds": 47.79447754099965,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.009273893379001252,
+          "rmse": 0.3911885619778886
+        },
+        "valid_tokens": {
+          "relative_l2": 0.005292720446587068,
+          "rmse": 0.2596822916764956
+        }
+      },
+      "teacher": {
+        "seconds": 49.537193208001554,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.03062632437257762,
+          "rmse": 1.2918703397118623
+        },
+        "valid_tokens": {
+          "relative_l2": 0.024253246803861674,
+          "rmse": 1.189962472831219
+        }
+      },
+      "seconds": 145.69128733297111
+    },
+    {
+      "layer": 25,
+      "float": {
+        "seconds": 46.94018912501633,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.010579256982260695,
+          "rmse": 0.44643005601132335
+        },
+        "valid_tokens": {
+          "relative_l2": 0.005823997144824534,
+          "rmse": 0.2858322057797307
+        }
+      },
+      "sequential": {
+        "seconds": 48.83892516704509,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.010460995187903164,
+          "rmse": 0.4414395713706983
+        },
+        "valid_tokens": {
+          "relative_l2": 0.005687688079643992,
+          "rmse": 0.2791423809395953
+        }
+      },
+      "teacher": {
+        "seconds": 52.67509825003799,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.034080897699242774,
+          "rmse": 1.4381668858509904
+        },
+        "valid_tokens": {
+          "relative_l2": 0.026879244282054512,
+          "rmse": 1.3191891224848507
+        }
+      },
+      "seconds": 149.01033720897976
+    },
+    {
+      "layer": 26,
+      "float": {
+        "seconds": 47.13144949998241,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.011644938420117153,
+          "rmse": 0.49162351054240144
+        },
+        "valid_tokens": {
+          "relative_l2": 0.006198527196368108,
+          "rmse": 0.3043249328042142
+        }
+      },
+      "sequential": {
+        "seconds": 47.541659666982014,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.011543931766008184,
+          "rmse": 0.4873592333010913
+        },
+        "valid_tokens": {
+          "relative_l2": 0.00604774224355275,
+          "rmse": 0.29692194509767056
+        }
+      },
+      "teacher": {
+        "seconds": 49.93448233301751,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.03718144640179081,
+          "rmse": 1.569718322899942
+        },
+        "valid_tokens": {
+          "relative_l2": 0.029298562535075703,
+          "rmse": 1.4384518761128262
+        }
+      },
+      "seconds": 145.1474974169978
+    },
+    {
+      "layer": 27,
+      "float": {
+        "seconds": 50.616586874995846,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.012975980293070621,
+          "rmse": 0.5481649654856262
+        },
+        "valid_tokens": {
+          "relative_l2": 0.006681459331824893,
+          "rmse": 0.32820340730429987
+        }
+      },
+      "sequential": {
+        "seconds": 44.703662874992006,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.012893442403128454,
+          "rmse": 0.5446781861772927
+        },
+        "valid_tokens": {
+          "relative_l2": 0.006516209192552828,
+          "rmse": 0.32008607004711326
+        }
+      },
+      "teacher": {
+        "seconds": 48.4992868329864,
+        "resumed": false,
+        "all_tokens": {
+          "relative_l2": 0.040802521791317305,
+          "rmse": 1.72368579824497
+        },
+        "valid_tokens": {
+          "relative_l2": 0.032044690078325416,
+          "rmse": 1.5740837364118783
+        }
+      },
+      "seconds": 144.50993800000288
+    }
+  ]
+}

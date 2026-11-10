@@ -524,3 +524,6 @@ estimation can use autograd, including differentiation through nonlinear blocks.
 identical Q4_0 storage and held-out prompts, recording all-token and non-padding
 encoder error separately. It uses only the original checkpoint for teacher
 outputs and never fits on evaluation prompts.
+
+See the [Bonsai comparison](benchmarks/results/bonsai-block-calibration.md) for
+measured quality, reproduction settings and the limits of local teacher fitting.
