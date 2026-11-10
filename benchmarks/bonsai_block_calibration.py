@@ -90,7 +90,12 @@ def main():
         choices=["float", "sequential", "teacher"],
         default=["float", "sequential", "teacher"],
     )
+    parser.add_argument("--dependency-stages", action="store_true")
     args = parser.parse_args()
+    if args.dependency_stages and "float" in args.modes:
+        parser.error(
+            "Dependency stages require --modes sequential teacher (or either mode)"
+        )
     torch.set_num_threads(8)
     torch.manual_seed(3309)
     device = "mps" if torch.backends.mps.is_available() else "cpu"
@@ -168,6 +173,20 @@ def main():
             checkpoint_dir=args.out / mode,
             run_id="bonsai-30bbc032-explicit-f32-v2:" + args.prompts.read_text(),
             inference_model=float_view,
+            target_paths=tuple(
+                "block." + name
+                for name in [
+                    "self_attn.q_proj",
+                    "self_attn.k_proj",
+                    "self_attn.v_proj",
+                    "self_attn.o_proj",
+                    "mlp.gate_proj",
+                    "mlp.up_proj",
+                    "mlp.down_proj",
+                ]
+            )
+            if args.dependency_stages
+            else None,
         )
         (args.out / f"{mode}-recipe.json").write_text(recipe.model_dump_json(indent=2))
     reports = []
@@ -222,6 +241,7 @@ def main():
             block_report[mode] = {
                 "seconds": time.monotonic() - start,
                 "resumed": result.resumed,
+                "schedule": result.schedule.stages if result.schedule else None,
                 **metrics(evaluation_states[mode], reference_evaluation, masks["eval"]),
             }
             print(

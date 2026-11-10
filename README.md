@@ -527,3 +527,59 @@ outputs and never fits on evaluation prompts.
 
 See the [Bonsai comparison](benchmarks/results/bonsai-block-calibration.md) for
 measured quality, reproduction settings and the limits of local teacher fitting.
+
+### Dependency stages within a block
+
+Set `target_paths` on `BlockQuantizationPipeline` to alternate collection and
+adaptation at dependency barriers inside each block. The runner traces the
+explicit target modules across the supplied calibration batches, groups targets
+with no observed dependency, then runs a fresh recipe for each group. Later
+stages collect new statistics through the already adapted stages. Teacher
+observations always use a separate, unchanged float block.
+
+```python
+from neuropress import QuantizationSchedule
+
+paths = tuple(name for name, module in block.named_modules()
+              if isinstance(module, torch.nn.Linear))
+schedule = QuantizationSchedule.trace(block.eval(), calibration_batches, paths)
+print(schedule)
+runner = BlockQuantizationPipeline(config, target_paths=paths,
+                                   input_source="sequential")
+result = runner.run_block("block", block, calibration_batches, reference_batches)
+print(result.schedule)
+```
+
+For a Qwen decoder block, the notation is:
+
+```text
+[q_proj | k_proj | v_proj] → [o_proj] → [gate_proj | up_proj] → [down_proj]
+```
+
+`|` means targets can share a statistics collection pass; `→` means apply the
+preceding stage before recollecting. This expresses potential concurrency, not
+parallel execution. Names above omit the attention/MLP prefixes for readability.
+The ranking follows tensor dependencies through functional operations, reshapes,
+residual additions and parameter reads, rather than Python hook call order.
+Targets may be embeddings, convolutions or other modules supported by the recipe.
+
+The trace describes observed eager PyTorch tensor dataflow, not arbitrary program
+semantics. Supply representative batches and use a pure, deterministic eval
+forward. In-place tensor operations, tensor-dependent Python branches, repeated
+calls to a target, nested targets, shared target parameter storage and targets
+missing from a batch are rejected. Python side effects, foreign computation and
+unobserved paths are outside this contract. Every selected target must be handled
+by the recipe; assignments outside the selected weight stage are rejected.
+
+Existing estimators with `filter_fn` support stage selection while preserving
+format filters. Composite estimators forward selection to each member. Future
+estimators can implement `select_targets(paths)` explicitly. Global preprocessing
+and final kernel lowering remain outside the staged traversal; methods requiring
+joint optimization across dependent targets should use the default whole-block
+mode. An `inference_model` callback can materialize packed weights for subsequent
+GPU collection without changing the stored model. Stage settings are part of the
+checkpoint fingerprint, and resumed results retain their schedule.
+
+The Bonsai benchmark accepts `--dependency-stages --modes sequential teacher`.
+The three-way report above measures whole-block calibration; it does not measure
+this finer-grained schedule.

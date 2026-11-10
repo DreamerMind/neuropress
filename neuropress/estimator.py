@@ -91,6 +91,22 @@ class QuantizationParamEstimator(ABC):
         """
         ...
 
+    def select_targets(self, paths: set[str]) -> None:
+        """Restrict estimation to a stage, preserving existing target filters.
+
+        Estimators with module filters inherit this implementation. Other
+        estimators must implement this contract explicitly to support staging.
+        Selection occurs before prepare; no assignment may escape the stage.
+        """
+        if not hasattr(self, "filter_fn"):
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support target selection"
+            )
+        previous = self.filter_fn
+        self.filter_fn = lambda name, module: (
+            name in paths and (previous is None or previous(name, module))
+        )
+
     @abstractmethod
     def declare_statistics(self) -> list[StatisticRequest]:
         """Return the list of statistics needed for estimation."""

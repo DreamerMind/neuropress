@@ -26,6 +26,7 @@ from .estimators import (
     MinMaxZpWeightEstimator,
 )
 from .graph import QGraph, QNode, QValue, RuntimeModuleGraphProvider
+from .graph.schedule import QuantizationSchedule
 from .kernel_lowering import AutoKernelLowering, KernelLowering
 from .methods import METHOD_REGISTRY
 from .pipeline import QuantizationPipeline
@@ -113,6 +114,7 @@ __all__ = [
     "QuantizationPlan",
     "QuantizationRecipe",
     "QuantizationRecipeConfig",
+    "QuantizationSchedule",
     "QuantizedWeight",
     "RuntimeModuleGraphProvider",
     "SmoothQuantStep",

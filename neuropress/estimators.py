@@ -3056,6 +3056,11 @@ class CompositeEstimator(QuantizationParamEstimator):
 
     estimators: list[QuantizationParamEstimator] = field(default_factory=list)
 
+    def select_targets(self, paths: set[str]) -> None:
+        """Restrict every composed estimator to the same calibration stage."""
+        for estimator in self.estimators:
+            estimator.select_targets(paths)
+
     def prepare(self, model: nn.Module) -> None:
         """Prepare all sub-estimators.
 

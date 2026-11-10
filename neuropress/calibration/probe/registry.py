@@ -5,6 +5,7 @@ A single global calibration pass feeds all registered probes.
 
 from __future__ import annotations
 
+import inspect
 import typing
 from collections import deque
 from collections.abc import Iterable
@@ -217,9 +218,16 @@ class StatisticsRegistry:
                 if hasattr(collector, "module") and collector.module is None:
                     collector.module = mod
 
-                def _act_hook(module, inputs, outputs, _col=collector, _key=dedupe_key):
+                def _act_hook(
+                    module, inputs, kwargs, outputs, _col=collector, _key=dedupe_key
+                ):
                     if not collecting_student:
                         return
+                    if kwargs:
+                        bound = inspect.signature(module.forward).bind(
+                            *inputs, **kwargs
+                        )
+                        inputs = tuple(bound.arguments.values())
                     if isinstance(_col, PairedCollector):
                         if not observations[_key]:
                             raise ValueError(
@@ -231,7 +239,7 @@ class StatisticsRegistry:
                     if isinstance(data, torch.Tensor):
                         _col.update(data)
 
-                hooks.append(mod.register_forward_hook(_act_hook))
+                hooks.append(mod.register_forward_hook(_act_hook, with_kwargs=True))
 
         try:
             with torch.no_grad():

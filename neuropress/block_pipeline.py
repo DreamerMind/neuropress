@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import weakref
@@ -14,6 +15,7 @@ import torch
 from torch import nn
 
 from .calibration.batches import call_batch, move_batch
+from .graph.schedule import QuantizationSchedule
 from .pipeline import QuantizationPipeline
 from .plan import QuantizationPlan
 from .recipe_config import QuantizationRecipeConfig
@@ -53,6 +55,7 @@ class BlockCalibrationResult:
     student_outputs: list[Any]
     kept_float: dict[str, str]
     resumed: bool = False
+    schedule: QuantizationSchedule | None = None
 
 
 class BlockQuantizationPipeline:
@@ -67,6 +70,10 @@ class BlockQuantizationPipeline:
     example a copy with packed weights materialized for GPU calibration. It must
     not mutate the original block. Its semantics must be included in ``run_id``
     when checkpointing. Block inputs/outputs are CPU tensor trees between calls.
+
+    ``target_paths`` enables dependency stages within each block: collect and
+    adapt independent targets together, then recollect for dependent targets.
+    The trace requires a functional eval forward; teacher weights stay frozen.
     """
 
     def __init__(
@@ -79,6 +86,7 @@ class BlockQuantizationPipeline:
         checkpoint_dir: str | Path | None = None,
         run_id: str | None = None,
         inference_model: Callable[[nn.Module], nn.Module] | None = None,
+        target_paths: tuple[str, ...] | None = None,
     ) -> None:
         if input_source not in {"float", "sequential"}:
             raise ValueError("input_source must be float or sequential")
@@ -92,6 +100,9 @@ class BlockQuantizationPipeline:
             raise ValueError(
                 "Checkpointing requires run_id identifying the model/data/forward contract"
             )
+        if target_paths is not None and input_source != "sequential":
+            raise ValueError("Dependency stages require input_source=sequential")
+        self.target_paths = tuple(target_paths) if target_paths is not None else None
         self.config = config
         self.input_source = input_source
         self.forward_device = torch.device(forward_device)
@@ -122,6 +133,11 @@ class BlockQuantizationPipeline:
         _fingerprint(
             {
                 "schema": 1,
+                **(
+                    {"target_paths": self.target_paths}
+                    if self.target_paths is not None
+                    else {}
+                ),
                 "run_id": self.run_id,
                 "name": name,
                 "recipe": self.config.model_dump_json(),
@@ -176,28 +192,74 @@ class BlockQuantizationPipeline:
                 streams["student"],
                 metadata["kept_float"],
                 True,
+                QuantizationSchedule(
+                    tuple(tuple(stage) for stage in metadata["schedule"])
+                )
+                if metadata.get("schedule") is not None
+                else None,
             )
 
         reference_outputs = self.forward(model, reference)
         source = reference if self.input_source == "float" else student
-        model.to(self.forward_device).eval()
-        pipeline = QuantizationPipeline(self.config.build())
-        pipeline.run(
-            model,
-            (move_batch(batch, self.forward_device) for batch in source),
-            reference_data=(
-                move_batch(batch, self.forward_device) for batch in reference
-            ),
-            estimation_device=self.estimation_device,
-        )
-        plan: QuantizationPlan = pipeline.last_plan
+        schedule = None
+        if self.target_paths is not None:
+            model.to(self.forward_device).eval()
+            schedule = QuantizationSchedule.trace(
+                model,
+                (move_batch(batch, self.forward_device) for batch in source),
+                self.target_paths,
+            )
+            model.cpu()
+            teacher = copy.deepcopy(model).to(self.forward_device).eval()
+            plan = QuantizationPlan()
+            try:
+                for stage in schedule.stages:
+                    observed = (
+                        self.inference_model(model) if self.inference_model else model
+                    )
+                    observed.to(self.forward_device).eval()
+                    pipeline = QuantizationPipeline(self.config.build())
+                    pipeline.run(
+                        model,
+                        (move_batch(batch, self.forward_device) for batch in source),
+                        reference_data=(
+                            move_batch(batch, self.forward_device)
+                            for batch in reference
+                        ),
+                        reference_model=teacher,
+                        estimation_device=self.estimation_device,
+                        collection_model=observed,
+                        target_paths=set(stage),
+                    )
+                    plan.kept_float.update(pipeline.last_plan.kept_float)
+                    observed.cpu()
+                    model.cpu()
+            finally:
+                teacher.cpu()
+        else:
+            model.to(self.forward_device).eval()
+            pipeline = QuantizationPipeline(self.config.build())
+            pipeline.run(
+                model,
+                (move_batch(batch, self.forward_device) for batch in source),
+                reference_data=(
+                    move_batch(batch, self.forward_device) for batch in reference
+                ),
+                estimation_device=self.estimation_device,
+            )
+            plan = pipeline.last_plan
         model.cpu()
         inference = (
             self.inference_model(model) if self.inference_model is not None else model
         )
         student_outputs = self.forward(inference, student)
         result = BlockCalibrationResult(
-            name, model, reference_outputs, student_outputs, dict(plan.kept_float)
+            name,
+            model,
+            reference_outputs,
+            student_outputs,
+            dict(plan.kept_float),
+            schedule=schedule,
         )
         if path is not None:
             path.mkdir(parents=True, exist_ok=True)
@@ -211,7 +273,11 @@ class BlockQuantizationPipeline:
             temporary = path / "complete.json.tmp"
             temporary.write_text(
                 json.dumps(
-                    {"fingerprint": fingerprint, "kept_float": result.kept_float}
+                    {
+                        "fingerprint": fingerprint,
+                        "kept_float": result.kept_float,
+                        "schedule": schedule.stages if schedule else None,
+                    }
                 )
             )
             temporary.replace(path / "complete.json")

@@ -2,7 +2,9 @@
 
 Builds a QGraph by running a forward pass and recording module calls
 via forward hooks.  No symbolic tracing (FX/Dynamo) is required; the
-graph captures the actual execution order.
+graph captures the actual execution order. Its sequential edges do not establish
+tensor dependencies or independence; use QuantizationSchedule for calibration
+stages derived from tensor dataflow.
 
 Upgrade path: replace this class with a DynamoOpGraphProvider that
 reuses the same QGraph API without touching any downstream code.

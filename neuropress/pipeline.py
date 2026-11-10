@@ -54,6 +54,8 @@ class QuantizationPipeline:
         reference_data: Iterable | None = None,
         reference_model: nn.Module | None = None,
         estimation_device: str | torch.device | None = None,
+        collection_model: nn.Module | None = None,
+        target_paths: set[str] | None = None,
     ) -> nn.Module:
         """Run the full pipeline and return the quantized model.
 
@@ -71,10 +73,16 @@ class QuantizationPipeline:
             reference_model: Teacher model; defaults to the unadapted student.
             estimation_device: Move the model and statistics here after collection.
                 The returned model remains on this device.
+            collection_model: Optional inference view used for graph/statistics forwards.
+                It must preserve target module paths and their unadapted weights.
+            target_paths: Optional estimator selection and assignment boundary.
             example_inputs: Optional single batch for graph building.
                 If *None*, the first element of *calibration_data* is used
                 and then replayed at the start of the collection pass.
         """
+        if collection_model is not None and self.recipe.preprocessing:
+            raise ValueError("Apply preprocessing before supplying a collection model")
+
         # -- Step 0: Preprocessing (materialise if needed) ------------------
         if self.recipe.preprocessing:
             LOGGER.info(
@@ -98,12 +106,15 @@ class QuantizationPipeline:
             inputs_for_graph = next(calibration_iter)
             calibration_iter = itertools.chain([inputs_for_graph], calibration_iter)
 
-        graph: QGraph = self._graph_provider.build(model, inputs_for_graph)
+        observed_model = collection_model if collection_model is not None else model
+        graph: QGraph = self._graph_provider.build(observed_model, inputs_for_graph)
         LOGGER.info("QGraph: %d nodes, %d values", len(graph.nodes), len(graph.values))
 
         # -- Step 2 & 3: Declare + aggregate statistics --------------------
         LOGGER.info("Step 2/3: Aggregating statistic requests")
         estimator = self.recipe.param_estimator
+        if target_paths is not None:
+            estimator.select_targets(target_paths)
         # Allow estimators to bind themselves to the model before declaring
         # statistics (e.g. GPTQEstimator.prepare discovers target modules).
         if hasattr(estimator, "prepare"):
@@ -126,7 +137,7 @@ class QuantizationPipeline:
                 total=total_batches,
             )
         registry.collect(
-            model,
+            observed_model,
             calibration_iter,
             reference_data=reference_data,
             reference_model=reference_model,
@@ -144,6 +155,17 @@ class QuantizationPipeline:
             len(plan.weight_assignments),
             len(plan.activation_assignments),
         )
+
+        if target_paths is not None:
+            assigned = set(plan.weight_assignments) | set(plan.kept_float)
+            if assigned - target_paths or plan.activation_assignments:
+                raise ValueError(
+                    "Estimator assignments escape the selected weight stage"
+                )
+            if target_paths - assigned:
+                raise ValueError(
+                    f"Stage targets not handled by estimator: {target_paths - assigned}"
+                )
 
         # -- Step 6: Adapt model (weight assignment + manifest + lowering) -------
         LOGGER.info("Step 6: Adapting model structure")
