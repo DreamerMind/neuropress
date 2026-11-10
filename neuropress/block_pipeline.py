@@ -251,7 +251,7 @@ class BlockQuantizationPipeline:
                     raise ValueError(
                         "Blocks must not share parameter storage across boundaries"
                     )
-                current_parameters[storage] = weakref.ref(parameter)
+                current_parameters[storage] = weakref.ref(parameter.untyped_storage())
             parameters.update(current_parameters)
             result = self.run_block(name, block, student, reference)
             student = [

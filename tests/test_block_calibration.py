@@ -285,10 +285,15 @@ def test_reference_model_and_repeated_invocations_are_aligned():
     assert not teacher.linear._forward_hooks
 
 
-def test_block_runner_rejects_cross_block_shared_weights():
+@pytest.mark.parametrize("alias", [False, True])
+def test_block_runner_rejects_cross_block_shared_weights(alias):
     first = nn.Sequential(nn.Linear(32, 32, bias=False)).eval()
     second = nn.Sequential(nn.Linear(32, 32, bias=False)).eval()
-    second[0].weight = first[0].weight
+    second[0].weight = (
+        nn.Parameter(first[0].weight.detach().view_as(first[0].weight))
+        if alias
+        else first[0].weight
+    )
     runner = BlockQuantizationPipeline(recipe())
     with pytest.raises(ValueError, match="share parameter storage"):
         list(runner.run(enumerate_names([first, second]), [torch.randn(2, 32)]))
