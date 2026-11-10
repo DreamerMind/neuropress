@@ -196,6 +196,8 @@ class GptqEstimatorConfig(EstimatorConfig):
     damp_percent: float = 0.01
     damp_auto_increment: float = 0.0025
     weight_transform: str | None = None
+    reconstruction: Literal["self", "teacher"] = "self"
+    reconstruction_damp_percent: float = Field(default=0.01, gt=0)
 
     def build(self) -> GPTQEstimator:
         """Build a :class:`.GPTQEstimator` for the configured target class.
@@ -224,6 +226,8 @@ class GptqEstimatorConfig(EstimatorConfig):
             symmetric=self.symmetric,
             damp_percent=self.damp_percent,
             damp_auto_increment=self.damp_auto_increment,
+            reconstruction=self.reconstruction,
+            reconstruction_damp_percent=self.reconstruction_damp_percent,
         )
 
 

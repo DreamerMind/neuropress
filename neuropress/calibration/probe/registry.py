@@ -6,15 +6,19 @@ A single global calibration pass feeds all registered probes.
 from __future__ import annotations
 
 import typing
+from collections import deque
 from collections.abc import Iterable
+from itertools import zip_longest
 from typing import Any
 
 import torch
 from torch import nn
 
+from ..batches import call_batch, move_batch
 from .collectors import (
     COLLECTOR_REGISTRY,
     Collector,
+    PairedCollector,
     StatField,
     StatisticRequest,
 )
@@ -116,16 +120,20 @@ class StatisticsRegistry:
         self,
         model: nn.Module,
         calibration_data: Iterable,
+        *,
+        reference_data: Iterable | None = None,
+        reference_model: nn.Module | None = None,
     ) -> None:
         """Run a single forward pass over *calibration_data*, populating stats.
 
-        Supported stat types: "min_max", "hessian".
-        Hooks are installed, data is collected, then hooks are removed.
+        Collectors are selected through COLLECTOR_REGISTRY. Paired collectors
+        additionally require reference_data aligned batch-for-batch. Module paths
+        and invocation order must match the reference_model (default: model).
+        Teacher outputs are snapshotted on CPU for one batch at a time. Hooks
+        are removed even when pairing or a forward pass fails.
         """
         hooks: list[Any] = []
-        module_map: dict[str, nn.Module] = {
-            name: mod for name, mod in model.named_modules() if name
-        }
+        module_map = dict(model.named_modules())
 
         # Build per-target collector instances.
         # Pre-registered collectors (e.g. context-aware HessianAccumulators)
@@ -137,6 +145,35 @@ class StatisticsRegistry:
                 collectors[dedupe_key] = self._collectors[dedupe_key]
             elif req.stat_type in COLLECTOR_REGISTRY:
                 collectors[dedupe_key] = COLLECTOR_REGISTRY[req.stat_type]()
+
+        paired = {
+            key: col
+            for key, col in collectors.items()
+            if isinstance(col, PairedCollector)
+        }
+        if paired and reference_data is None:
+            raise ValueError("Paired statistics require reference_data")
+        teacher = reference_model if reference_model is not None else model
+        teacher_modules = dict(teacher.named_modules())
+        for key in paired:
+            target = self._requests[key].target_key
+            if target not in module_map or target not in teacher_modules:
+                raise ValueError(
+                    f"Paired target {target!r} missing from student or teacher"
+                )
+        observations = {key: deque() for key in paired}
+        collecting_student = True
+        for key in paired:
+
+            def reference_hook(module, inputs, output, _key=key):
+                if not collecting_student:
+                    observations[_key].append(move_batch(output, "cpu", copy=True))
+
+            hooks.append(
+                teacher_modules[self._requests[key].target_key].register_forward_hook(
+                    reference_hook
+                )
+            )
 
         # Install hooks.  target_key format: "{module_path}/{param_name}"
         # or just a value_id (activation).
@@ -155,6 +192,8 @@ class StatisticsRegistry:
                 def _weight_hook(
                     module, inputs, outputs, _col=collector, _pn=param_name
                 ):
+                    if not collecting_student:
+                        return
                     w = getattr(module, _pn, None)
                     if w is not None:
                         _col.update(w.data)
@@ -178,7 +217,16 @@ class StatisticsRegistry:
                 if hasattr(collector, "module") and collector.module is None:
                     collector.module = mod
 
-                def _act_hook(module, inputs, outputs, _col=collector):
+                def _act_hook(module, inputs, outputs, _col=collector, _key=dedupe_key):
+                    if not collecting_student:
+                        return
+                    if isinstance(_col, PairedCollector):
+                        if not observations[_key]:
+                            raise ValueError(
+                                f"No matching teacher invocation for {_key}"
+                            )
+                        _col.update_pair(inputs, outputs, observations[_key].popleft())
+                        return
                     data = inputs[0] if inputs else outputs
                     if isinstance(data, torch.Tensor):
                         _col.update(data)
@@ -186,14 +234,25 @@ class StatisticsRegistry:
                 hooks.append(mod.register_forward_hook(_act_hook))
 
         try:
-            with torch.inference_mode():
-                for batch in calibration_data:
-                    if isinstance(batch, dict):
-                        model(**batch)
-                    elif isinstance(batch, list | tuple):
-                        model(*batch)
-                    else:
-                        model(batch)
+            with torch.no_grad():
+                if paired:
+                    missing = object()
+                    for batch, reference in zip_longest(
+                        calibration_data, reference_data, fillvalue=missing
+                    ):
+                        if batch is missing or reference is missing:
+                            raise ValueError("Student and teacher batch counts differ")
+                        collecting_student = False
+                        call_batch(teacher, reference)
+                        collecting_student = True
+                        call_batch(model, batch)
+                        if any(observations.values()):
+                            raise ValueError(
+                                "Student and teacher module invocation counts differ"
+                            )
+                else:
+                    for batch in calibration_data:
+                        call_batch(model, batch)
         finally:
             for h in hooks:
                 h.remove()
@@ -205,6 +264,11 @@ class StatisticsRegistry:
     # ------------------------------------------------------------------
     # Retrieval
     # ------------------------------------------------------------------
+
+    def to(self, device: torch.device | str) -> StatisticsRegistry:
+        """Move collected tensor statistics before estimation on another device."""
+        self._stats = move_batch(self._stats, device)
+        return self
 
     def set_stat(self, target_key: str, stat_type: str, value: Any) -> None:
         """Pre-populate a statistic (e.g. restored from a cache on disk).

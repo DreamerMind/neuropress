@@ -1,6 +1,7 @@
 """neuropress – graph-aware quantization framework."""
 
 from .adapter import ModuleQuantizationAdapter, WeightAssignmentAdapter
+from .block_pipeline import BlockCalibrationResult, BlockQuantizationPipeline
 from .calibration import (
     COLLECTOR_REGISTRY,
     DATASET_REGISTRY,
@@ -79,6 +80,8 @@ __all__ = [
     "AdapterConfig",
     "AutoKernelLowering",
     "AutoKernelLoweringConfig",
+    "BlockCalibrationResult",
+    "BlockQuantizationPipeline",
     "CalibrationConfig",
     "CalibrationProbe",
     "CompositeEstimator",

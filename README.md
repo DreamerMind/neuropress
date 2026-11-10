@@ -440,3 +440,84 @@ Then run with `neuropress-cloud --job my-experiment`.
 | `--ssh-host HOST` | — | Hostname or IP of the target machine (required for `--cloud own`) |
 | `--ssh-port PORT` | `22` | SSH port on the target machine |
 | `--ssh-user USER` | `root` | SSH login user |
+
+## Block calibration and teacher reconstruction
+
+`BlockQuantizationPipeline` runs existing recipes on a lazy sequence of independent
+float blocks. It carries aligned reference and quantized-upstream activation
+streams, collects statistics on a forward device, and estimates/packs weights on
+an independently selected device. The caller supplies block boundaries and any
+batch propagation convention; the runner has no GPTQ or model-family dispatch.
+
+There are three useful configurations:
+
+| Statistics input | GPTQ `reconstruction` | Local objective |
+| --- | --- | --- |
+| `input_source="float"` | `"self"` | Preserve the layer on original float activations |
+| `input_source="sequential"` | `"self"` | Preserve the layer on quantized-upstream activations |
+| `input_source="sequential"` | `"teacher"` | Match the original float linear output using student inputs |
+
+The float-input schedule matches whole-model float statistics for a deterministic
+partition. The sequential schedule does not inherently correct upstream error.
+Teacher reconstruction adds a ridge-regularized weight correction before GPTQ:
+with `H` the input Hessian and `C` the teacher-minus-student output/input product,
+`W_fit = W + C (H + lambda I)^-1`. Lambda is
+`reconstruction_damp_percent * mean(diag(H))`, defaulting to 0.01 of that mean.
+Bias remains fixed. GPTQ then quantizes `W_fit` using the same input Hessian.
+
+Teacher reconstruction currently supports `nn.Linear`. It is local reconstruction
+of each linear invocation, not optimization of a whole nonlinear decoder block.
+All statistics within a block are collected before its weights are adapted.
+Quality relative to float-input or sequential GPTQ must be measured on held-out
+samples; the teacher objective does not guarantee a better final model.
+
+```python
+from neuropress import BlockQuantizationPipeline, QuantizationRecipeConfig
+
+config = QuantizationRecipeConfig.model_validate({
+    "estimator": {
+        "type": "gptq", "target": "linear", "nbits": 4,
+        "symmetric": True, "group_size": 32, "weight_transform": "q4_0",
+        "reconstruction": "teacher", "reconstruction_damp_percent": 0.01,
+    },
+    "kernel_lowering": None,
+})
+runner = BlockQuantizationPipeline(
+    config,
+    input_source="sequential",
+    forward_device="cuda",
+    estimation_device="cpu",
+    checkpoint_dir="checkpoints",
+    run_id="model-revision/dataset-selection/forward-contract",
+)
+for result in runner.run(named_float_blocks, calibration_batches):
+    # result.model is the adapted block; result.kept_float records any fallback.
+    consume(result)
+```
+
+By default, each block output becomes the next block input. Supply
+`propagate(previous_batch, output)` to preserve masks or other arguments. Use
+`run_block` directly when the model needs its own traversal. Blocks must not share
+weights across boundaries. Apply whole-model preprocessing before partitioning,
+and kernel lowering after calibration. An optional `inference_model` callback can
+provide a non-mutating inference view, for example f32 materialization of packed
+weights for GPU calibration; include that contract in `run_id`.
+
+Checkpoints store the adapted model and both propagated streams. A completed
+checkpoint is reused only when the float weights, incoming streams, recipe,
+devices and run identity match. Missing completion metadata triggers recomputation;
+a mismatched completed checkpoint raises instead of silently reusing stale data.
+Use separate directories for independent runs; concurrent writers are unsupported.
+
+Paired observations are a collector capability, not a GPTQ runner branch.
+Register a `PairedCollector` in `COLLECTOR_REGISTRY` and declare its statistic in
+an estimator to receive aligned student inputs/output and teacher output.
+Ordinary and paired requests share the same collection pass, including in
+`CompositeEstimator` recipes. `QuantizationPipeline.run` also accepts
+`reference_data`, `reference_model` and `estimation_device` directly. Nested
+composite configs preserve their full estimator-specific JSON fields.
+
+`benchmarks/bonsai_block_calibration.py` compares the three configurations with
+identical Q4_0 storage and held-out prompts, recording all-token and non-padding
+encoder error separately. It uses only the original checkpoint for teacher
+outputs and never fits on evaluation prompts.

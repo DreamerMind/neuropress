@@ -1,0 +1,391 @@
+"""Block execution, composable paired statistics, and teacher reconstruction."""
+
+from copy import deepcopy
+
+import pytest
+import torch
+from torch import nn
+
+from neuropress.block_pipeline import BlockQuantizationPipeline
+from neuropress.calibration.probe import (
+    COLLECTOR_REGISTRY,
+    PairedCollector,
+    StatisticRequest,
+    StatisticsRegistry,
+)
+from neuropress.calibration.probe.reconstruction import reconstruct_linear_weight
+from neuropress.pipeline import QuantizationPipeline
+from neuropress.recipe_config import QuantizationRecipeConfig
+
+
+def recipe(teacher=False):
+    return QuantizationRecipeConfig.model_validate(
+        {
+            "estimator": {
+                "type": "gptq",
+                "group_size": 32,
+                "nbits": 4,
+                "symmetric": True,
+                "weight_transform": "q4_0",
+                "reconstruction": "teacher" if teacher else "self",
+            },
+            "kernel_lowering": None,
+        }
+    )
+
+
+def test_teacher_statistics_match_ridge_objective_without_mutation():
+    torch.manual_seed(4)
+    model = nn.Sequential(nn.Linear(32, 16, bias=True)).eval()
+    weight = model[0].weight.detach().clone()
+    x = torch.randn(3, 24, 32)
+    student = x * torch.linspace(0.7, 1.3, 32)
+    registry = StatisticsRegistry()
+    registry.register_requests(
+        [
+            StatisticRequest(target_key="0", stat_type=s)
+            for s in ["hessian", "linear_reconstruction"]
+        ]
+    )
+    registry.collect(model, [student], reference_data=[x])
+    h = registry.get(StatisticRequest(target_key="0", stat_type="hessian"))["hessian"]
+    cross = registry.get(
+        StatisticRequest(target_key="0", stat_type="linear_reconstruction")
+    )["cross"]
+    new = reconstruct_linear_weight(weight, h, cross, 0.01)
+    flat = student.flatten(0, 1)
+    y = x.flatten(0, 1) @ weight.t()
+    ridge = 0.01 * h.diag().mean()
+    expected = torch.linalg.solve(
+        2 * flat.t() @ flat + ridge * torch.eye(32),
+        2 * flat.t() @ y + ridge * weight.t(),
+    ).t()
+    torch.testing.assert_close(new, expected, rtol=2e-5, atol=2e-6)
+    assert (flat @ new.t() - y).square().sum() < (flat @ weight.t() - y).square().sum()
+    torch.testing.assert_close(model[0].weight, weight, rtol=0, atol=0)
+
+
+def test_teacher_gptq_improves_known_upstream_scale_error():
+    torch.manual_seed(5)
+    original = nn.Sequential(nn.Linear(32, 16, bias=False)).eval()
+    x = torch.randn(4, 64, 32)
+    student = x * 1.5
+    ordinary, teacher = deepcopy(original), deepcopy(original)
+    for model, use_teacher in [(ordinary, False), (teacher, True)]:
+        pipeline = QuantizationPipeline(recipe(use_teacher).build())
+        pipeline.run(model, [student], reference_data=[x], estimation_device="cpu")
+        assert not pipeline.last_plan.kept_float
+    with torch.no_grad():
+        target = original(x)
+        assert (teacher(student) - target).norm() < (
+            ordinary(student) - target
+        ).norm() * 0.3
+
+
+def test_self_and_teacher_match_when_streams_are_identical():
+    torch.manual_seed(6)
+    original = nn.Sequential(nn.Linear(32, 16, bias=False)).eval()
+    x = torch.randn(4, 32)
+    models = [deepcopy(original), deepcopy(original)]
+    for model, use_teacher in zip(models, [False, True], strict=True):
+        QuantizationPipeline(recipe(use_teacher).build()).run(
+            model, [x], reference_data=[x]
+        )
+    torch.testing.assert_close(
+        models[0][0].weight.decompress_to_u8(),
+        models[1][0].weight.decompress_to_u8(),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize("source", ["float", "sequential"])
+def test_block_execution_matches_explicit_schedule_and_resume(source, tmp_path):
+    torch.manual_seed(11)
+    blocks = [
+        nn.Sequential(nn.Linear(32, 32, bias=False), nn.ReLU()).eval() for _ in range(2)
+    ]
+    inputs = [torch.randn(2, 12, 32)]
+    originals = deepcopy(blocks)
+    runner = BlockQuantizationPipeline(
+        recipe(), input_source=source, checkpoint_dir=tmp_path, run_id="toy-v1"
+    )
+    actual = list(runner.run(enumerate_names(blocks), inputs))
+    reference, student = inputs, inputs
+    for expected, result in zip(originals, actual, strict=True):
+        with torch.no_grad():
+            reference_outputs = [expected(x) for x in reference]
+        QuantizationPipeline(recipe().build()).run(
+            expected, reference if source == "float" else student
+        )
+        with torch.no_grad():
+            student = [expected(x) for x in student]
+        reference = reference_outputs
+        torch.testing.assert_close(result.student_outputs[0], student[0])
+        torch.testing.assert_close(result.reference_outputs[0], reference[0])
+    torch.manual_seed(11)
+    fresh = [
+        nn.Sequential(nn.Linear(32, 32, bias=False), nn.ReLU()).eval() for _ in range(2)
+    ]
+    resumed = list(runner.run(enumerate_names(fresh), inputs))
+    assert all(result.resumed for result in resumed)
+    for expected, result in zip(actual, resumed, strict=True):
+        torch.testing.assert_close(
+            result.student_outputs[0], expected.student_outputs[0], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            result.model[0].weight.decompress_to_u8(),
+            expected.model[0].weight.decompress_to_u8(),
+            rtol=0,
+            atol=0,
+        )
+    with pytest.raises(ValueError, match="Checkpoint mismatch"):
+        runner.run_block(
+            "0",
+            nn.Sequential(nn.Linear(32, 32, bias=False), nn.ReLU()).eval(),
+            inputs,
+            inputs,
+        )
+
+
+def enumerate_names(blocks):
+    return ((str(i), block) for i, block in enumerate(blocks))
+
+
+@pytest.mark.parametrize("failure", ["missing", "length", "shape"])
+def test_pairing_failures_remove_hooks(failure):
+    model = nn.Sequential(nn.Linear(32, 16)).eval()
+    registry = StatisticsRegistry()
+    registry.register_requests(
+        [StatisticRequest(target_key="0", stat_type="linear_reconstruction")]
+    )
+    x = torch.randn(2, 32)
+    refs = (
+        None
+        if failure == "missing"
+        else ([] if failure == "length" else [torch.randn(3, 32)])
+    )
+    with pytest.raises(ValueError):
+        registry.collect(model, [x], reference_data=refs)
+    assert not model[0]._forward_hooks
+
+
+def test_composite_recipe_roundtrip_and_mixed_collection():
+    config = QuantizationRecipeConfig.model_validate(
+        {
+            "estimator": {
+                "type": "composite",
+                "methods": [
+                    {
+                        "type": "gptq",
+                        "target": "linear",
+                        "group_size": 32,
+                        "weight_transform": "q4_0",
+                        "reconstruction": "teacher",
+                        "reconstruction_damp_percent": 0.03,
+                    },
+                    {"type": "min_max_zp_weight", "target": "embedding", "nbits": 8},
+                ],
+            },
+            "kernel_lowering": None,
+        }
+    )
+    restored = QuantizationRecipeConfig.from_json(config.model_dump_json())
+    assert restored.model_dump() == config.model_dump()
+    model = nn.Sequential(nn.Embedding(128, 32), nn.Linear(32, 16)).eval()
+    pipeline = QuantizationPipeline(restored.build())
+    ids = torch.randint(0, 128, (2, 16))
+    pipeline.run(model, [ids], reference_data=[ids])
+    assert not pipeline.last_plan.kept_float
+    assert set(pipeline.last_plan.weight_assignments) == {"0", "1"}
+    assert hasattr(model[1].weight, "qscheme")
+
+
+def test_future_paired_collector_composes_with_existing_hessian(monkeypatch):
+    class DifferenceCollector(PairedCollector):
+        def __init__(self):
+            self.value = 0.0
+
+        def update_pair(self, inputs, output, reference):
+            self.value += float((output - reference).square().sum())
+
+        def result(self):
+            return {"squared_error": self.value}
+
+    monkeypatch.setitem(COLLECTOR_REGISTRY, "future_objective", DifferenceCollector)
+    model = nn.Sequential(nn.Linear(32, 16)).eval()
+    x = torch.randn(2, 32)
+    registry = StatisticsRegistry()
+    requests = [
+        StatisticRequest(target_key="0", stat_type=s)
+        for s in ["hessian", "future_objective"]
+    ]
+    registry.register_requests(requests + requests)
+    registry.collect(model, [x * 2], reference_data=[x])
+    assert registry.get(requests[0])["hessian"] is not None
+    with torch.no_grad():
+        expected = (model(x * 2) - model(x)).square().sum().item()
+    assert registry.get(requests[1])["squared_error"] == pytest.approx(expected)
+
+
+def test_float_block_statistics_match_whole_model_collection():
+    torch.manual_seed(14)
+    original = nn.Sequential(
+        nn.Sequential(nn.Linear(32, 32, bias=False), nn.ReLU()),
+        nn.Sequential(nn.Linear(32, 32, bias=False), nn.ReLU()),
+    ).eval()
+    whole = deepcopy(original)
+    batches = [torch.randn(2, 16, 32) for _ in range(3)]
+    QuantizationPipeline(recipe().build()).run(whole, batches)
+    blocked = list(
+        BlockQuantizationPipeline(recipe(), input_source="float").run(
+            enumerate_names(original), batches
+        )
+    )
+    for index, result in enumerate(blocked):
+        torch.testing.assert_close(
+            result.model[0].weight.decompress_to_u8(),
+            whole[index][0].weight.decompress_to_u8(),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            result.model[0].weight.qscheme.scale,
+            whole[index][0].weight.qscheme.scale,
+            rtol=0,
+            atol=0,
+        )
+
+
+def test_reference_model_and_repeated_invocations_are_aligned():
+    class Repeated(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(32, 32)
+
+        def forward(self, x):
+            return self.linear(self.linear(x))
+
+    torch.manual_seed(8)
+    teacher = Repeated().eval()
+    student = deepcopy(teacher)
+    with torch.no_grad():
+        student.linear.weight.mul_(0.8)
+    registry = StatisticsRegistry()
+    request = StatisticRequest(target_key="linear", stat_type="linear_reconstruction")
+    registry.register_requests([request])
+    registry.collect(
+        student,
+        [torch.randn(2, 32)],
+        reference_data=[torch.randn(2, 32)],
+        reference_model=teacher,
+    )
+    assert registry.get(request)["nsamples"] == 2
+    assert not student.linear._forward_hooks
+    assert not teacher.linear._forward_hooks
+
+
+def test_block_runner_rejects_cross_block_shared_weights():
+    first = nn.Sequential(nn.Linear(32, 32, bias=False)).eval()
+    second = nn.Sequential(nn.Linear(32, 32, bias=False)).eval()
+    second[0].weight = first[0].weight
+    runner = BlockQuantizationPipeline(recipe())
+    with pytest.raises(ValueError, match="share parameter storage"):
+        list(runner.run(enumerate_names([first, second]), [torch.randn(2, 32)]))
+
+
+@pytest.mark.parametrize("teacher", [False, True])
+def test_estimators_do_not_mutate_shared_statistics(teacher):
+    from neuropress.graph.graph import QGraph
+
+    model = nn.Sequential(nn.Linear(32, 16, bias=False)).eval()
+    x = torch.randn(2, 20, 32)
+    x[..., :3] = 0
+    config = recipe(teacher).build()
+    estimator = config.param_estimator
+    estimator.prepare(model)
+    registry = StatisticsRegistry()
+    requests = estimator.declare_statistics()
+    registry.register_requests(requests)
+    registry.collect(model, [x], reference_data=[x * 1.2])
+    saved = {
+        request.stat_type: {
+            key: value.clone()
+            for key, value in registry.get(request).items()
+            if isinstance(value, torch.Tensor)
+        }
+        for request in requests
+    }
+    plan = estimator.estimate(QGraph(), registry, config)
+    assert not plan.kept_float
+    for request in requests:
+        for key, value in saved[request.stat_type].items():
+            torch.testing.assert_close(
+                registry.get(request)[key], value, rtol=0, atol=0
+            )
+
+
+def test_block_runner_allows_future_gradient_based_estimators(monkeypatch):
+    from neuropress.estimator import QuantizationParamEstimator
+    from neuropress.estimator_configs import EstimatorConfig
+    from neuropress.plan import QuantizationPlan
+
+    class Samples(PairedCollector):
+        def update_pair(self, inputs, output, reference):
+            self.inputs = inputs[0].detach().clone()
+            self.targets = reference.detach().clone()
+
+        def result(self):
+            return {"inputs": self.inputs, "targets": self.targets}
+
+    class GradientEstimator(QuantizationParamEstimator):
+        def prepare(self, model):
+            self.model = model
+
+        def declare_statistics(self):
+            return [StatisticRequest(target_key="0", stat_type="paired_samples")]
+
+        def estimate(self, graph, registry, recipe):
+            samples = registry.get(self.declare_statistics()[0])
+            weight = self.model[0].weight.detach().clone().requires_grad_(True)
+            prediction = torch.nn.functional.linear(samples["inputs"], weight)
+            loss = (prediction - samples["targets"]).square().mean()
+            (gradient,) = torch.autograd.grad(loss, weight)
+            return QuantizationPlan(
+                weight_assignments={"0": (weight - 0.1 * gradient).detach()}
+            )
+
+    class GradientConfig(EstimatorConfig):
+        type: str = "test_gradient"
+
+        def build(self):
+            return GradientEstimator()
+
+    monkeypatch.setitem(COLLECTOR_REGISTRY, "paired_samples", Samples)
+    model = nn.Sequential(nn.Linear(32, 16, bias=False)).eval()
+    original = model[0].weight.detach().clone()
+    config = QuantizationRecipeConfig(estimator=GradientConfig(), kernel_lowering=None)
+    x = torch.randn(4, 32)
+    result = BlockQuantizationPipeline(config).run_block("block", model, [x * 1.5], [x])
+    assert not torch.equal(result.model[0].weight, original)
+    assert torch.isfinite(result.student_outputs[0]).all()
+
+
+def test_bonsai_inference_view_uses_exact_f32_weights_without_qtensor_deepcopy():
+    from benchmarks.bonsai_block_calibration import float_view
+
+    torch.manual_seed(27)
+    model = nn.Sequential(
+        nn.Linear(32, 64, bias=False), nn.Linear(64, 32, bias=False)
+    ).eval()
+    QuantizationPipeline(recipe().build()).run(model, [torch.randn(2, 32)])
+    expected = [
+        m.weight.qscheme.dequantize(m.weight.decompress_to_u8(), torch.float32)
+        for m in model
+    ]
+    for _ in range(3):
+        view = float_view(model)
+        for layer, value in zip(view, expected, strict=True):
+            torch.testing.assert_close(layer.weight, value, rtol=0, atol=0)
+        assert view(torch.randn(2, 32)).shape == (2, 32)
+    assert all(hasattr(m.weight, "decompress_to_u8") for m in model)

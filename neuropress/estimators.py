@@ -182,6 +182,7 @@ def _gptq_layer(
     symmetric: bool,
     damp_percent: float,
     damp_auto_increment: float,
+    reconstruction_damp_percent: float | None = None,
 ) -> QuantizedWeight:
     """Estimate codes and a scheme for a module without replacing its weight.
 
@@ -211,6 +212,17 @@ def _gptq_layer(
     calib.device = device
     calib.init()
     registry.inject(calib, name)
+    if reconstruction_damp_percent is not None:
+        from .calibration.probe.reconstruction import reconstruct_linear_weight
+
+        stat = registry.get(
+            StatisticRequest(target_key=name, stat_type="linear_reconstruction")
+        )
+        if stat is None or stat["cross"] is None or calib.hessian is None:
+            raise ValueError("Teacher reconstruction statistics are missing")
+        calib.weight_tensor = reconstruct_linear_weight(
+            _w, calib.hessian, stat["cross"], reconstruction_damp_percent
+        )
     _, scheme, *_ = calib.compute_quantization()
     return QuantizedWeight(
         calib.quantized_codes.cpu(),
@@ -242,6 +254,8 @@ class GPTQEstimator(QuantizationParamEstimator):
     symmetric: bool = True
     damp_percent: float = 0.01
     damp_auto_increment: float = 0.0025
+    reconstruction: str = "self"
+    reconstruction_damp_percent: float = 0.01
 
     # Set by prepare() - not part of the public construction interface.
     _target_modules: dict[str, nn.Module] = field(
@@ -262,10 +276,18 @@ class GPTQEstimator(QuantizationParamEstimator):
                 matching *module_classes* and *filter_fn* are recorded as
                 targets for the subsequent Hessian collection and GPTQ pass.
         """
+        if self.reconstruction not in {"self", "teacher"}:
+            raise ValueError("reconstruction must be self or teacher")
+        if self.reconstruction_damp_percent <= 0:
+            raise ValueError("reconstruction_damp_percent must be positive")
         self._device = next(model.parameters()).device
         self._target_modules = collect_target_modules(
             model, self.module_classes, self.filter_fn
         )
+        if self.reconstruction == "teacher" and any(
+            not isinstance(mod, nn.Linear) for mod in self._target_modules.values()
+        ):
+            raise ValueError("Teacher GPTQ currently supports nn.Linear targets only")
         self._tied_aliases = collect_tied_aliases(
             model, self.module_classes, self.filter_fn
         )
@@ -285,31 +307,32 @@ class GPTQEstimator(QuantizationParamEstimator):
         )
 
     def cache_stages(self) -> list[CacheStageDescriptor]:
-        """Declare the per-layer Hessian cache stage (calibration-scoped)."""
-        return [
+        """Declare Hessian and optional teacher-residual cache stages."""
+        stages = [
             CacheStageDescriptor(
                 "hessian",
                 "Full input Hessians (one per layer)",
                 scope="calibration",
             )
         ]
+        if self.reconstruction == "teacher":
+            stages.append(
+                CacheStageDescriptor(
+                    "linear_reconstruction",
+                    "Teacher residual/input products",
+                    scope="calibration",
+                )
+            )
+        return stages
 
     def declare_statistics(self) -> list[StatisticRequest]:
-        """Return one Hessian request per target module.
-
-        Returns an empty list when all hessians are already in cache, causing
-        the pipeline to skip the calibration forward pass entirely.
-        """
-        cache = self._cache
-        if all(cache.has("hessian", name) for name in self._target_modules):
-            LOGGER.info(
-                "GPTQEstimator: all %d hessians in cache - skipping calibration.",
-                len(self._target_modules),
-            )
-            return []
+        """Request uncached Hessians and, when selected, paired reconstruction stats."""
+        stages = [stage.name for stage in self.cache_stages()]
         return [
-            StatisticRequest(target_key=name, stat_type="hessian")
+            StatisticRequest(target_key=name, stat_type=stage)
             for name in self._target_modules
+            for stage in stages
+            if not self._cache.has(stage, name)
         ]
 
     def estimate(
@@ -361,6 +384,11 @@ class GPTQEstimator(QuantizationParamEstimator):
                 if cached_h is not None:
                     registry.set_stat(name, "hessian", cached_h)
 
+                if self.reconstruction == "teacher":
+                    cached_cross = cache.load("linear_reconstruction", name)
+                    if cached_cross is not None:
+                        registry.set_stat(name, "linear_reconstruction", cached_cross)
+
                 try:
                     with timed_span(spans, "gptq.layer", layer=name):
                         assignment = _gptq_layer(
@@ -373,6 +401,11 @@ class GPTQEstimator(QuantizationParamEstimator):
                             symmetric=self.symmetric,
                             damp_percent=self.damp_percent,
                             damp_auto_increment=self.damp_auto_increment,
+                            reconstruction_damp_percent=(
+                                self.reconstruction_damp_percent
+                                if self.reconstruction == "teacher"
+                                else None
+                            ),
                         )
                 except Exception as exc:
                     LOGGER.error("GPTQ failed for '%s': %s - skipping", name, exc)
@@ -388,6 +421,15 @@ class GPTQEstimator(QuantizationParamEstimator):
                     )
                     if stat is not None:
                         cache.save("hessian", name, stat)
+
+                if self.reconstruction == "teacher" and cached_cross is None:
+                    stat = registry.get(
+                        StatisticRequest(
+                            target_key=name, stat_type="linear_reconstruction"
+                        )
+                    )
+                    if stat is not None:
+                        cache.save("linear_reconstruction", name, stat)
 
                 if _RICH:
                     progress.advance(task_id)

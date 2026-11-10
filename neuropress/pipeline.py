@@ -8,6 +8,7 @@ import math
 from collections.abc import Iterable, Iterator
 from typing import Any
 
+import torch
 from torch import nn
 
 try:
@@ -41,6 +42,7 @@ class QuantizationPipeline:
     def __init__(self, recipe: QuantizationRecipe) -> None:
         """Initialize the pipeline with the given *recipe*."""
         self.recipe = recipe
+        self.last_plan = QuantizationPlan()
         self._graph_provider = RuntimeModuleGraphProvider()
 
     def run(
@@ -48,6 +50,10 @@ class QuantizationPipeline:
         model: nn.Module,
         calibration_data: Iterable,
         example_inputs: Any = None,
+        *,
+        reference_data: Iterable | None = None,
+        reference_model: nn.Module | None = None,
+        estimation_device: str | torch.device | None = None,
     ) -> nn.Module:
         """Run the full pipeline and return the quantized model.
 
@@ -61,6 +67,10 @@ class QuantizationPipeline:
             calibration_data: Iterable of batches for calibration.  May be a
                 generator — it is iterated exactly once (unless preprocessing
                 is active, in which case it is materialised upfront).
+            reference_data: Aligned original-float batches for paired statistics.
+            reference_model: Teacher model; defaults to the unadapted student.
+            estimation_device: Move the model and statistics here after collection.
+                The returned model remains on this device.
             example_inputs: Optional single batch for graph building.
                 If *None*, the first element of *calibration_data* is used
                 and then replayed at the start of the collection pass.
@@ -115,7 +125,16 @@ class QuantizationPipeline:
                 ),
                 total=total_batches,
             )
-        registry.collect(model, calibration_iter)
+        registry.collect(
+            model,
+            calibration_iter,
+            reference_data=reference_data,
+            reference_model=reference_model,
+        )
+        if estimation_device is not None:
+            model.to(estimation_device)
+            registry.to(estimation_device)
+            estimator.prepare(model)
 
         # -- Step 5: Estimate QSchemes -------------------------------------
         LOGGER.info("Step 5: Estimating QSchemes")
@@ -128,6 +147,7 @@ class QuantizationPipeline:
 
         # -- Step 6: Adapt model (weight assignment + manifest + lowering) -------
         LOGGER.info("Step 6: Adapting model structure")
+        self.last_plan = plan
         self.recipe.adapter.apply(model, plan)
 
         from .t2n.model_io import attach_manifest

@@ -465,7 +465,7 @@ class CompositeEstimatorConfig(EstimatorConfig):
     """
 
     type: Literal["composite"] = "composite"
-    methods: list[EstimatorConfig] = []
+    methods: list[SerializeAsAny[EstimatorConfig]] = []
 
     @model_validator(mode="before")
     @classmethod
