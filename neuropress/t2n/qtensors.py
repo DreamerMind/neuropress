@@ -41,6 +41,7 @@ Registering a handler for a custom QTensor type::
 from __future__ import annotations
 
 import hashlib
+import json
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
@@ -196,26 +197,104 @@ def load_qtensor(path: str | Path) -> Any:
 # ---------------------------------------------------------------------------
 
 
-class _QTractScaleOnlySerde(QTensorSerde):
-    """Serde for :class:`~torch_to_nnef.tensor.quant.qtract.QTensorTractScaleOnly`.
+def qtensor_shape(q: Any) -> tuple[int, ...]:
+    """Return a QTensor's decoded shape without decompressing its codes."""
+    shape = getattr(q, "decompressed_shape", None)
+    if shape is None:
+        with torch._C.DisableTorchFunctionSubclass():
+            shape = q.shape
+    return tuple(shape)
 
-    Safetensors entries:
 
-    =========  ===============  ============================================
-    Key        Dtype            Description
-    =========  ===============  ============================================
-    u8_blob    uint8            Packed 4-bit weights
-    scale      float16          Per-group scale factors ``[n_groups, 1]``
-    =========  ===============  ============================================
+def _scalar_packing_metadata(q: Any) -> dict[str, str]:
+    from .packing import BitPacking
 
-    Metadata keys: ``n_bits``, ``group_size``, ``dequant_to_dtype``,
-    ``nnef_name`` (empty string when absent).
+    if any(not isinstance(c, BitPacking) for c in q.u8_compressors):
+        raise ValueError("Scalar tensor persistence requires BitPacking compressors")
+    return {
+        "shape": json.dumps(list(qtensor_shape(q))),
+        "packing": json.dumps([c.nbits for c in q.u8_compressors]),
+    }
 
-    Reconstruction strategy: dequantize ``u8_blob`` with the loaded scale to
-    recover an approximate float tensor, then re-quantize with the same scale.
-    Because the scale is already calibrated this produces a bitwise-identical
-    ``u8_blob`` without requiring the original float weight.
+
+def _scalar_layout(tensors, metadata):
+    """Return the decoded shape and compressors of a persisted scalar tensor."""
+    from .packing import BitPacking
+
+    blob = tensors["u8_blob"]
+    if "packing" in metadata:
+        bits = json.loads(metadata["packing"])
+    else:
+        count = tensors["scale"].numel() * int(metadata["group_size"])
+        bits = [int(metadata["n_bits"])] if blob.numel() < count else []
+    compressors = [BitPacking(n) for n in bits]
+    if "shape" in metadata:
+        return torch.Size(json.loads(metadata["shape"])), compressors
+    # Checkpoints from before the shape was recorded.
+    codes = blob
+    for compressor in reversed(compressors):
+        codes = compressor.decompress(codes)
+    return codes.shape, compressors
+
+
+def qtensor_from_blob(
+    cls: type,
+    blob: torch.Tensor,
+    shape: torch.Size,
+    qscheme: Any,
+    dtype: torch.dtype,
+    compressors: list[Any],
+    nnef_name: str | None = None,
+) -> Any:
+    """Wrap stored codes in a QTensor without quantizing a placeholder.
+
+    The QTensor constructor quantizes and compresses a float tensor it then
+    keeps as storage. Stored codes need neither step: reads decompress u8_blob,
+    so the uninitialized shell is never touched and its pages stay non-resident,
+    the same placeholder torch_to_nnef uses when reloading offloaded QTensors.
+    It stays a real allocation so pickling and torch.save keep working.
     """
+    from torch_to_nnef.tensor.quant.qtract import QTensorTractScaleOnly
+
+    q = cls.__new__(
+        cls,
+        torch.empty(tuple(shape), dtype=dtype),
+        qscheme,
+        dequant_to_dtype=dtype,
+    )
+    q.u8_compressors = list(compressors)
+    q.u8_blob = blob
+    q.qscheme = qscheme
+    q.dequant_to_dtype = dtype
+    q.nnef_name = nnef_name
+    q.requires_grad = False
+    if issubclass(cls, QTensorTractScaleOnly):
+        q.decompressed_shape = torch.Size(shape)
+        q.specific_machine = None
+    return q
+
+
+def scalar_qtensor_from_codes(
+    type_name: str,
+    codes: torch.Tensor,
+    scale: torch.Tensor,
+    zero_point: torch.Tensor | None,
+    metadata: dict[str, str],
+) -> Any:
+    """Rebuild a scalar QTensor from unpacked codes in its recorded storage format."""
+    from .packing import BitPacking
+
+    blob = codes
+    for bits in json.loads(metadata.get("packing", "[]")):
+        blob = BitPacking(bits).compress(blob)
+    tensors = {"u8_blob": blob, "scale": scale.reshape(-1, 1)}
+    if zero_point is not None:
+        tensors["zero_point"] = zero_point.reshape(-1, 1)
+    return _SERDE_REGISTRY[type_name].from_parts(tensors, metadata)
+
+
+class _QTractScaleOnlySerde(QTensorSerde):
+    """Persist Q4_0 codes, scales, shape and packing without requantization."""
 
     def type_name(self) -> str:
         """Return ``"QTensorTractScaleOnly"``."""
@@ -231,6 +310,7 @@ class _QTractScaleOnlySerde(QTensorSerde):
     def to_metadata(self, q: Any) -> dict[str, str]:
         """Extract quantization parameters as string metadata."""
         return {
+            **_scalar_packing_metadata(q),
             "n_bits": str(q.qscheme.n_bits),
             "group_size": str(q.qscheme.group_size),
             "dequant_to_dtype": str(q.dequant_to_dtype).replace("torch.", ""),
@@ -255,15 +335,16 @@ class _QTractScaleOnlySerde(QTensorSerde):
         dtype = getattr(torch, metadata["dequant_to_dtype"])
 
         qscheme = QScalePerGroupF16(group_size=group_size, scale=scale, n_bits=n_bits)
-        # Dequantize u8_blob back to float, then re-quantize with the same
-        # calibrated scale — yields bitwise-identical u8_blob.
-        fp_approx = qscheme.dequantize(u8_blob, dtype)
-        q = QTensorTractScaleOnly(fp_approx, qscheme, dequant_to_dtype=dtype)
-
-        nnef_name = metadata.get("nnef_name")
-        if nnef_name:
-            q.nnef_name = nnef_name
-        return q
+        shape, compressors = _scalar_layout(tensors, metadata)
+        return qtensor_from_blob(
+            QTensorTractScaleOnly,
+            u8_blob,
+            shape,
+            qscheme,
+            dtype,
+            compressors,
+            metadata.get("nnef_name") or None,
+        )
 
 
 # Register the built-in handler on module import.
@@ -276,26 +357,7 @@ register_qtensor_serde(_QTractScaleOnlySerde())
 
 
 class _QTensorScaleZpSerde(QTensorSerde):
-    """Serde for :class:`~neuropress.transforms.weight_only.QTensorScaleZp`.
-
-    Safetensors entries:
-
-    =========  ===============  =============================================
-    Key        Dtype            Description
-    =========  ===============  =============================================
-    u8_blob    uint8            Packed 4-bit weights
-    scale      float16          Per-group scale factors ``[n_groups, 1]``
-    zero_point float16          Per-group zero-points ``[n_groups, 1]``
-    =========  ===============  =============================================
-
-    Metadata keys: ``n_bits``, ``group_size``, ``dequant_to_dtype``,
-    ``nnef_name`` (empty string when absent).
-
-    Reconstruction strategy: dequantize ``u8_blob`` with the loaded
-    scale/zero_point to recover an approximate float tensor, then re-quantize
-    with the same calibrated parameters — yields a bitwise-identical
-    ``u8_blob``.
-    """
+    """Persist affine codes, scales, offsets, shape and packing exactly."""
 
     def type_name(self) -> str:
         """Return ``"QTensorScaleZp"``."""
@@ -312,10 +374,12 @@ class _QTensorScaleZpSerde(QTensorSerde):
     def to_metadata(self, q: Any) -> dict[str, str]:
         """Extract quantization parameters as string metadata."""
         return {
+            **_scalar_packing_metadata(q),
             "n_bits": str(q.qscheme.n_bits),
             "group_size": str(q.qscheme.group_size),
             "dequant_to_dtype": str(q.dequant_to_dtype).replace("torch.", ""),
             "nnef_name": q.nnef_name or "",
+            "export_as_float": "1" if q.export_as_float else "0",
         }
 
     def from_parts(
@@ -325,7 +389,6 @@ class _QTensorScaleZpSerde(QTensorSerde):
     ) -> Any:
         """Reconstruct a ``QTensorScaleZp`` from serialized parts."""
         from ..transforms.weight_only import QScaleZpPerGroupF16, QTensorScaleZp
-        from .packing import BitPacking4
 
         scale = tensors["scale"]
         zero_point = tensors["zero_point"]
@@ -337,16 +400,17 @@ class _QTensorScaleZpSerde(QTensorSerde):
         qscheme = QScaleZpPerGroupF16(
             group_size=group_size, scale=scale, zero_point=zero_point, n_bits=n_bits
         )
-        # Dequantize u8_blob back to float, then re-quantize with the same
-        # calibrated parameters — yields bitwise-identical u8_blob.
-        fp_approx = qscheme.dequantize(u8_blob, dtype)
-        q = QTensorScaleZp(
-            fp_approx, qscheme, dequant_to_dtype=dtype, u8_compressors=[BitPacking4]
+        shape, compressors = _scalar_layout(tensors, metadata)
+        q = qtensor_from_blob(
+            QTensorScaleZp,
+            u8_blob,
+            shape,
+            qscheme,
+            dtype,
+            compressors,
+            metadata.get("nnef_name") or None,
         )
-
-        nnef_name = metadata.get("nnef_name")
-        if nnef_name:
-            q.nnef_name = nnef_name
+        q.export_as_float = metadata.get("export_as_float") == "1"
         return q
 
 

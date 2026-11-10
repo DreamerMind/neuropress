@@ -6,8 +6,8 @@ import contextlib
 import logging
 import math
 import operator
-from collections.abc import Callable
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field, replace
 from functools import reduce
 from typing import Any
 
@@ -45,11 +45,11 @@ from .calibration.probe import StatisticRequest, StatisticsRegistry
 from .estimator import QuantizationParamEstimator
 from .graph.graph import QGraph
 from .methods.correction_mode import CorrectionMode
-from .methods.gptq import GPTQCalibration
+from .methods.gptq import GPTQCalibration, _is_conv1d_transpose
 from .methods.gptq_panel import GPTQMixedPrecisionCalibration
 from .methods.hqq import HQQCalibration
 from .methods.zp_scale_calib import NormZpScaleCalibration
-from .plan import QuantizationPlan
+from .plan import F16_MIN_POSITIVE, QuantizationPlan, QuantizedWeight
 from .qscheme.descriptor import Granularity
 from .qscheme.zp_scale import ZpScaleScheme
 from .quantization.cache import CacheStageDescriptor, NullCacheManager
@@ -58,10 +58,51 @@ from .recipe import QuantizationRecipe
 
 LOGGER = logging.getLogger(__name__)
 
+_F16_MAX_EXACT_OFFSET = 2047.0
+"""Every integer up to this magnitude is exact in f16, so offsets stay exact."""
+
 
 # ---------------------------------------------------------------------------
 # Shared target-collection utility
 # ---------------------------------------------------------------------------
+
+
+def _weight_identity(weight: torch.Tensor) -> tuple[str, int]:
+    """Return a key shared only by tensors holding the same weight.
+
+    Only plain materialized tensors have a stable storage address. Offloaded
+    and quantized tensors reload into transient buffers whose addresses get
+    reused across unrelated layers, and meta tensors have no storage, so those
+    are tied only when they are the same object.
+    """
+    if type(weight) in (torch.Tensor, nn.Parameter):
+        if not weight.is_meta and weight.numel() > 0:
+            return "storage", weight.data_ptr()
+    return "object", id(weight)
+
+
+def _walk_targets(
+    model: nn.Module,
+    module_classes: tuple[type, ...],
+    filter_fn: Callable[[str, nn.Module], bool] | None,
+) -> Iterator[tuple[str, nn.Module, str | None]]:
+    """Yield ``(name, module, tied_to)`` for every module selected as a target.
+
+    *tied_to* names the first target holding the same weight storage, or is
+    ``None`` for that first target itself.
+    """
+    first_by_weight: dict[tuple[str, int], str] = {}
+    for name, mod in model.named_modules():
+        if not isinstance(mod, module_classes):
+            continue
+        if filter_fn is not None and not filter_fn(name, mod):
+            continue
+        w = getattr(mod, "weight", None)
+        tied_to = None
+        if w is not None:
+            tied_to = first_by_weight.setdefault(_weight_identity(w), name)
+            tied_to = None if tied_to == name else tied_to
+        yield name, mod, tied_to
 
 
 def collect_target_modules(
@@ -72,11 +113,11 @@ def collect_target_modules(
     """Return an ordered dict of target modules, deduplicating tied weights.
 
     Iterates ``model.named_modules()`` in traversal order and keeps the
-    *first* name encountered for each unique weight storage pointer.
-    Subsequent modules whose ``weight.data_ptr()`` was already seen are
-    silently dropped - this handles tied-weight pairs such as
-    ``embed_tokens`` / ``lm_head`` automatically without model-specific
-    ``exclude_lm_head`` flags.
+    *first* name encountered for each unique weight.
+    Subsequent modules whose weight was already seen are
+    dropped - this handles tied-weight pairs such as ``embed_tokens`` /
+    ``lm_head`` automatically without model-specific ``exclude_lm_head``
+    flags.  See :func:`collect_tied_aliases` for the dropped names.
 
     Args:
         model: Model to inspect.
@@ -86,25 +127,44 @@ def collect_target_modules(
     Returns:
         ``{name: module}`` dict in model traversal order, deduplicated.
     """
-    seen_ptrs: set[int] = set()
     result: dict[str, nn.Module] = {}
-    for name, mod in model.named_modules():
-        if not isinstance(mod, module_classes):
-            continue
-        if filter_fn is not None and not filter_fn(name, mod):
-            continue
-        w = getattr(mod, "weight", None)
-        if w is not None:
-            ptr = w.data_ptr()
-            if ptr in seen_ptrs:
-                LOGGER.info(
-                    "collect_target_modules: skipping '%s' — tied weight already collected",
-                    name,
-                )
-                continue
-            seen_ptrs.add(ptr)
-        result[name] = mod
+    for name, mod, tied_to in _walk_targets(model, module_classes, filter_fn):
+        if tied_to is None:
+            result[name] = mod
+        else:
+            LOGGER.info(
+                "collect_target_modules: skipping '%s' - tied weight already collected",
+                name,
+            )
     return result
+
+
+def collect_tied_aliases(
+    model: nn.Module,
+    module_classes: tuple[type, ...],
+    filter_fn: Callable[[str, nn.Module], bool] | None = None,
+) -> dict[str, list[str]]:
+    """Map each deduplicated target to the other targets sharing its weight.
+
+    Estimators that leave parameters untouched until the adapter runs list
+    these names too, so every selected module receives the assignment.  Tied
+    modules that are not selected targets are absent and stay unchanged.
+    """
+    aliases: dict[str, list[str]] = {}
+    for name, _, tied_to in _walk_targets(model, module_classes, filter_fn):
+        if tied_to is not None:
+            aliases.setdefault(tied_to, []).append(name)
+    return aliases
+
+
+def _add_tied_aliases(
+    assignments: dict[str, Any], aliases: dict[str, list[str]]
+) -> dict[str, Any]:
+    for name, tied in aliases.items():
+        if name in assignments:
+            for alias in tied:
+                assignments[alias] = assignments[name]
+    return assignments
 
 
 # ---------------------------------------------------------------------------
@@ -122,24 +182,13 @@ def _gptq_layer(
     symmetric: bool,
     damp_percent: float,
     damp_auto_increment: float,
-) -> ZpScaleScheme:
-    """Apply GPTQ to *mod*, updating its weight in-place to dequantized floats.
+) -> QuantizedWeight:
+    """Estimate codes and a scheme for a module without replacing its weight.
 
-    Granularity is chosen per layer: per-group when ``in_features`` is
-    divisible by *group_size*, otherwise per-channel.
-
-    Args:
-        name: Human-readable layer name for logging.
-        mod: Module whose weight is quantized in-place.
-        registry: Populated registry providing Hessian statistics.
-        device: Computation device.
-        group_size: Preferred group size for per-group granularity.
-        nbits: Quantization bit-width.
-        symmetric: Whether to use symmetric quantization.
-        damp_percent: Initial Hessian dampening fraction.
-        damp_auto_increment: Dampening increment on Cholesky failure.
+    Uses per-group quantization when the flattened column count is divisible
+    by group_size, otherwise per-channel quantization.
     """
-    in_features = mod.weight.shape[1]
+    in_features = math.prod(mod.weight.shape[1:])
     if in_features >= group_size and in_features % group_size == 0:
         gran = Granularity.per_group([group_size])
     else:
@@ -162,7 +211,13 @@ def _gptq_layer(
     calib.device = device
     calib.init()
     registry.inject(calib, name)
-    return calib.compute_qscheme()
+    _, scheme, *_ = calib.compute_quantization()
+    return QuantizedWeight(
+        calib.quantized_codes.cpu(),
+        scheme,
+        _w.dtype,
+        transposed=_is_conv1d_transpose(type(mod)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -172,39 +227,16 @@ def _gptq_layer(
 
 @dataclass
 class GPTQEstimator(QuantizationParamEstimator):
-    """GPTQ estimator: collects Hessians then runs GPTQ per target layer.
+    """Estimate GPTQ weight assignments from activation Hessians.
 
-    Call :meth:`prepare` before ``declare_statistics`` is invoked to bind the
-    estimator to a specific model.  :class:`.QuantizationPipeline` does this
-    automatically when the estimator exposes a ``prepare`` method.
-
-    Attributes:
-        module_classes: Only modules that are instances of these classes are
-            targeted.  Defaults to ``(nn.Linear,)``.
-        filter_fn: Optional extra filter ``(name, module) -> bool``.  If
-            *None*, all instances of *module_classes* are targeted.
-        weight_transform: Optional callable ``(weight, name) -> value | None``
-            applied to the GPTQ-corrected weight after each layer.  The return
-            value is stored in :attr:`.QuantizationPlan.weight_assignments`.
-            Return *None* to skip a layer from the plan.  If *None*, GPTQ
-            updates weights in-place and no plan entries are created.
-        quantized_weight_transform: Optional ``(weight, qscheme, name)`` adapter
-            that preserves the GPTQ grid. Takes precedence over weight_transform.
-        group_size: Preferred group size for per-group granularity.  Layers
-            whose ``in_features`` is not divisible by *group_size* fall back
-            to per-channel granularity.
-        nbits: Quantization bit-width passed to the GPTQ quantizer.
-        symmetric: Whether to use symmetric quantization.
-        damp_percent: Initial Hessian dampening fraction.
-        damp_auto_increment: Dampening increment on Cholesky failure.
+    The plan retains the selected integer codes and schemes. Estimation does
+    not replace model parameters. weight_transform names a destination format
+    for the adapter; legacy Python callbacks receive dequantized values there.
     """
 
     module_classes: tuple[type[nn.Module], ...] = field(default=(nn.Linear,))
     filter_fn: Callable[[str, nn.Module], bool] | None = None
-    weight_transform: Callable[[torch.Tensor, str], Any] | None = None
-    quantized_weight_transform: (
-        Callable[[torch.Tensor, ZpScaleScheme, str], Any] | None
-    ) = None
+    weight_transform: str | Callable[[torch.Tensor, str], Any] | None = None
     group_size: int = 128
     nbits: int = 4
     symmetric: bool = True
@@ -213,6 +245,9 @@ class GPTQEstimator(QuantizationParamEstimator):
 
     # Set by prepare() - not part of the public construction interface.
     _target_modules: dict[str, nn.Module] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    _tied_aliases: dict[str, list[str]] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
     _device: torch.device | None = field(
@@ -231,6 +266,18 @@ class GPTQEstimator(QuantizationParamEstimator):
         self._target_modules = collect_target_modules(
             model, self.module_classes, self.filter_fn
         )
+        self._tied_aliases = collect_tied_aliases(
+            model, self.module_classes, self.filter_fn
+        )
+        if isinstance(self.weight_transform, str) and (
+            self.weight_transform != "identity"
+        ):
+            for name, mod in self._target_modules.items():
+                if _is_conv1d_transpose(type(mod)):
+                    raise ValueError(
+                        f"'{name}': format {self.weight_transform!r} cannot keep "
+                        "Conv1D scale groups; use a callable weight_transform"
+                    )
         LOGGER.info(
             "GPTQEstimator: %d target modules (device=%s)",
             len(self._target_modules),
@@ -271,26 +318,13 @@ class GPTQEstimator(QuantizationParamEstimator):
         registry: StatisticsRegistry,
         recipe: QuantizationRecipe,
     ) -> QuantizationPlan:
-        """Run GPTQ per layer and return a :class:`.QuantizationPlan`.
+        """Return selected codes, schemes and destinations for the target weights.
 
-        Weights are updated in-place to GPTQ-corrected dequantized floats.
-        A *quantized_weight_transform* receives the selected scheme and takes
-        precedence over *weight_transform*. Its output is stored in the plan's
-        ``weight_assignments``.
-
-        Args:
-            graph: QGraph built by the pipeline (unused; targets are fixed by
-                :meth:`prepare`).
-            registry: Populated Hessian statistics from the calibration pass.
-            recipe: Active recipe (unused).
-
-        Returns:
-            A :class:`.QuantizationPlan` populated by *weight_transform* for
-            each successfully processed layer, or an empty plan when
-            *weight_transform* is *None*.
+        Packing and parameter replacement are deferred to the model adapter.
         """
         ids_seen: set[int] = set()
         assignments: dict[str, Any] = {}
+        kept_float: dict[str, str] = {}
         cache = self._cache
         spans = self._spans
 
@@ -329,7 +363,7 @@ class GPTQEstimator(QuantizationParamEstimator):
 
                 try:
                     with timed_span(spans, "gptq.layer", layer=name):
-                        qscheme = _gptq_layer(
+                        assignment = _gptq_layer(
                             name,
                             mod,
                             registry,
@@ -342,6 +376,7 @@ class GPTQEstimator(QuantizationParamEstimator):
                         )
                 except Exception as exc:
                     LOGGER.error("GPTQ failed for '%s': %s - skipping", name, exc)
+                    kept_float[name] = str(exc)
                     if _RICH:
                         progress.advance(task_id)
                     continue
@@ -357,32 +392,14 @@ class GPTQEstimator(QuantizationParamEstimator):
                 if _RICH:
                     progress.advance(task_id)
 
-                if self.quantized_weight_transform is not None:
-                    try:
-                        q = self.quantized_weight_transform(mod.weight, qscheme, name)
-                    except (
-                        T2NErrorImpossibleQuantization,
-                        ValueError,
-                        AssertionError,  # torch_to_nnef's QTensor shape checks
-                    ) as exc:
-                        LOGGER.error("'%s' keeps GPTQ float weights: %s", name, exc)
-                        q = None
-                    if q is not None:
-                        assignments[name] = q
-                elif self.weight_transform is not None:
-                    if mod.weight.dim() < 2:
-                        LOGGER.warning(
-                            "Skipping weight_transform for '%s': %dD weight %s",
-                            name,
-                            mod.weight.dim(),
-                            tuple(mod.weight.shape),
-                        )
-                    else:
-                        q = self.weight_transform(mod.weight, name)
-                        if q is not None:
-                            assignments[name] = q
+                assignments[name] = replace(
+                    assignment, destination=self.weight_transform
+                )
 
-        return QuantizationPlan(weight_assignments=assignments)
+        return QuantizationPlan(
+            weight_assignments=_add_tied_aliases(assignments, self._tied_aliases),
+            kept_float=kept_float,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -401,27 +418,11 @@ def _gptq_panel_layer(
     symmetric: bool,
     damp_percent: float,
     damp_auto_increment: float,
-) -> GPTQMixedPrecisionCalibration | None:
-    """Apply GPTQ with mixed-precision panel selection to *mod* in-place.
+) -> QuantizedWeight | None:
+    """Estimate mixed-precision column panels without modifying the module.
 
-    Uses the flattened weight column count (``in_channels * kH * kW`` for
-    Conv2d, ``in_features`` for Linear) to determine granularity.
-
-    Args:
-        name: Human-readable layer name for logging.
-        mod: Module whose weight is quantized in-place.
-        registry: Populated registry providing Hessian statistics.
-        device: Computation device.
-        group_size: Column-group size for panel scoring and quantization.
-        possible_nbits: Candidate bit-widths (at least two required).
-        target_bpw: Average bits-per-weight budget for the mixed allocation.
-        symmetric: Whether to use symmetric quantization in each quantizer.
-        damp_percent: Initial Hessian dampening fraction.
-        damp_auto_increment: Dampening increment on Cholesky failure.
-
-    Returns:
-        The calibration object (with ``_mp_assignments`` populated) on
-        success, or ``None`` when the layer is skipped.
+    Returns None when the flattened weight column count cannot be divided
+    into group_size panels.
     """
     weight_cols = reduce(operator.mul, mod.weight.shape[1:])
     if weight_cols < group_size or weight_cols % group_size != 0:
@@ -456,8 +457,13 @@ def _gptq_panel_layer(
     calib.device = device
     calib.init()
     registry.inject(calib, name)
-    calib.compute_qscheme()
-    return calib
+    _, scheme, *_ = calib.compute_quantization()
+    return QuantizedWeight(
+        calib.quantized_codes.cpu(),
+        scheme,
+        _w.dtype,
+        transposed=_is_conv1d_transpose(type(mod)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -467,23 +473,10 @@ def _gptq_panel_layer(
 
 @dataclass
 class GPTQPanelEstimator(QuantizationParamEstimator):
-    """GPTQ with mixed-precision panel selection per target layer.
+    """Estimate mixed-precision codes and a scheme for every column panel.
 
-    Like :class:`GPTQEstimator` but uses
-    :class:`~.methods.gptq_panel.GPTQMixedPrecisionCalibration` to assign
-    one quantizer (selected from *possible_nbits*) per column-group under a
-    *target_bpw* bit budget.
-
-    Attributes:
-        module_classes: Only modules that are instances of these classes are
-            targeted.  Defaults to ``(nn.Conv2d,)``.
-        filter_fn: Optional extra filter ``(name, module) -> bool``.
-        group_size: Column-group size for panel scoring and quantization.
-        possible_nbits: Candidate bit-widths (must contain at least two).
-        target_bpw: Average bits-per-weight budget for mixed allocation.
-        symmetric: Whether to use symmetric quantization.
-        damp_percent: Initial Hessian dampening fraction.
-        damp_auto_increment: Dampening increment on Cholesky failure.
+    The adapter replaces Linear modules with homogeneous-precision branches.
+    Other module types receive the selected dequantized weight values.
     """
 
     module_classes: tuple[type[nn.Module], ...] = field(default=(nn.Conv2d,))
@@ -498,10 +491,10 @@ class GPTQPanelEstimator(QuantizationParamEstimator):
     _target_modules: dict[str, nn.Module] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
-    _device: torch.device | None = field(
-        default=None, init=False, repr=False, compare=False
+    _tied_aliases: dict[str, list[str]] = field(
+        default_factory=dict, init=False, repr=False, compare=False
     )
-    _model: nn.Module | None = field(
+    _device: torch.device | None = field(
         default=None, init=False, repr=False, compare=False
     )
 
@@ -511,9 +504,11 @@ class GPTQPanelEstimator(QuantizationParamEstimator):
         Args:
             model: The model that will be passed to the pipeline.
         """
-        self._model = model
         self._device = next(model.parameters()).device
         self._target_modules = collect_target_modules(
+            model, self.module_classes, self.filter_fn
+        )
+        self._tied_aliases = collect_tied_aliases(
             model, self.module_classes, self.filter_fn
         )
         LOGGER.info(
@@ -535,106 +530,33 @@ class GPTQPanelEstimator(QuantizationParamEstimator):
         registry: StatisticsRegistry,
         recipe: QuantizationRecipe,
     ) -> QuantizationPlan:
-        """Run panel GPTQ, split layers, and return packed QTensor assignments.
-
-        Steps:
-
-        1. Run :func:`_gptq_panel_layer` on each target module - weights are
-           updated in-place to GPTQ-corrected dequantized floats and per-panel
-           bit-width assignments are collected.
-        2. Replace each quantized ``nn.Linear`` with a
-           :class:`~neuropress.transforms.split_mixed_linear.MixedPrecisionLinear`
-           that has one homogeneous-precision sub-linear per distinct bit-width.
-        3. Wrap each sub-linear's weight as a bit-packed
-           ``QTensorTractScaleOnly`` (Q4 → :data:`~neuropress.t2n.packing.BitPacking4`,
-           Q2 → :data:`~neuropress.t2n.packing.BitPacking2`).
-
-        Args:
-            graph: QGraph built by the pipeline (unused; targets are fixed by
-                :meth:`prepare`).
-            registry: Populated Hessian statistics from the calibration pass.
-            recipe: Active recipe (unused).
-
-        Returns:
-            A :class:`.QuantizationPlan` mapping each sub-linear path
-            (e.g. ``"layer.sub_linears.0"``) to its packed QTensor.
-        """
-        # Lazy imports: keep transforms / t2n out of module-level imports.
-        from .t2n.model_io import QuantizationManifest as _Manifest
-        from .transforms.split_mixed_linear import apply_split_to_model
-        from .transforms.weight_only import _make_packed_qtensor
-
-        # ── Step 1: run panel GPTQ on all target layers ──────────────────────
-        assignments_map: dict[str, list[Any]] = {}
+        """Return mixed weight assignments; defer layer splitting to the adapter."""
+        assignments = {}
+        kept_float: dict[str, str] = {}
         for name, mod in self._target_modules.items():
-            LOGGER.info(
-                "Panel GPTQ quantizing: %s  shape=%s", name, tuple(mod.weight.shape)
-            )
             try:
-                calib = _gptq_panel_layer(
+                assignment = _gptq_panel_layer(
                     name,
                     mod,
                     registry,
                     self._device,
-                    group_size=self.group_size,
-                    possible_nbits=self.possible_nbits,
-                    target_bpw=self.target_bpw,
-                    symmetric=self.symmetric,
-                    damp_percent=self.damp_percent,
-                    damp_auto_increment=self.damp_auto_increment,
+                    self.group_size,
+                    self.possible_nbits,
+                    self.target_bpw,
+                    self.symmetric,
+                    self.damp_percent,
+                    self.damp_auto_increment,
                 )
-                if calib is not None and calib._mp_assignments is not None:
-                    assignments_map[name] = calib._mp_assignments
             except Exception as exc:
                 LOGGER.error("Panel GPTQ failed for '%s': %s - skipping", name, exc)
-
-        if not assignments_map or self._model is None:
-            return QuantizationPlan()
-
-        # ── Step 2: split each nn.Linear → MixedPrecisionLinear ─────────────
-        # apply_split_to_model only handles nn.Linear; Conv2d and other module
-        # types are left as-is (their weights were already updated in-place by
-        # _gptq_panel_layer above).
-        linear_assignments = {
-            name: pa
-            for name, pa in assignments_map.items()
-            if isinstance(self._target_modules.get(name), nn.Linear)
-        }
-
-        if not linear_assignments:
-            return QuantizationPlan()
-
-        # Pre-create the manifest so apply_split_to_model can record the split
-        # transform entry; attach_manifest() will later add qtensor_assignment
-        # while preserving this entry.
-        if not hasattr(self._model, "__neuropress_manifest__"):
-            self._model.__neuropress_manifest__ = _Manifest()  # type: ignore[attr-defined]
-        apply_split_to_model(self._model, linear_assignments, self.group_size)
-
-        # ── Step 3: wrap each sub-linear's weight as a packed QTensor ────────
-        sub_assignments: dict[str, Any] = {}
-        for path in linear_assignments:
-            parts = path.split(".")
-            mixed_lin: Any = self._model
-            for part in parts:
-                mixed_lin = getattr(mixed_lin, part)
-            for i, (sub_lin, nbits) in enumerate(
-                zip(mixed_lin.sub_linears, mixed_lin.precision_nbits, strict=True)
-            ):
-                sub_path = f"{path}.sub_linears.{i}"
-                try:
-                    q = _make_packed_qtensor(
-                        sub_lin.weight, sub_path, nbits, self.group_size
-                    )
-                    sub_assignments[sub_path] = q
-                except Exception as exc:
-                    LOGGER.error(
-                        "QTensor wrapping failed for '%s': %s - skipping",
-                        sub_path,
-                        exc,
-                    )
-
-        return QuantizationPlan(weight_assignments=sub_assignments)
+                kept_float[name] = str(exc)
+                continue
+            if assignment is not None:
+                assignments[name] = assignment
+        return QuantizationPlan(
+            weight_assignments=_add_tied_aliases(assignments, self._tied_aliases),
+            kept_float=kept_float,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -644,41 +566,24 @@ class GPTQPanelEstimator(QuantizationParamEstimator):
 
 @dataclass
 class MinMaxZpWeightEstimator(QuantizationParamEstimator):
-    """Min-max weight quantisation estimator - no calibration data required.
+    """Estimate affine min/max weight assignments without calibration inputs.
 
-    Applies per-tensor symmetric or asymmetric uniform quantisation directly
-    to each target module's weight and stores the result back in-place.  No
-    forward passes are needed (``declare_statistics`` returns an empty list).
-
-    When *weight_transform* is set, the dequantised float is passed through
-    the transform (e.g. ``q4_0_packed``) and the resulting packed QTensor is
-    stored in the plan.  When *None*, the dequantised float itself is stored.
-
-    Attributes:
-        module_classes: Only modules that are instances of these classes are
-            targeted.  Defaults to ``(nn.Embedding,)``.
-        filter_fn: Optional extra filter ``(name, module) -> bool`` applied
-            in addition to *module_classes*.  Use this to enforce shape
-            constraints (e.g. group-size divisibility for tract Q4_0).
-        weight_transform: Optional callable ``(weight, name) -> value | None``
-            applied after in-place quantisation.  The return value is stored
-            in :attr:`.QuantizationPlan.weight_assignments`.  Return *None* to
-            skip the layer from the plan.
-        nbits: Quantisation bit-width.
-        symmetric: Whether to use symmetric quantisation.
-        group_size: Per-group size used by the weight transform for scale
-            storage overhead estimation.  Only relevant when *weight_transform*
-            is set.
+    Named storage formats use group_size groups. Without a named format,
+    quantization is per-tensor. The plan carries codes and scales; the adapter
+    performs storage conversion and parameter replacement.
     """
 
     module_classes: tuple[type[nn.Module], ...] = field(default=(nn.Embedding,))
     filter_fn: Callable[[str, nn.Module], bool] | None = None
-    weight_transform: Callable[[torch.Tensor, str], Any] | None = None
+    weight_transform: str | Callable[[torch.Tensor, str], Any] | None = None
     nbits: int = 8
     symmetric: bool = True
     group_size: int = 32
 
     _target_modules: dict[str, nn.Module] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    _tied_aliases: dict[str, list[str]] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
 
@@ -689,6 +594,9 @@ class MinMaxZpWeightEstimator(QuantizationParamEstimator):
             model: The model that will be passed to the pipeline.
         """
         self._target_modules = collect_target_modules(
+            model, self.module_classes, self.filter_fn
+        )
+        self._tied_aliases = collect_tied_aliases(
             model, self.module_classes, self.filter_fn
         )
         LOGGER.info(
@@ -705,66 +613,76 @@ class MinMaxZpWeightEstimator(QuantizationParamEstimator):
         registry: StatisticsRegistry,
         recipe: QuantizationRecipe,
     ) -> QuantizationPlan:
-        """Quantise each target weight in-place and store the plan value.
-
-        When *weight_transform* is set the packed QTensor returned by the
-        transform is stored; otherwise the dequantised float tensor is stored.
-
-        Args:
-            graph: Unused.
-            registry: Unused.
-            recipe: Unused.
-
-        Returns:
-            A :class:`.QuantizationPlan` mapping each target layer name to its
-            plan value (packed QTensor or dequantised float tensor).
-        """
-        assignments: dict[str, Any] = {}
-        half = 2 ** (self.nbits - 1)
+        """Return selected codes and schemes without mutating model weights."""
+        assignments = {}
+        kept_float: dict[str, str] = {}
         for name, mod in self._target_modules.items():
-            # Give this module a private weight tensor before mutating it
-            # in-place below.  If mod.weight is tied to another module's
-            # weight (e.g. embed_tokens/lm_head with tie_word_embeddings),
-            # the in-place .copy_() a few lines down would otherwise
-            # silently corrupt that other module too, even though it was
-            # never a target of this estimator.
-            mod._parameters["weight"] = nn.Parameter(
-                mod.weight.detach().clone(), requires_grad=mod.weight.requires_grad
+            w = mod.weight.detach().float()
+            grouped = (
+                isinstance(self.weight_transform, str)
+                and self.weight_transform != "identity"
             )
-            w = mod.weight.data.float()
-            if self.symmetric:
-                maxabs = w.abs().max().clamp(min=1e-8)
-                scale = maxabs / (half - 1)
-                q = (w / scale).round().clamp(-half, half - 1)
-                dq = q * scale
-            else:
-                wmin, wmax = w.min(), w.max()
-                scale = (wmax - wmin).clamp(min=1e-8) / (2**self.nbits - 1)
-                q = ((w - wmin) / scale).round().clamp(0, 2**self.nbits - 1)
-                dq = q * scale + wmin
-            dq = dq.to(mod.weight.dtype)
-            mod.weight.data.copy_(dq)
-            LOGGER.info(
-                "MinMaxZp: quantised '%s' in-place (%d-bit, symmetric=%s)",
-                name,
-                self.nbits,
-                self.symmetric,
+            width = self.group_size if grouped else w.numel()
+            if w.numel() % width:
+                reason = f"weight size is not divisible by group size {width}"
+                LOGGER.warning("Min/max skipping '%s': %s", name, reason)
+                kept_float[name] = reason
+                continue
+            groups = w.reshape(-1, 1, 1, width)
+            try:
+                zero, scale = self._grid(groups, grouped)
+            except T2NErrorImpossibleQuantization as exc:
+                LOGGER.error("Min/max skipping '%s': %s", name, exc)
+                kept_float[name] = str(exc)
+                continue
+            scheme = ZpScaleScheme(
+                zero, scale, self.nbits, list(groups.shape), list(scale.shape)
             )
-            if self.weight_transform is not None:
-                if mod.weight.dim() < 2:
-                    LOGGER.warning(
-                        "Skipping weight_transform for '%s': weight is %dD (shape %s)",
-                        name,
-                        mod.weight.dim(),
-                        tuple(mod.weight.shape),
-                    )
-                else:
-                    packed = self.weight_transform(mod.weight, name)
-                    if packed is not None:
-                        assignments[name] = packed
-            else:
-                assignments[name] = dq
-        return QuantizationPlan(weight_assignments=assignments)
+            assignments[name] = QuantizedWeight(
+                scheme.quantize_as_u8(w).cpu(),
+                scheme,
+                mod.weight.dtype,
+                self.weight_transform,
+            )
+        return QuantizationPlan(
+            weight_assignments=_add_tied_aliases(assignments, self._tied_aliases),
+            kept_float=kept_float,
+        )
+
+    def _grid(
+        self, groups: torch.Tensor, stored_in_f16: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(zero, scale)`` per group.
+
+        When a format stores the grid in f16, codes must be selected against
+        the stored values or they decode differently.  So the scale is rounded
+        to f16 first, and an asymmetric offset is an integer f16 holds exactly.
+        A group far from zero relative to its range therefore gets a coarser
+        scale, as the offset cannot reach it otherwise.
+        """
+        half_range = 2 ** (self.nbits - 1)
+        if self.symmetric:
+            maximum = groups.abs().amax(dim=-1, keepdim=True)
+            scale = maximum / (half_range - 1)
+        else:
+            low = groups.amin(dim=-1, keepdim=True)
+            scale = (groups.amax(dim=-1, keepdim=True) - low) / (2**self.nbits - 1)
+            if stored_in_f16:
+                scale = torch.maximum(scale, low.abs() / _F16_MAX_EXACT_OFFSET)
+        scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+        if stored_in_f16:
+            rounded = scale.to(torch.float16)
+            if not torch.isfinite(rounded).all():
+                raise T2NErrorImpossibleQuantization(
+                    "weight range is too large for f16 scales"
+                )
+            scale = rounded.masked_fill(rounded == 0, F16_MIN_POSITIVE).to(scale.dtype)
+        if self.symmetric:
+            return torch.full_like(scale, half_range), scale
+        zero = -low / scale
+        if stored_in_f16:
+            zero = zero.round().clamp(-_F16_MAX_EXACT_OFFSET, _F16_MAX_EXACT_OFFSET)
+        return zero, scale
 
 
 # ---------------------------------------------------------------------------
@@ -3139,6 +3057,7 @@ class CompositeEstimator(QuantizationParamEstimator):
         for est in self.estimators:
             plan = est.estimate(graph, registry, recipe)
             merged.weight_assignments.update(plan.weight_assignments)
+            merged.kept_float.update(plan.kept_float)
             merged.activation_assignments.update(plan.activation_assignments)
         return merged
 
@@ -3158,27 +3077,16 @@ def _hqq_layer(
     beta: float,
     kappa: float,
     lp_norm: float,
-) -> None:
-    """Apply HQQ to *mod*, updating its weight in-place to dequantized floats.
+) -> QuantizedWeight:
+    """Estimate HQQ codes and a scheme without changing the module weight.
 
-    Granularity is per-group when ``in_features`` is divisible by *group_size*,
-    otherwise per-channel.
-
-    Args:
-        name: Human-readable layer name for logging.
-        mod: Module whose weight is quantized in-place.
-        group_size: Preferred group size for per-group granularity.
-        nbits: Quantization bit-width.
-        symmetric: Whether to use symmetric quantization.
-        num_iter: Number of HQQ optimization iterations.
-        beta: Initial penalty strength for half-quadratic splitting.
-        kappa: Penalty schedule multiplier per iteration.
-        lp_norm: Lp exponent for the proximal operator.
+    Uses per-group quantization when the flattened column count is divisible
+    by group_size, otherwise per-channel quantization.
     """
     w = mod.weight
     assert isinstance(w, torch.Tensor)
 
-    in_features = int(w.shape[1]) if w.dim() > 1 else w.shape[0]
+    in_features = math.prod(w.shape[1:]) if w.dim() > 1 else w.shape[0]
     if in_features >= group_size and in_features % group_size == 0:
         gran = Granularity.per_group([group_size])
     else:
@@ -3201,14 +3109,7 @@ def _hqq_layer(
     calib.update(w.data)
     qscheme = calib.compute_qscheme()
 
-    # Dequantize and copy result back in-place.
-    with torch.no_grad():
-        w_float = w.data.float().reshape(calib.calibration_data_shape)
-        scale = qscheme.scale
-        zp = qscheme.zero_point.float()
-        q = (w_float / scale + zp).clamp(0, qscheme.maxq).round()
-        dq = (q - zp) * scale
-        w.data.copy_(dq.reshape(w.shape).to(w.dtype))
+    return QuantizedWeight(qscheme.quantize_as_u8(w.detach()).cpu(), qscheme, w.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -3218,38 +3119,15 @@ def _hqq_layer(
 
 @dataclass
 class HQQEstimator(QuantizationParamEstimator):
-    """HQQ estimator: no calibration data required.
+    """Estimate HQQ weight assignments without activation calibration.
 
-    Applies :class:`~.methods.hqq.HQQCalibration` directly to each target
-    module's weight tensor and updates it in-place to the dequantized float
-    representation.  Because HQQ is purely weight-driven, no forward pass
-    is needed and :meth:`declare_statistics` always returns an empty list.
-
-    Useful standalone or as one component of a
-    :class:`CompositeEstimator` alongside a Hessian-based estimator.
-
-    Attributes:
-        module_classes: Only modules that are instances of these classes are
-            targeted.  Defaults to ``(nn.Linear,)``.
-        filter_fn: Optional extra filter ``(name, module) -> bool``.
-        weight_transform: Optional callable ``(weight, name) -> value | None``
-            applied to the HQQ-corrected weight after each layer.  The return
-            value is stored in :attr:`.QuantizationPlan.weight_assignments`.
-            Return *None* to skip the layer from the plan.
-        group_size: Preferred group size for per-group granularity.  Layers
-            whose ``in_features`` is not divisible by *group_size* fall back
-            to per-channel granularity.
-        nbits: Quantization bit-width.
-        symmetric: Whether to use symmetric quantization.
-        num_iter: Number of HQQ optimization iterations.  ``0`` = min-max.
-        beta: Initial half-quadratic penalty strength.
-        kappa: Penalty schedule multiplier (``beta *= kappa`` per iteration).
-        lp_norm: Lp exponent for the proximal operator.
+    Selected codes and affine schemes are retained in the plan. Named formats
+    and legacy Python weight transforms are applied by the model adapter.
     """
 
     module_classes: tuple[type[nn.Module], ...] = field(default=(nn.Linear,))
     filter_fn: Callable[[str, nn.Module], bool] | None = None
-    weight_transform: Callable[[torch.Tensor, str], Any] | None = None
+    weight_transform: str | Callable[[torch.Tensor, str], Any] | None = None
     group_size: int = 64
     nbits: int = 4
     symmetric: bool = False
@@ -3261,6 +3139,9 @@ class HQQEstimator(QuantizationParamEstimator):
     _target_modules: dict[str, nn.Module] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
+    _tied_aliases: dict[str, list[str]] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     def prepare(self, model: nn.Module) -> None:
         """Discover target modules in *model*.
@@ -3269,6 +3150,9 @@ class HQQEstimator(QuantizationParamEstimator):
             model: The model that will be passed to the pipeline.
         """
         self._target_modules = collect_target_modules(
+            model, self.module_classes, self.filter_fn
+        )
+        self._tied_aliases = collect_tied_aliases(
             model, self.module_classes, self.filter_fn
         )
         LOGGER.info("HQQEstimator: %d target modules", len(self._target_modules))
@@ -3283,24 +3167,10 @@ class HQQEstimator(QuantizationParamEstimator):
         registry: StatisticsRegistry,
         recipe: QuantizationRecipe,
     ) -> QuantizationPlan:
-        """Run HQQ per layer and return a :class:`.QuantizationPlan`.
-
-        Weights are updated in-place to their dequantized float
-        representations.  If *weight_transform* is set, its output is stored
-        in the plan's ``weight_assignments``.
-
-        Args:
-            graph: Unused (targets are fixed by :meth:`prepare`).
-            registry: Unused (no statistics needed).
-            recipe: Unused.
-
-        Returns:
-            A :class:`.QuantizationPlan` populated by *weight_transform* for
-            each successfully processed layer, or an empty plan when
-            *weight_transform* is ``None``.
-        """
+        """Return HQQ codes, schemes and destinations without replacing weights."""
         ids_seen: set[int] = set()
         assignments: dict[str, Any] = {}
+        kept_float: dict[str, str] = {}
 
         for name, mod in self._target_modules.items():
             raw_weight = mod.weight
@@ -3314,7 +3184,7 @@ class HQQEstimator(QuantizationParamEstimator):
             LOGGER.info("HQQ quantizing: %s  shape=%s", name, tuple(raw_weight.shape))
 
             try:
-                _hqq_layer(
+                assignment = _hqq_layer(
                     name,
                     mod,
                     group_size=self.group_size,
@@ -3327,19 +3197,17 @@ class HQQEstimator(QuantizationParamEstimator):
                 )
             except Exception as exc:
                 LOGGER.error("HQQ failed for '%s': %s - skipping", name, exc)
+                kept_float[name] = str(exc)
                 continue
 
-            if self.weight_transform is not None:
-                if mod.weight.dim() < 2:
-                    LOGGER.warning(
-                        "Skipping weight_transform for '%s': weight is %dD (shape %s)",
-                        name,
-                        mod.weight.dim(),
-                        tuple(mod.weight.shape),
-                    )
-                else:
-                    q = self.weight_transform(mod.weight, name)
-                    if q is not None:
-                        assignments[name] = q
+            assignments[name] = QuantizedWeight(
+                assignment.codes,
+                assignment.scheme,
+                assignment.dtype,
+                self.weight_transform,
+            )
 
-        return QuantizationPlan(weight_assignments=assignments)
+        return QuantizationPlan(
+            weight_assignments=_add_tied_aliases(assignments, self._tied_aliases),
+            kept_float=kept_float,
+        )

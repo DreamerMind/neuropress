@@ -59,6 +59,7 @@ Usage::
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -115,6 +116,26 @@ def _pack_u8(values: torch.Tensor, nbits: int) -> torch.Tensor:
     for i in range(vpb):
         packed |= grouped[:, :, i] << (i * nbits)
     return packed
+
+
+def _kernel_blob(weight_q: Any) -> torch.Tensor:
+    """Return *weight_q*'s codes in the kernels' ``[N, K // vpb]`` packed layout.
+
+    A blob already bit-packed at the scheme's width has that exact layout, so it
+    is reused instead of being decompressed and packed again.
+    """
+    from ..t2n.packing import BitPacking
+
+    nbits = weight_q.qscheme.n_bits
+    compressors = weight_q.u8_compressors
+    if (
+        len(compressors) == 1
+        and isinstance(compressors[0], BitPacking)
+        and compressors[0].nbits == nbits
+        and weight_q.u8_blob.dim() == 2
+    ):
+        return weight_q.u8_blob
+    return _pack_u8(weight_q.decompress_to_u8(), nbits)
 
 
 def _is_gemlite_compatible(nbits: int, group_size: int) -> bool:
@@ -549,7 +570,7 @@ class NPLinear(nn.Module):
             zero_point = None
         elif isinstance(weight_q, QTensorScaleZp):
             qtype = "asym"
-            zero_point = weight_q.qscheme.zero_point.detach().clone()
+            zero_point = weight_q.qscheme.per_group_zero_point().detach()
         else:
             raise TypeError(
                 f"Unsupported weight type {type(weight_q).__name__!r}. "
@@ -570,7 +591,7 @@ class NPLinear(nn.Module):
         qtensor_meta = serde.to_metadata(weight_q)
 
         return cls(
-            u8_blob=weight_q.u8_blob.detach().clone(),
+            u8_blob=_kernel_blob(weight_q),
             scale=weight_q.qscheme.scale.detach().clone(),
             out_features=linear.out_features,
             in_features=linear.in_features,
@@ -609,20 +630,19 @@ class NPLinear(nn.Module):
                 "Cannot reconstruct QTensor: no serde metadata stored. "
                 "Build via NPLinear.from_linear() to enable to_qtensor()."
             )
-        from ..t2n.qtensors import _SERDE_REGISTRY
+        from ..t2n.qtensors import scalar_qtensor_from_codes
 
         if self.backend == LinearBackend.DEFAULT:
             return self._weight_q
 
         type_name = "QTensorTractScaleOnly" if self.qtype == "sym" else "QTensorScaleZp"
-        serde = _SERDE_REGISTRY[type_name]
-        tensors: dict[str, torch.Tensor] = {
-            "u8_blob": self.u8_blob,
-            "scale": self.scale.reshape(-1, 1),
-        }
-        if self.zero_point is not None:
-            tensors["zero_point"] = self.zero_point.reshape(-1, 1)
-        return serde.from_parts(tensors, self._qtensor_meta)
+        return scalar_qtensor_from_codes(
+            type_name,
+            _unpack_u8(self.u8_blob, self.nbits),
+            self.scale,
+            self.zero_point,
+            self._qtensor_meta,
+        )
 
     # ------------------------------------------------------------------
     # Backend switching

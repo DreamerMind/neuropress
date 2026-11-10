@@ -61,7 +61,7 @@ import torch.nn.functional as F
 
 from .backends import Backend, EmbeddingBackend
 from .np_linear import (
-    _pack_u8,
+    _kernel_blob,
     _resolve_backend,  # noqa: F401
     _unpack_u8,
 )
@@ -245,6 +245,7 @@ class NPEmbedding(nn.Module):
         weight_q: torch.Tensor | None = None,
         qtensor_meta: dict[str, str] | None = None,
         embed_scale: float = 1.0,
+        out_dtype: torch.dtype | None = None,
     ) -> None:
         """Initialise NPEmbedding.
 
@@ -267,6 +268,8 @@ class NPEmbedding(nn.Module):
             embed_scale: Scalar multiplier applied to every output embedding
                 row.  Used to replicate the behaviour of custom embedding
                 subclasses (e.g. Gemma's ``embed_scale = sqrt(hidden_size)``).
+            out_dtype: Dtype of the returned embeddings, normally that of the
+                replaced embedding.  ``None`` keeps the scale dtype.
         """
         super().__init__()
         self._qtensor_meta = qtensor_meta
@@ -277,6 +280,7 @@ class NPEmbedding(nn.Module):
         self.qtype = qtype
         self.padding_idx = padding_idx
         self.embed_scale = embed_scale
+        self.out_dtype = out_dtype
         self.backend = _resolve_backend_emb(backend, nbits=nbits, group_size=group_size)
 
         if self.backend == EmbeddingBackend.DEFAULT:
@@ -326,7 +330,7 @@ class NPEmbedding(nn.Module):
             zero_point = None
         elif isinstance(weight_q, QTensorScaleZp):
             qtype = "asym"
-            zero_point = weight_q.qscheme.zero_point.detach().clone()
+            zero_point = weight_q.qscheme.per_group_zero_point().detach()
         else:
             raise TypeError(
                 f"Unsupported weight type {type(weight_q).__name__!r}. "
@@ -351,15 +355,7 @@ class NPEmbedding(nn.Module):
             float(embed_scale_buf.item()) if embed_scale_buf is not None else 1.0
         )
 
-        # decompress_to_u8() always returns canonical one-value-per-byte data
-        # regardless of whether the source QTensor's u8_blob is itself
-        # nibble-packed (e.g. via BitPacking4, used by the "q4_0_packed"
-        # weight transform) or not (e.g. a QTensor round-tripped through
-        # to_qtensor()/from_parts(), which carries no compressor). Repacking
-        # ourselves from this canonical form -- rather than assuming
-        # weight_q.u8_blob is already in NPEmbedding's packed layout --
-        # keeps this correct in both cases.
-        u8_blob = _pack_u8(weight_q.decompress_to_u8(), weight_q.qscheme.n_bits)
+        u8_blob = _kernel_blob(weight_q)
 
         return cls(
             u8_blob=u8_blob,
@@ -375,6 +371,7 @@ class NPEmbedding(nn.Module):
             weight_q=weight_q if bk == EmbeddingBackend.DEFAULT else None,
             qtensor_meta=qtensor_meta,
             embed_scale=embed_scale,
+            out_dtype=weight_q.dtype,
         )
 
     # ------------------------------------------------------------------
@@ -396,25 +393,19 @@ class NPEmbedding(nn.Module):
                 "Cannot reconstruct QTensor: no serde metadata stored. "
                 "Build via NPEmbedding.from_embedding() to enable to_qtensor()."
             )
-        from ..t2n.qtensors import _SERDE_REGISTRY
+        from ..t2n.qtensors import scalar_qtensor_from_codes
 
         if self.backend == EmbeddingBackend.DEFAULT:
             return self._weight_q
 
         type_name = "QTensorTractScaleOnly" if self.qtype == "sym" else "QTensorScaleZp"
-        serde = _SERDE_REGISTRY[type_name]
-        # self.u8_blob is nibble-packed ([V, D // vpb], see class docstring)
-        # for GPU-memory efficiency, but the serde's generic dequantize
-        # assumes one quantized value per byte (the format nn.Linear weights
-        # use, which are never packed) -- unpack before handing off, or every
-        # downstream shape is short by the packing factor.
-        tensors: dict[str, torch.Tensor] = {
-            "u8_blob": _unpack_u8(self.u8_blob, self.nbits),
-            "scale": self.scale.reshape(-1, 1),
-        }
-        if self.zero_point is not None:
-            tensors["zero_point"] = self.zero_point.reshape(-1, 1)
-        return serde.from_parts(tensors, self._qtensor_meta)
+        return scalar_qtensor_from_codes(
+            type_name,
+            _unpack_u8(self.u8_blob, self.nbits),
+            self.scale,
+            self.zero_point,
+            self._qtensor_meta,
+        )
 
     # ------------------------------------------------------------------
     # Backend switching
@@ -472,6 +463,11 @@ class NPEmbedding(nn.Module):
             out = self._forward_cuda(x)
         else:
             raise ValueError(f"Unknown backend: {self.backend}")  # pragma: no cover
+        # Kernels decode in the f16 scale dtype; return the replaced
+        # embedding's dtype so a float32 model does not run in f16 (Gemma's
+        # scaled activations overflow it).
+        if self.out_dtype is not None:
+            out = out.to(self.out_dtype)
         if self.embed_scale != 1.0:
             out = out * self.embed_scale
         return out

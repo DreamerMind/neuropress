@@ -34,9 +34,9 @@ RUN_INTEGRATION=1 uv run pytest tests/integration/ -v
 
 4. **QuantizationRecipe** – ties together `allowed_weight_qschemes`, `allowed_activation_qschemes`, a `QuantizationParamEstimator`, and a `ModuleQuantizationAdapter`.
 
-5. **QuantizationPlan** – the output of estimation: dicts mapping target keys to `ZpScaleScheme` or `QSchemeGroup` instances.
+5. **QuantizationPlan** – the output of estimation: dicts mapping target keys to selected values. A weight assignment is a `QuantizedWeight` (integer codes, a `ZpScaleScheme` or `QSchemeGroup`, and an optional destination format) or an already-materialized tensor such as a VQ `QTensor`. Scalar estimators leave model parameters untouched; tied modules selected as targets share one assignment object. Codes wait on the CPU until the adapter runs, as they take one byte per weight. `kept_float` records selected layers that stayed float and why; size estimates come from the recipe alone and do not reflect them.
 
-6. **ModuleQuantizationAdapter** – applies the plan to the model (abstract; user-supplied).
+6. **ModuleQuantizationAdapter** – applies the plan to the model. `WeightAssignmentAdapter` converts each `QuantizedWeight` to its destination format without recalibrating, replaces mixed-precision `nn.Linear` modules with `MixedPrecisionLinear`, and keeps tied modules tied. A tied module listed with its own assignment, such as an embedding and an `lm_head` in different formats, receives its own tensor. A weight whose scale or offset is outside the format's f16 range stays float, so one layer cannot discard the others. Mixed branches with no tract format export to NNEF as float variables; standalone `q4_1_packed` and `q2_0_packed` tensors refuse NNEF export. A weight its destination cannot store, including a packing that could not restore its shape, stays float and is added to `kept_float` rather than discarding the other layers; blocks whose scale is below the f16 range are stored as exact zeros.
 
 ### Key abstractions
 
@@ -93,11 +93,13 @@ Every entry is built by `_make_entry(config)`, which binds a `QuantizationRecipe
 1. Reads `QuantizationRecipe.calibration` and loads batches from `calibration.DATASET_REGISTRY`
 2. Transfers batches to the model device one at a time (no OOM on large calibration sets)
 3. Delegates to `QuantizationPipeline`, which runs the six steps above
-4. Applies kernel lowering when the recipe configures one
+4. Applies kernel lowering when the recipe configures one, except when `LLMExporter` calls it for an NNEF export (it passes `export_dirpath`), since tracing needs the QTensor modules
+
+`save_quantized_model` unlowers a lowered model before writing, restoring fused RMSNorms to the modules they replaced (the fused weight may hold Gemma's folded `+1`), and lowers it again afterwards. `load_quantized_model` restores quantized tensors on the device of the parameters they replace, so a checkpoint loads into a CUDA model and lowers there.
 
 Recipes can also be built from JSON via `QuantizationRecipeConfig.from_json(...).build()`, which resolves component types from the registries at deserialization time.
 
-Layers whose `in_features` is not a multiple of the group size are skipped (Q4_0 group size = 32).
+Layers whose `in_features` is not a multiple of the group size are skipped (Q4_0 group size = 32). Config `build()` rejects a `weight_transform` that cannot store the configured `nbits`, `symmetric` or `group_size`, before any estimation runs. GPTQ on a transformers `Conv1D` supports no named storage format: its scale groups run along the first weight dimension, which flat per-block storage cannot express without recalibrating.
 
 Registry entries: `"open_text_c4_gptq_q4_0"` (128 samples), `"open_text_c4_gptq_q4_0_32samples"`, `"open_text_c4_gptq_q4_0_256samples"`.
 

@@ -9,12 +9,14 @@ from torch_to_nnef.tensor.quant.qtract import QTensorTractScaleOnly
 import neuropress.transforms.weight_only  # noqa: F401
 from neuropress.adapter import WeightAssignmentAdapter
 from neuropress.estimator_configs import GptqEstimatorConfig
+from neuropress.estimators import GPTQEstimator
 from neuropress.methods.gptq import GPTQCalibration
 from neuropress.methods.zp_scale_calib import NormZpScaleCalibration
 from neuropress.pipeline import QuantizationPipeline
+from neuropress.plan import QuantizedWeight
 from neuropress.qscheme import Granularity
 from neuropress.recipe import QuantizationRecipe
-from neuropress.transforms.weight_only import _q4_0_from_gptq
+from neuropress.transforms.weight_only import _q4_0_from_assignment
 
 
 @pytest.mark.parametrize(
@@ -41,8 +43,8 @@ def test_pipeline_preserves_gptq_grid_in_nnef(format_name, group_size, tmp_path)
     calib.name = "reference"
     calib.init()
     calib.update_statistics(x)
-    weights, scheme, *_ = calib.compute_quantization()
-    expected_codes = scheme.quantize_as_u8(weights).reshape(-1, 32)
+    _weights, scheme, *_ = calib.compute_quantization()
+    expected_codes = calib.quantized_codes.reshape(-1, 32)
     expected_scales = scheme.scale.flatten().repeat_interleave(group_size // 32).half()
     estimator = GptqEstimatorConfig(
         group_size=group_size, weight_transform=format_name
@@ -77,8 +79,11 @@ def test_q40_rejects_incompatible_gptq_scheme(group_size, symmetric):
     calib.init()
     calib.update(weight)
     scheme = calib.compute_qscheme()
-    with pytest.raises(ValueError, match="symmetric 4-bit GPTQ"):
-        _q4_0_from_gptq(weight, scheme, "weight")
+    with pytest.raises(ValueError, match="symmetric 4-bit quantization"):
+        _q4_0_from_assignment(
+            QuantizedWeight(scheme.quantize_as_u8(weight), scheme, weight.dtype),
+            "weight",
+        )
 
 
 def _run_q40_gptq(scale_first_block: float):
@@ -138,9 +143,12 @@ def _run_conv2d(format_name, kernel):
     return model[0].weight, original
 
 
-@pytest.mark.parametrize("kernel", [1, 3])
-def test_q40_pipeline_handles_conv2d(kernel):
-    q, original = _run_conv2d("q4_0", kernel)
+@pytest.mark.parametrize(
+    "format_name, kernel",
+    [("q4_0", 1), ("q4_0", 3), ("q4_0_packed", 2)],
+)
+def test_q40_pipeline_handles_conv2d(format_name, kernel):
+    q, original = _run_conv2d(format_name, kernel)
     assert isinstance(q, QTensorTractScaleOnly)
     decoded = q.decompress()
     assert decoded.shape == original.shape
@@ -148,10 +156,12 @@ def test_q40_pipeline_handles_conv2d(kernel):
 
 
 @pytest.mark.parametrize("kernel", [1, 3])
-def test_q40_packed_conv2d_does_not_abort_the_run(kernel):
+def test_q40_packed_conv2d_with_odd_kernel_stays_float(kernel):
+    # Packing cannot restore this shape, so it must not decode flat.
     weight, original = _run_conv2d("q4_0_packed", kernel)
+    assert not isinstance(weight, QTensorTractScaleOnly)
     assert weight.shape == original.shape
-    assert torch.isfinite(weight).all()
+    assert (weight - original).abs().max() < 0.2
 
 
 def test_q40_rejection_keeps_other_layers():
@@ -167,7 +177,9 @@ def test_q40_rejection_keeps_other_layers():
             return self.compatible(x[..., :96]) + self.rejected(x[..., :64])
 
     model = Branches().eval()
-    estimator = GptqEstimatorConfig(group_size=48, weight_transform="q4_0").build()
+    # Configs reject this group size at build(), so bypass them to reach the
+    # per-layer path: 96 keeps groups of 48, 64 falls back to per-channel.
+    estimator = GPTQEstimator(group_size=48, weight_transform="q4_0")
     recipe = QuantizationRecipe(
         param_estimator=estimator, adapter=WeightAssignmentAdapter()
     )

@@ -103,9 +103,8 @@ class MixedPrecisionLinear(nn.Module):
     @property
     def out_features(self) -> int:
         """Number of output features (from the first sub-linear)."""
-        first = self.sub_linears[0]
-        assert isinstance(first, nn.Linear)
-        return int(first.out_features)
+        # Branches may be lowered kernel modules, which keep out_features.
+        return int(self.sub_linears[0].out_features)
 
     # ------------------------------------------------------------------
     # Forward
@@ -141,6 +140,76 @@ class MixedPrecisionLinear(nn.Module):
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"groups=[{buckets}]"
         )
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+
+def precision_column_layout(
+    panels_by_nbits: dict[int, list[tuple[int, int]]],
+    sort_descending: bool = True,
+) -> tuple[list[int], list[int], list[int]]:
+    """Order column ranges so same-precision columns become contiguous.
+
+    Args:
+        panels_by_nbits: ``(start, end)`` column ranges for each bit-width.
+        sort_descending: Place the highest precision first.
+
+    Returns:
+        ``(precisions, column_permutation, split_sizes)``.  Within one
+        precision, the original column order is preserved.
+    """
+    precisions = sorted(panels_by_nbits, reverse=sort_descending)
+    permutation: list[int] = []
+    sizes: list[int] = []
+    for nbits in precisions:
+        columns = [
+            column
+            for start, end in sorted(panels_by_nbits[nbits])
+            for column in range(start, end)
+        ]
+        permutation.extend(columns)
+        sizes.append(len(columns))
+    return precisions, permutation, sizes
+
+
+def record_mixed_split(
+    model: nn.Module,
+    modules: dict[str, MixedPrecisionLinear],
+    shared_with: dict[str, str] | None = None,
+) -> None:
+    """Record split modules in the model manifest so a load can replay them.
+
+    Args:
+        model: Model whose manifest receives the transform.
+        modules: Installed split modules by module path.
+        shared_with: Paths reusing another path's branches, mapped to it.
+    """
+    from neuropress.t2n.model_io import (
+        MixedPrecisionModuleSpec,
+        MixedPrecisionSplitTransform,
+        QuantizationManifest,
+    )
+
+    if not hasattr(model, "__neuropress_manifest__"):
+        model.__neuropress_manifest__ = QuantizationManifest()
+    model.__neuropress_manifest__.transforms.append(
+        MixedPrecisionSplitTransform(
+            type="mixed_precision_split",
+            modules={
+                path: MixedPrecisionModuleSpec(
+                    split_sizes=mod.split_sizes,
+                    precision_nbits=mod.precision_nbits,
+                    out_features=mod.out_features,
+                    has_bias=mod.bias is not None,
+                    shares_branches_with=(shared_with or {}).get(path),
+                )
+                for path, mod in modules.items()
+            },
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -186,35 +255,25 @@ def split_mixed_precision_linear(
             f"/ group_size={group_size}, got {len(assignments)}"
         )
 
-    # 1. Group panel indices by the selected quantizer's nbits.
-    nbits_to_panels: dict[int, list[int]] = {}
+    # 1. Group panel column ranges by the selected quantizer's nbits.
+    nbits_to_panels: dict[int, list[tuple[int, int]]] = {}
     for assignment in sorted(assignments, key=lambda a: a.panel_index):
         if assignment.selected is None:
             raise ValueError(
                 f"Panel {assignment.panel_index} has no selected quantizer."
             )
         nbits = assignment.selected.nbits
-        nbits_to_panels.setdefault(nbits, []).append(assignment.panel_index)
+        start = assignment.panel_index * group_size
+        nbits_to_panels.setdefault(nbits, []).append((start, start + group_size))
 
-    # 2. Determine the ordering of precision buckets.
-    sorted_nbits = sorted(nbits_to_panels.keys(), reverse=sort_descending)
-
-    # 3. Build the flat column permutation and record split sizes.
-    #    Within each precision bucket the original column order is preserved.
-    col_perm: list[int] = []
-    split_sizes: list[int] = []
-    for nbits in sorted_nbits:
-        panels = sorted(nbits_to_panels[nbits])
-        bucket_cols: list[int] = []
-        for panel_idx in panels:
-            start = panel_idx * group_size
-            bucket_cols.extend(range(start, start + group_size))
-        col_perm.extend(bucket_cols)
-        split_sizes.append(len(bucket_cols))
+    # 2. Order the precision buckets and build the flat column permutation.
+    sorted_nbits, col_perm, split_sizes = precision_column_layout(
+        nbits_to_panels, sort_descending
+    )
 
     col_perm_tensor = torch.tensor(col_perm, dtype=torch.long)
 
-    # 4. Create one sub-linear per precision bucket.
+    # 3. Create one sub-linear per precision bucket.
     W = linear.weight.data  # [out_features, in_features]
     out_features = W.shape[0]
     sub_linears = nn.ModuleList()
@@ -228,7 +287,7 @@ def split_mixed_precision_linear(
         sub_linears.append(sub_lin)
         offset += size
 
-    # 5. Detach bias (added once at the end in forward, not per sub-linear).
+    # 4. Detach bias (added once at the end in forward, not per sub-linear).
     bias = linear.bias.data.clone() if linear.bias is not None else None
 
     return MixedPrecisionLinear(
@@ -277,30 +336,9 @@ def apply_split_to_model(
         setattr(parent, parts[-1], mixed)
 
     # Record the split transform in the model manifest if one is present.
-    _manifest = getattr(model, "__neuropress_manifest__", None)
-    if _manifest is not None and hasattr(_manifest, "transforms"):
-        from neuropress.t2n.model_io import (
-            MixedPrecisionModuleSpec,
-            MixedPrecisionSplitTransform,
-        )
-
-        module_specs: dict[str, MixedPrecisionModuleSpec] = {}
-        for path, _assignments in assignments_map.items():
-            parts = path.split(".")
-            mod = model
-            for part in parts:
-                mod = getattr(mod, part)
-            # mod is now the MixedPrecisionLinear we just installed.
-            module_specs[path] = MixedPrecisionModuleSpec(
-                split_sizes=mod.split_sizes,
-                precision_nbits=mod.precision_nbits,
-                out_features=mod.out_features,
-                has_bias=mod.bias is not None,
-            )
-        _manifest.transforms.append(
-            MixedPrecisionSplitTransform(
-                type="mixed_precision_split", modules=module_specs
-            )
+    if getattr(model, "__neuropress_manifest__", None) is not None:
+        record_mixed_split(
+            model, {path: model.get_submodule(path) for path in assignments_map}
         )
 
     return model
