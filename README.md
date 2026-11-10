@@ -516,6 +516,9 @@ Ordinary and paired requests share the same collection pass, including in
 `CompositeEstimator` recipes. `QuantizationPipeline.run` also accepts
 `reference_data`, `reference_model` and `estimation_device` directly. Nested
 composite configs preserve their full estimator-specific JSON fields.
+Use `target_key=""` to collect paired observations at the block root for a
+whole-block estimator. Collection and stream propagation run without gradients;
+estimation can use autograd, including differentiation through nonlinear blocks.
 
 `benchmarks/bonsai_block_calibration.py` compares the three configurations with
 identical Q4_0 storage and held-out prompts, recording all-token and non-padding

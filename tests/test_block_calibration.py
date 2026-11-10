@@ -170,7 +170,8 @@ def test_pairing_failures_remove_hooks(failure):
     assert not model[0]._forward_hooks
 
 
-def test_composite_recipe_roundtrip_and_mixed_collection():
+@pytest.mark.parametrize("estimation_device", [None, "cpu"])
+def test_composite_recipe_roundtrip_and_mixed_collection(estimation_device):
     config = QuantizationRecipeConfig.model_validate(
         {
             "estimator": {
@@ -195,7 +196,9 @@ def test_composite_recipe_roundtrip_and_mixed_collection():
     model = nn.Sequential(nn.Embedding(128, 32), nn.Linear(32, 16)).eval()
     pipeline = QuantizationPipeline(restored.build())
     ids = torch.randint(0, 128, (2, 16))
-    pipeline.run(model, [ids], reference_data=[ids])
+    pipeline.run(
+        model, [ids], reference_data=[ids], estimation_device=estimation_device
+    )
     assert not pipeline.last_plan.kept_float
     assert set(pipeline.last_plan.weight_assignments) == {"0", "1"}
     assert hasattr(model[1].weight, "qscheme")
