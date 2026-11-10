@@ -256,3 +256,85 @@ def test_dependencies_are_unioned_across_representative_batches():
         QuantizationSchedule.trace(
             model, [torch.randn(2, 32), torch.randn(3, 32)], ["a", "b"]
         )
+
+
+@pytest.mark.parametrize("composed", [False, True])
+@pytest.mark.parametrize("collection_failure", [False, True])
+def test_pipeline_selections_are_scoped_and_preserve_original_filters(
+    composed, collection_failure
+):
+    from neuropress.estimators import CompositeEstimator
+
+    class FailsDuringCollection(nn.Sequential):
+        def forward(self, x):
+            self.calls = getattr(self, "calls", 0) + 1
+            if self.calls == 2:
+                raise RuntimeError("collection failed")
+            return super().forward(x)
+
+    def model(cls=nn.Sequential):
+        return cls(*(nn.Linear(32, 32, bias=False) for _ in range(3))).eval()
+
+    recipe = config().build()
+    estimator = recipe.param_estimator
+    format_filter = estimator.filter_fn
+
+    def original_filter(name, module):
+        return name != "2" and (format_filter is None or format_filter(name, module))
+
+    estimator.filter_fn = original_filter
+    if composed:
+        recipe.param_estimator = CompositeEstimator([CompositeEstimator([estimator])])
+    pipeline = QuantizationPipeline(recipe)
+    x = torch.randn(8, 32)
+    if collection_failure:
+        with pytest.raises(RuntimeError, match="collection failed"):
+            pipeline.run(model(FailsDuringCollection), [x], target_paths={"0"})
+    else:
+        pipeline.run(model(), [x], target_paths={"0"})
+        assert set(pipeline.last_plan.weight_assignments) == {"0"}
+    assert estimator.filter_fn is original_filter
+    pipeline.run(model(), [x], target_paths={"1"})
+    assert set(pipeline.last_plan.weight_assignments) == {"1"}
+    assert estimator.filter_fn is original_filter
+    pipeline.run(model(), [x])
+    assert set(pipeline.last_plan.weight_assignments) == {"0", "1"}
+    assert estimator.filter_fn is original_filter
+
+
+def test_composite_selection_unwinds_when_a_member_rejects_selection():
+    from neuropress.estimator import QuantizationParamEstimator
+    from neuropress.estimators import CompositeEstimator
+    from neuropress.plan import QuantizationPlan
+
+    class Unsupported(QuantizationParamEstimator):
+        def declare_statistics(self):
+            return []
+
+        def estimate(self, graph, registry, recipe):
+            return QuantizationPlan()
+
+    estimator = config().build().param_estimator
+    original_filter = estimator.filter_fn
+    composite = CompositeEstimator([estimator, Unsupported()])
+    with pytest.raises(NotImplementedError, match="does not support target selection"):
+        with composite.select_targets({"0"}):
+            pytest.fail("Unsupported member must reject selection")
+    assert estimator.filter_fn is original_filter
+
+
+def test_self_dependent_target_inputs_are_rejected_and_hooks_removed():
+    class SelfDependent(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.a = nn.Linear(32, 32, bias=False)
+
+        def forward(self, x):
+            return self.a(torch.nn.functional.linear(x, self.a.weight))
+
+    model = SelfDependent().eval()
+    with pytest.raises(ValueError, match="input depends on its own parameters: a"):
+        QuantizationSchedule.trace(model, [torch.randn(2, 32)], ["a"])
+    assert all(
+        not m._forward_hooks and not m._forward_pre_hooks for m in model.modules()
+    )

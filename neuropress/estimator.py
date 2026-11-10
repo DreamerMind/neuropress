@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 from torch import nn
@@ -91,21 +93,29 @@ class QuantizationParamEstimator(ABC):
         """
         ...
 
-    def select_targets(self, paths: set[str]) -> None:
-        """Restrict estimation to a stage, preserving existing target filters.
+    @contextmanager
+    def select_targets(self, paths: set[str]) -> Iterator[None]:
+        """Temporarily restrict estimation to a stage, preserving target filters.
 
         Estimators with module filters inherit this implementation. Other
         estimators must implement this contract explicitly to support staging.
-        Selection occurs before prepare; no assignment may escape the stage.
+        Enter before prepare and leave after adaptation. The original filter
+        is restored even when collection or estimation fails. Custom estimators
+        must provide the same context-manager contract.
         """
         if not hasattr(self, "filter_fn"):
             raise NotImplementedError(
                 f"{type(self).__name__} does not support target selection"
             )
+        paths = frozenset(paths)
         previous = self.filter_fn
         self.filter_fn = lambda name, module: (
             name in paths and (previous is None or previous(name, module))
         )
+        try:
+            yield
+        finally:
+            self.filter_fn = previous
 
     @abstractmethod
     def declare_statistics(self) -> list[StatisticRequest]:

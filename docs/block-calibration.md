@@ -115,14 +115,16 @@ Targets may be embeddings, convolutions or other modules supported by the recipe
 The trace describes observed eager PyTorch tensor dataflow, not arbitrary program
 semantics. Supply representative batches and use a pure, deterministic eval
 forward. In-place tensor operations, tensor-dependent Python branches, repeated
-calls to a target, nested targets, shared target parameter storage and targets
+calls to a target, inputs depending on the target's own parameters, nested targets,
+shared target parameter storage and targets
 missing from a batch are rejected. Python side effects, foreign computation and
 unobserved paths are outside this contract. Every selected target must be handled
 by the recipe; assignments outside the selected weight stage are rejected.
 
 Existing estimators with `filter_fn` support stage selection while preserving
 format filters. Composite estimators forward selection to each member. Future
-estimators can implement `select_targets(paths)` explicitly. Global preprocessing
+estimators can implement `select_targets(paths)` as a context manager, restoring
+their selection state when the scope exits, including on failure. Global preprocessing
 and final kernel lowering remain outside the staged traversal; methods requiring
 joint optimization across dependent targets should use the default whole-block
 mode. An `inference_model` callback can materialize packed weights for subsequent

@@ -120,6 +120,10 @@ class QuantizationSchedule:
                         raise ValueError(f"Repeated target invocation: {name}")
                     seen.add(name)
                     active[name] = tracker.sources((args, kwargs))
+                    if name in active[name]:
+                        raise ValueError(
+                            f"Target input depends on its own parameters: {name}"
+                        )
 
                 def after(
                     mod, args, kwargs, output, name=name, active=active, tracker=tracker

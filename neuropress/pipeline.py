@@ -6,6 +6,7 @@ import itertools
 import logging
 import math
 from collections.abc import Iterable, Iterator
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -113,72 +114,75 @@ class QuantizationPipeline:
         # -- Step 2 & 3: Declare + aggregate statistics --------------------
         LOGGER.info("Step 2/3: Aggregating statistic requests")
         estimator = self.recipe.param_estimator
-        if target_paths is not None:
+        with (
             estimator.select_targets(target_paths)
-        # Allow estimators to bind themselves to the model before declaring
-        # statistics (e.g. GPTQEstimator.prepare discovers target modules).
-        if hasattr(estimator, "prepare"):
-            estimator.prepare(model)
-        requests = estimator.declare_statistics()
-        registry = StatisticsRegistry()
-        registry.register_requests(requests)
+            if target_paths is not None
+            else nullcontext()
+        ):
+            # Allow estimators to bind themselves to the model before declaring
+            # statistics (e.g. GPTQEstimator.prepare discovers target modules).
+            if hasattr(estimator, "prepare"):
+                estimator.prepare(model)
+            requests = estimator.declare_statistics()
+            registry = StatisticsRegistry()
+            registry.register_requests(requests)
 
-        # -- Step 4: Global calibration (single lazy pass) -----------------
-        LOGGER.info("Step 4: Running global calibration")
-        cal = self.recipe.calibration
-        total_batches = math.ceil(cal.n_samples / cal.batch_size)
-        if _RICH:
-            calibration_iter = _rich_track(
+            # -- Step 4: Global calibration (single lazy pass) -----------------
+            LOGGER.info("Step 4: Running global calibration")
+            cal = self.recipe.calibration
+            total_batches = math.ceil(cal.n_samples / cal.batch_size)
+            if _RICH:
+                calibration_iter = _rich_track(
+                    calibration_iter,
+                    description=(
+                        f"[cyan]Hessians[/cyan]  "
+                        f"{cal.n_samples} samples / batch {cal.batch_size}"
+                    ),
+                    total=total_batches,
+                )
+            registry.collect(
+                observed_model,
                 calibration_iter,
-                description=(
-                    f"[cyan]Hessians[/cyan]  "
-                    f"{cal.n_samples} samples / batch {cal.batch_size}"
-                ),
-                total=total_batches,
+                reference_data=reference_data,
+                reference_model=reference_model,
             )
-        registry.collect(
-            observed_model,
-            calibration_iter,
-            reference_data=reference_data,
-            reference_model=reference_model,
-        )
-        if estimation_device is not None:
-            model.to(estimation_device)
-            registry.to(estimation_device)
-            estimator.prepare(model)
+            if estimation_device is not None:
+                model.to(estimation_device)
+                registry.to(estimation_device)
+                estimator.prepare(model)
 
-        # -- Step 5: Estimate QSchemes -------------------------------------
-        LOGGER.info("Step 5: Estimating QSchemes")
-        plan: QuantizationPlan = estimator.estimate(graph, registry, self.recipe)
-        LOGGER.info(
-            "Plan: %d weight assignments, %d activation assignments",
-            len(plan.weight_assignments),
-            len(plan.activation_assignments),
-        )
+            # -- Step 5: Estimate QSchemes -------------------------------------
+            LOGGER.info("Step 5: Estimating QSchemes")
+            plan: QuantizationPlan = estimator.estimate(graph, registry, self.recipe)
+            LOGGER.info(
+                "Plan: %d weight assignments, %d activation assignments",
+                len(plan.weight_assignments),
+                len(plan.activation_assignments),
+            )
 
-        if target_paths is not None:
-            assigned = set(plan.weight_assignments) | set(plan.kept_float)
-            if assigned - target_paths or plan.activation_assignments:
-                raise ValueError(
-                    "Estimator assignments escape the selected weight stage"
-                )
-            if target_paths - assigned:
-                raise ValueError(
-                    f"Stage targets not handled by estimator: {target_paths - assigned}"
-                )
+            if target_paths is not None:
+                assigned = set(plan.weight_assignments) | set(plan.kept_float)
+                if assigned - target_paths or plan.activation_assignments:
+                    raise ValueError(
+                        "Estimator assignments escape the selected weight stage"
+                    )
+                if target_paths - assigned:
+                    raise ValueError(
+                        f"Stage targets not handled by estimator: {target_paths - assigned}"
+                    )
 
-        # -- Step 6: Adapt model (weight assignment + manifest + lowering) -------
-        LOGGER.info("Step 6: Adapting model structure")
-        self.last_plan = plan
-        self.recipe.adapter.apply(model, plan)
+            # -- Step 6: Adapt model (weight assignment + manifest + lowering) -------
+            LOGGER.info("Step 6: Adapting model structure")
+            self.last_plan = plan
+            self.recipe.adapter.apply(model, plan)
 
-        from .t2n.model_io import attach_manifest
+            from .t2n.model_io import attach_manifest
 
-        attach_manifest(model)
+            attach_manifest(model)
 
-        if self.recipe.kernel_lowering is not None:
-            LOGGER.info("Step 6b: Kernel lowering")
-            self.recipe.kernel_lowering.apply(model)
-            model.__neuropress_kernel_lowering__ = self.recipe.kernel_lowering
+            if self.recipe.kernel_lowering is not None:
+                LOGGER.info("Step 6b: Kernel lowering")
+                self.recipe.kernel_lowering.apply(model)
+                model.__neuropress_kernel_lowering__ = self.recipe.kernel_lowering
 
-        return model
+            return model

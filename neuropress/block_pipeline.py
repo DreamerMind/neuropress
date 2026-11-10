@@ -181,9 +181,11 @@ class BlockQuantizationPipeline:
                 raise ValueError(
                     f"Checkpoint mismatch for block {name}; use a fresh checkpoint directory"
                 )
+            model.cpu()
             load_quantized_model(
                 model, path / "model.safetensors", kernel_lowering=None
             )
+            model.eval()
             streams = torch.load(path / "streams.pt", weights_only=True)
             return BlockCalibrationResult(
                 name,

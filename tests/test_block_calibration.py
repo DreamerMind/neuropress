@@ -390,3 +390,25 @@ def test_block_runner_allows_future_gradient_based_estimators(monkeypatch):
     for i, weight in zip([0, 2], original, strict=True):
         assert not torch.equal(result.model[i].weight, weight)
     assert torch.isfinite(result.student_outputs[0]).all()
+
+
+def test_checkpoint_resume_restores_eval_mode_for_all_modules(tmp_path):
+    torch.manual_seed(91)
+    original = nn.Sequential(
+        nn.Linear(32, 32, bias=False),
+        nn.Sequential(nn.BatchNorm1d(32), nn.Dropout(0.75)),
+    )
+    x = torch.randn(8, 32)
+    runner = BlockQuantizationPipeline(recipe(), checkpoint_dir=tmp_path, run_id="eval")
+    fresh = runner.run_block("block", deepcopy(original), [x], [x])
+    resumed = runner.run_block("block", deepcopy(original), [x], [x])
+    assert resumed.resumed
+    assert all(not module.training for module in resumed.model.modules())
+    assert all(
+        parameter.device.type == "cpu" for parameter in resumed.model.parameters()
+    )
+    with torch.no_grad():
+        torch.testing.assert_close(resumed.model(x), fresh.model(x), rtol=0, atol=0)
+        torch.testing.assert_close(
+            resumed.model(x), resumed.student_outputs[0], rtol=0, atol=0
+        )
