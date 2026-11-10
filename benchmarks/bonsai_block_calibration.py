@@ -14,11 +14,6 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 from torch import nn
-from transformers import AutoConfig
-from transformers.models.qwen3.modeling_qwen3 import (
-    Qwen3DecoderLayer,
-    Qwen3RotaryEmbedding,
-)
 
 from neuropress.block_pipeline import BlockQuantizationPipeline
 from neuropress.recipe_config import QuantizationRecipeConfig
@@ -77,6 +72,12 @@ def metrics(actual, reference, mask):
 @torch.inference_mode()
 def main():
     """Run the matched calibration experiment and save held-out measurements."""
+    from transformers import AutoConfig
+    from transformers.models.qwen3.modeling_qwen3 import (
+        Qwen3DecoderLayer,
+        Qwen3RotaryEmbedding,
+    )
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--snapshot", type=Path, required=True)
     parser.add_argument("--prompts", type=Path, required=True)
