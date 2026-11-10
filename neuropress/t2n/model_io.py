@@ -356,6 +356,14 @@ def _set_module(model: nn.Module, module_path: str, new_module: nn.Module) -> No
     setattr(parent, parts[-1], new_module)
 
 
+def _placeholder_device(module: nn.Module) -> torch.device:
+    """Return the device of *module*'s first non-meta tensor (CPU if none)."""
+    for tensor in list(module.parameters()) + list(module.buffers()):
+        if tensor.device.type != "meta":
+            return tensor.device
+    return torch.device("cpu")
+
+
 def _replay_mixed_precision_split(
     model: nn.Module, transform: MixedPrecisionSplitTransform
 ) -> None:
@@ -381,6 +389,9 @@ def _replay_mixed_precision_split(
 
         # A tied module reuses its sibling's branches, which the checkpoint
         # stores once.  Modules are recorded in application order.
+        # Placeholders live where the replaced layer lives, so the weights
+        # loaded into them follow the model's device.
+        device = _placeholder_device(model.get_submodule(path))
         source = spec.shares_branches_with
         if source is not None:
             sibling = model.get_submodule(source)
@@ -388,11 +399,11 @@ def _replay_mixed_precision_split(
             column_perm = sibling.column_perm
         else:
             sub_linears = nn.ModuleList(
-                [nn.Linear(sz, out, bias=False) for sz in split_sizes]
+                [nn.Linear(sz, out, bias=False, device=device) for sz in split_sizes]
             )
             # Placeholder tensor - overwritten by load_state_dict.
-            column_perm = torch.zeros(sum(split_sizes), dtype=torch.long)
-        bias = torch.zeros(out) if has_bias else None
+            column_perm = torch.zeros(sum(split_sizes), dtype=torch.long, device=device)
+        bias = torch.zeros(out, device=device) if has_bias else None
 
         mpl = MixedPrecisionLinear(
             column_perm=column_perm,
@@ -552,13 +563,18 @@ def load_quantized_model(
                 f"(needed for parameter {param_path!r}).  "
                 f"Available: {sorted(_SERDE_REGISTRY)}"
             )
-        sub_tensors = {
-            tk: all_tensors[f"{param_path}{_QT_SEP}{tk}"] for tk in entry.tensor_keys
-        }
-        q = serde.from_parts(sub_tensors, entry.metadata)
         # A checkpoint stores a tied parameter once, so names it does not list
         # share this tensor.  Names it does list hold their own saved values.
         previous = model.get_parameter(param_path)
+        # Restore on the device of the parameter being replaced: the file is
+        # read on CPU, and a CUDA model would otherwise mix devices.
+        device = previous.device
+        sub_tensors = {
+            tk: all_tensors[f"{param_path}{_QT_SEP}{tk}"] for tk in entry.tensor_keys
+        }
+        if device.type != "meta":
+            sub_tensors = {tk: t.to(device) for tk, t in sub_tensors.items()}
+        q = serde.from_parts(sub_tensors, entry.metadata)
         for path in tied_paths[id(previous)]:
             if path == param_path or path not in saved_paths:
                 _set_param(model, path, q)

@@ -105,7 +105,8 @@ def run_quantization_pipeline(
     to store the ``recipe_config_json``.
 
     When the recipe configures a kernel lowering pass, it is applied eagerly
-    so the returned model is always in the fast inference state.  The
+    so the returned model is always in the fast inference state, except when
+    ``LLMExporter`` calls this function for an NNEF export.  The
     lowering object is stored on the model as
     ``model.__neuropress_kernel_lowering__`` so that
     :func:`~neuropress.t2n.model_io.save_quantized_model` can auto-unlower
@@ -128,15 +129,26 @@ def run_quantization_pipeline(
         span_collector: Optional sink receiving one timing span per pipeline
             stage.  Defaults to logging spans at INFO level.
         **kwargs: Extra kwargs forwarded by ``LLMExporter`` (e.g.
-            ``export_dirpath``) are silently ignored.  ``_load_dataset`` is
-            extracted and forwarded to the loader for testing purposes.
+            ``export_dirpath``) are otherwise ignored; their presence skips
+            kernel lowering, as the model is about to be exported to NNEF.
+            ``_load_dataset`` is extracted and forwarded to the loader for
+            testing purposes.
 
     Returns:
         The same *model*, modified according to *recipe* and with a
         :class:`~neuropress.t2n.model_io.QuantizationManifest` attached as
-        ``model.__neuropress_manifest__``.
+        ``model.__neuropress_manifest__``.  Given ``LLMExporter``'s export
+        wrapper, the wrapped model is calibrated and quantized (and holds the
+        manifest), and the wrapper is returned.
     """
     _load_dataset = kwargs.pop("_load_dataset", None)
+    # LLMExporter.prepare passes export_dirpath: NNEF export traces the QTensor
+    # modules, which lowered kernels (torch.compile, CUDA extensions) replace
+    # with code torch.jit.trace cannot follow, so lowering is skipped there.
+    if "export_dirpath" in kwargs and recipe.kernel_lowering is not None:
+        recipe = recipe.model_copy(update={"kernel_lowering": None})
+    wrapper = model
+    model = _calibration_target(model)
     device = next(model.parameters()).device
     cal = recipe.calibration
     loader = DATASET_REGISTRY[cal.dataset]
@@ -172,6 +184,24 @@ def run_quantization_pipeline(
         model.__neuropress_kernel_lowering__ = recipe.kernel_lowering  # type: ignore[attr-defined]
         recipe.kernel_lowering.apply(model)
     _guard_unquantized_linear_dtype(model)
+    return wrapper
+
+
+def _calibration_target(model: nn.Module) -> nn.Module:
+    """Return the module to calibrate and quantize in place of *model*.
+
+    ``LLMExporter.prepare`` hands registry entries its export wrapper, whose
+    forward takes the KV-cache signature rather than calibration batches.
+    The wrapped Hugging Face model is held as ``model.model`` and shares its
+    modules with the wrapper, so quantizing it updates what gets exported.
+    Matched by class name: torch_to_nnef_llm is an optional dependency.
+    """
+    is_wrapper = any(
+        cls.__name__ == "TorchToNNEFWrappedLLM" for cls in type(model).__mro__
+    )
+    inner = getattr(model, "model", None)
+    if is_wrapper and isinstance(inner, nn.Module):
+        return inner
     return model
 
 

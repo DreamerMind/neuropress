@@ -262,22 +262,26 @@ def is_lowered(model: nn.Module) -> bool:
 
     Returns:
         ``True`` when at least one :class:`~neuropress.nn.np_linear.NPLinear`,
-        :class:`~neuropress.nn.np_vq_linear.NPVQLinear`, or
-        :class:`~neuropress.nn.np_embedding.NPEmbedding` is found.
+        :class:`~neuropress.nn.np_vq_linear.NPVQLinear`,
+        :class:`~neuropress.nn.np_embedding.NPEmbedding` or
+        :class:`~neuropress.nn.np_rms_norm.NPRMSNorm` is found.
     """
     from .nn.np_embedding import NPEmbedding
     from .nn.np_linear import NPLinear
+    from .nn.np_rms_norm import NPRMSNorm
     from .nn.np_vq_linear import NPVQLinear
 
     return any(
-        isinstance(m, NPLinear | NPVQLinear | NPEmbedding) for m in model.modules()
+        isinstance(m, NPLinear | NPVQLinear | NPEmbedding | NPRMSNorm)
+        for m in model.modules()
     )
 
 
 def unlower_model(model: nn.Module) -> None:
     """Replace NP* modules with ``nn.Linear`` / ``nn.Embedding`` + QTensor weights.
 
-    The inverse of :meth:`KernelLowering.apply`.  Each NP* module's
+    The inverse of :meth:`KernelLowering.apply`.  Fused RMSNorms are restored
+    to the modules they replaced.  Each NP* module's
     :meth:`to_qtensor` reconstructs the original QTensor from the module's
     buffers and stored serde metadata.  The QTensor is then placed back into a
     standard ``nn.Linear`` or ``nn.Embedding``.
@@ -290,13 +294,20 @@ def unlower_model(model: nn.Module) -> None:
     """
     from .nn.np_embedding import NPEmbedding
     from .nn.np_linear import NPLinear
+    from .nn.np_rms_norm import NPRMSNorm
     from .nn.np_vq_embedding import NPVQEmbedding
     from .nn.np_vq_linear import NPVQLinear
 
     replacements: list[tuple[str, nn.Module]] = []
 
     for name, module in model.named_modules():
-        if isinstance(module, NPLinear | NPVQLinear):
+        if isinstance(module, NPRMSNorm):
+            # The fused norm may hold a folded "+1" weight; saving it under the
+            # original module's key would change the model on reload.
+            source = module.to_source_module()
+            if source is not None:
+                replacements.append((name, source))
+        elif isinstance(module, NPLinear | NPVQLinear):
             qtensor = module.to_qtensor()
             has_bias = module.bias is not None
             # Use device="meta" so no weight tensor is allocated — we

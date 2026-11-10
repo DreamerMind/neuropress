@@ -51,10 +51,31 @@ class NPRMSNorm(nn.Module):
         eps: Epsilon added to mean-square before rsqrt.
     """
 
-    def __init__(self, weight: torch.Tensor, eps: float = 1e-6) -> None:
+    def __init__(
+        self,
+        weight: torch.Tensor,
+        eps: float = 1e-6,
+        source: nn.Module | None = None,
+    ) -> None:
         super().__init__()
         self.register_buffer("weight", weight.clone())
         self.eps = eps
+        # Kept outside the module tree so it adds no state_dict entries.
+        self.__dict__["_source"] = source
+
+    def to_source_module(self) -> nn.Module | None:
+        """Return the norm this module replaced, on this module's device.
+
+        The fused weight may have the "+1" convention folded in, so the
+        original module, whose weight is unchanged, is the exact inverse.
+
+        Returns:
+            The original module, or ``None`` when it was not recorded.
+        """
+        source = self.__dict__.get("_source")
+        if source is None:
+            return None
+        return source.to(self.weight.device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply fused RMS normalization over the last dimension of *x*.
@@ -138,7 +159,8 @@ def linearize_rms_norms(model: nn.Module) -> int:
     """Replace all unfused RMSNorm modules in *model* with :class:`NPRMSNorm`.
 
     Traverses *model* in-place.  Returns the number of replacements made.
-    Skips silently when CUDA JIT is unavailable (returns 0).
+    Skips silently when CUDA JIT is unavailable (returns 0), and leaves norms
+    whose weight is not on a CUDA device unchanged.
 
     Args:
         model: Any ``nn.Module``; typically a HuggingFace causal LM.
@@ -152,8 +174,12 @@ def linearize_rms_norms(model: nn.Module) -> int:
         log.debug("linearize_rms_norms: CUDA JIT unavailable — skipping")
         return 0
 
+    # The fused kernel runs on CUDA only: norms of a model on CPU (e.g. one
+    # being exported) keep their original module.
     targets: list[tuple[str, nn.Module]] = [
-        (name, mod) for name, mod in model.named_modules() if _is_unfused_rms_norm(mod)
+        (name, mod)
+        for name, mod in model.named_modules()
+        if _is_unfused_rms_norm(mod) and next(mod.parameters()).device.type == "cuda"
     ]
 
     n_plus_one = 0
@@ -165,7 +191,9 @@ def linearize_rms_norms(model: nn.Module) -> int:
             n_plus_one += 1
         else:
             effective_weight = weight.clone()
-        np_norm = NPRMSNorm(effective_weight, eps=eps).to(weight.device, weight.dtype)
+        np_norm = NPRMSNorm(effective_weight, eps=eps, source=mod).to(
+            weight.device, weight.dtype
+        )
 
         parent_name, _, attr = name.rpartition(".")
         parent = model.get_submodule(parent_name) if parent_name else model

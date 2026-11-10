@@ -103,9 +103,8 @@ class MixedPrecisionLinear(nn.Module):
     @property
     def out_features(self) -> int:
         """Number of output features (from the first sub-linear)."""
-        first = self.sub_linears[0]
-        assert isinstance(first, nn.Linear)
-        return int(first.out_features)
+        # Branches may be lowered kernel modules, which keep out_features.
+        return int(self.sub_linears[0].out_features)
 
     # ------------------------------------------------------------------
     # Forward

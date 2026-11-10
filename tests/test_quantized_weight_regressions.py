@@ -936,3 +936,236 @@ def test_lowering_reuses_a_blob_in_the_kernel_layout(format_name):
     if format_name == "q4_0_packed":
         with patch.object(BitPacking, "decompress", side_effect=AssertionError):
             assert _kernel_blob(q) is q.u8_blob
+
+
+# Tied modules with different formats, lowering round trips and devices
+
+
+class TiedEmbeddingHead(nn.Module):
+    def __init__(self, vocab=64, hidden=64):
+        super().__init__()
+        self.embed = nn.Embedding(vocab, hidden)
+        self.head = nn.Linear(hidden, vocab, bias=False)
+        self.head.weight = self.embed.weight
+
+    def forward(self, ids):
+        return self.head(self.embed(ids))
+
+
+@pytest.mark.parametrize("head_format", ["q4_0_packed", "q4_1_packed"])
+def test_tied_embedding_and_head_with_different_formats_both_convert(head_format):
+    torch.manual_seed(16)
+    model = TiedEmbeddingHead()
+    embed_plan = estimate(
+        MinMaxZpWeightEstimatorConfig(
+            target="embedding",
+            nbits=4,
+            symmetric=True,
+            group_size=32,
+            weight_transform="q4_0_packed",
+        ).build(),
+        model,
+    )
+    head_plan = estimate(
+        minmax(head_format, symmetric=head_format == "q4_0_packed"), model
+    )
+    plan = QuantizationPlan(
+        weight_assignments={
+            **embed_plan.weight_assignments,
+            **head_plan.weight_assignments,
+        }
+    )
+    WeightAssignmentAdapter().apply(model, plan)
+    assert model.embed.weight is not model.head.weight
+    for name, module in (("embed", model.embed), ("head", model.head)):
+        torch.testing.assert_close(
+            module.weight.decompress(),
+            plan.weight_assignments[name].dequantize(),
+            rtol=0,
+            atol=0,
+        )
+    assert model(torch.tensor([[1, 2, 3]])).shape == (1, 3, 64)
+
+
+class PlusOneRMSNorm(nn.Module):
+    """Gemma-style norm: scales by ``1 + weight``."""
+
+    def __init__(self, hidden, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(hidden))
+        self.eps = eps
+
+    def forward(self, x):
+        normed = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return normed * (1.0 + self.weight)
+
+
+def _lower_norms(model):
+    """Fuse model[1] as linearize_rms_norms does, without needing CUDA."""
+    from neuropress.nn.np_rms_norm import NPRMSNorm
+
+    norm = model[1]
+    model[1] = NPRMSNorm(1.0 + norm.weight.detach(), eps=norm.eps, source=norm)
+
+
+def test_norms_of_a_cpu_model_are_not_fused():
+    from neuropress.nn.np_rms_norm import linearize_rms_norms
+
+    model = nn.Sequential(nn.Linear(32, 32), PlusOneRMSNorm(32))
+    with patch("neuropress.nn.backends.is_cuda_jit_available", return_value=True):
+        assert linearize_rms_norms(model) == 0
+    assert isinstance(model[1], PlusOneRMSNorm)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_fused_cuda_norms_unlower_to_the_original_module():
+    from neuropress.kernel_lowering import unlower_model
+    from neuropress.nn.np_rms_norm import NPRMSNorm, linearize_rms_norms
+
+    torch.manual_seed(20)
+    model = nn.Sequential(nn.Linear(32, 32), PlusOneRMSNorm(32)).cuda()
+    original = model[1].weight.detach().clone()
+    x = torch.randn(4, 32, device="cuda")
+    expected = model(x)
+    with patch("neuropress.nn.backends.is_cuda_jit_available", return_value=True):
+        assert linearize_rms_norms(model) == 1
+    assert isinstance(model[1], NPRMSNorm)
+    torch.testing.assert_close(model(x), expected, rtol=1e-4, atol=1e-4)
+    unlower_model(model)
+    assert isinstance(model[1], PlusOneRMSNorm)
+    assert torch.equal(model[1].weight, original)
+
+
+def test_unlowering_restores_plus_one_norms_exactly():
+    from neuropress.kernel_lowering import is_lowered, unlower_model
+
+    torch.manual_seed(17)
+    model = nn.Sequential(nn.Linear(32, 32), PlusOneRMSNorm(32))
+    original = model[1].weight.detach().clone()
+    _lower_norms(model)
+    assert is_lowered(model)
+    unlower_model(model)
+    assert isinstance(model[1], PlusOneRMSNorm)
+    assert torch.equal(model[1].weight, original)
+
+
+def test_saving_a_lowered_plus_one_norm_keeps_its_weight(tmp_path):
+    torch.manual_seed(18)
+    model = nn.Sequential(nn.Linear(32, 32), PlusOneRMSNorm(32))
+    original = model[1].weight.detach().clone()
+    WeightAssignmentAdapter().apply(model, estimate(minmax(), model))
+    _lower_norms(model)
+    path = tmp_path / "norm.safetensors"
+    save_quantized_model(model, path)
+    restored = nn.Sequential(nn.Linear(32, 32), PlusOneRMSNorm(32))
+    load_quantized_model(restored, path, kernel_lowering=None)
+    assert torch.equal(restored[1].weight, original)
+
+
+def test_mixed_linear_reports_features_with_lowered_branches():
+    model = nn.Sequential(nn.Linear(128, 16, bias=False))
+    WeightAssignmentAdapter().apply(model, _mixed_plan())
+    mixed = model[0]
+
+    class Lowered(nn.Module):
+        in_features = 0
+        out_features = 16
+
+    mixed.sub_linears[0] = Lowered()
+    assert mixed.out_features == 16
+    assert "out_features=16" in repr(mixed)
+
+
+def test_tied_offloaded_modules_with_different_formats_stay_distinct(tmp_path):
+    torch.manual_seed(21)
+    model = TiedEmbeddingHead()
+    embed_plan = estimate(
+        MinMaxZpWeightEstimatorConfig(
+            target="embedding",
+            nbits=4,
+            symmetric=True,
+            group_size=32,
+            weight_transform="q4_0_packed",
+        ).build(),
+        model,
+    )
+    head_plan = estimate(minmax("q4_1_packed", symmetric=False), model)
+    shared = nn.Parameter(
+        OffloadedTensor.from_original_tensor(
+            model.embed.weight.detach().clone(), "shared", tmp_path
+        ),
+        requires_grad=False,
+    )
+    model.embed._parameters["weight"] = shared
+    model.head._parameters["weight"] = shared
+    plan = QuantizationPlan(
+        weight_assignments={
+            **embed_plan.weight_assignments,
+            **head_plan.weight_assignments,
+        }
+    )
+    WeightAssignmentAdapter().apply(model, plan)
+    assert [name for name, _ in model.named_parameters()] == [
+        "embed.weight",
+        "head.weight",
+    ]
+    for name, module in (("embed", model.embed), ("head", model.head)):
+        torch.testing.assert_close(
+            module.weight.to_base_tensor().decompress(),
+            plan.weight_assignments[name].dequantize(),
+            rtol=0,
+            atol=0,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("mixed", [False, True])
+def test_checkpoint_loads_onto_the_model_device(mixed, tmp_path):
+    torch.manual_seed(19)
+    model = nn.Sequential(nn.Linear(128, 16, bias=False)).cuda()
+    if mixed:
+        plan = estimate(
+            GPTQPanelEstimator(
+                module_classes=(nn.Linear,),
+                group_size=32,
+                possible_nbits=[2, 4],
+                target_bpw=3.0,
+            ),
+            model,
+            [torch.randn(8, 16, 128, device="cuda")],
+        )
+    else:
+        plan = estimate(minmax(), model)
+    WeightAssignmentAdapter().apply(model, plan)
+    attach_manifest(model)
+    path = tmp_path / "device.safetensors"
+    save_quantized_model(model, path)
+    restored = nn.Sequential(nn.Linear(128, 16, bias=False)).cuda()
+    load_quantized_model(restored, path, kernel_lowering=None)
+    for name, tensor in list(restored.named_parameters()) + list(
+        restored.named_buffers()
+    ):
+        assert tensor.device.type == "cuda", name
+    x = torch.randn(2, 128, device="cuda")
+    torch.testing.assert_close(restored(x), model(x), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("format_name", ["q4_0_packed", "q4_1_packed"])
+def test_lowered_embedding_returns_the_replaced_dtype(format_name):
+    torch.manual_seed(22)
+    model = nn.Sequential(nn.Embedding(16, 64))
+    estimator = MinMaxZpWeightEstimatorConfig(
+        target="embedding",
+        nbits=4,
+        symmetric=format_name == "q4_0_packed",
+        group_size=32,
+        weight_transform=format_name,
+    ).build()
+    WeightAssignmentAdapter().apply(model, estimate(estimator, model))
+    expected = model[0].weight.decompress()
+    lowered = NPEmbedding.from_embedding(model[0], backend="compile")
+    ids = torch.arange(16)
+    out = lowered(ids)
+    assert out.dtype == torch.float32
+    # The kernels decode through the f16 scale dtype.
+    torch.testing.assert_close(out, expected[ids], rtol=1e-3, atol=1e-3)

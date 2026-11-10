@@ -245,6 +245,7 @@ class NPEmbedding(nn.Module):
         weight_q: torch.Tensor | None = None,
         qtensor_meta: dict[str, str] | None = None,
         embed_scale: float = 1.0,
+        out_dtype: torch.dtype | None = None,
     ) -> None:
         """Initialise NPEmbedding.
 
@@ -267,6 +268,8 @@ class NPEmbedding(nn.Module):
             embed_scale: Scalar multiplier applied to every output embedding
                 row.  Used to replicate the behaviour of custom embedding
                 subclasses (e.g. Gemma's ``embed_scale = sqrt(hidden_size)``).
+            out_dtype: Dtype of the returned embeddings, normally that of the
+                replaced embedding.  ``None`` keeps the scale dtype.
         """
         super().__init__()
         self._qtensor_meta = qtensor_meta
@@ -277,6 +280,7 @@ class NPEmbedding(nn.Module):
         self.qtype = qtype
         self.padding_idx = padding_idx
         self.embed_scale = embed_scale
+        self.out_dtype = out_dtype
         self.backend = _resolve_backend_emb(backend, nbits=nbits, group_size=group_size)
 
         if self.backend == EmbeddingBackend.DEFAULT:
@@ -367,6 +371,7 @@ class NPEmbedding(nn.Module):
             weight_q=weight_q if bk == EmbeddingBackend.DEFAULT else None,
             qtensor_meta=qtensor_meta,
             embed_scale=embed_scale,
+            out_dtype=weight_q.dtype,
         )
 
     # ------------------------------------------------------------------
@@ -458,6 +463,11 @@ class NPEmbedding(nn.Module):
             out = self._forward_cuda(x)
         else:
             raise ValueError(f"Unknown backend: {self.backend}")  # pragma: no cover
+        # Kernels decode in the f16 scale dtype; return the replaced
+        # embedding's dtype so a float32 model does not run in f16 (Gemma's
+        # scaled activations overflow it).
+        if self.out_dtype is not None:
+            out = out.to(self.out_dtype)
         if self.embed_scale != 1.0:
             out = out * self.embed_scale
         return out

@@ -116,6 +116,10 @@ def test_gptq_calibration_and_nnef_export(tmp_path: Any) -> None:
     )
     QuantizationPipeline(recipe).run(model, batches)
 
+    # The exporter builds its sample inputs on CPU, so export from CPU even
+    # when calibration ran on CUDA.
+    model.to("cpu")
+
     # -- 4. Export the quantized model to NNEF ------------------------------
     # export_model asserts the directory does NOT exist yet (unless
     # ignore_already_exist_dir=True), so hand it a path and let it create one.

@@ -72,7 +72,6 @@ class WeightAssignmentAdapter(ModuleQuantizationAdapter):
         from .transforms.vq import QTensorTractVQ
 
         module_map = dict(model.named_modules())
-        updater = ModTensorUpdater(model)
         assignments = list(plan.weight_assignments.items())
         total = len(assignments)
         log_every = max(1, total // 10)
@@ -117,19 +116,7 @@ class WeightAssignmentAdapter(ModuleQuantizationAdapter):
                 # slow-path branch that _set_tensor would take anyway.
                 mod._parameters["weight"] = q_weight
             else:
-                # update_by_ref's tie_replacements-always-True behaviour
-                # propagates this update to every module sharing the same
-                # underlying tensor (e.g. a tied lm_head when only
-                # embed_tokens is in the plan) — the plan only lists
-                # `name`, so any such sibling was never meant to change.
-                # update_by_name(..., tie_replacements=False) updates only
-                # the named module, matching the QTensorTractVQ branch above.
-                converted_tensors[key] = updater.update_by_name(
-                    f"{name}.weight" if name else "weight",
-                    q_weight,
-                    tie_replacements=False,
-                    enforce_tensor_consistency=False,
-                )
+                converted_tensors[key] = self._assign_weight(mod, q_weight)
             if (i + 1) % log_every == 0 or (i + 1) == total:
                 LOGGER.info(
                     "WeightAssignmentAdapter: %d/%d weights replaced (%s)",
@@ -139,6 +126,25 @@ class WeightAssignmentAdapter(ModuleQuantizationAdapter):
                 )
         self._report_kept_float(plan)
         return model
+
+    @staticmethod
+    def _assign_weight(mod: nn.Module, tensor: torch.Tensor) -> torch.Tensor:
+        """Give *mod* its own weight *tensor*, leaving tied siblings unchanged.
+
+        The plan lists each module that changes, so a sibling sharing the old
+        tensor (e.g. a tied lm_head when only embed_tokens is listed) keeps
+        it. A tied sibling listed with its own assignment receives its own
+        tensor as well. This matches ``ModTensorUpdater.update_by_name`` with
+        ``tie_replacements=False``, whose bookkeeping cannot update the second
+        name of a tied pair.
+        """
+        old = mod._parameters.get("weight")
+        if not isinstance(tensor, nn.Parameter):
+            tensor = nn.Parameter(tensor, requires_grad=False)
+        if old is not None and old.requires_grad and not tensor.requires_grad:
+            tensor.requires_grad = True
+        mod._parameters["weight"] = tensor
+        return tensor
 
     @staticmethod
     def _report_kept_float(plan: QuantizationPlan) -> None:
@@ -166,9 +172,12 @@ class WeightAssignmentAdapter(ModuleQuantizationAdapter):
         if isinstance(current, OffloadedTensor) and not isinstance(
             result, OffloadedTensor | type(None)
         ):
+            # Name it after its own module: tied modules converted to different
+            # formats start from one offloaded tensor, and OffloadedTensor
+            # hashes by name, shape and dtype.
             result = OffloadedTensor.from_original_tensor(
                 result,
-                f"{current._name}.quantized",
+                f"{name}.weight.quantized" if name else "weight.quantized",
                 offload_dir=current.offload_dir,
             )
         return result

@@ -380,3 +380,53 @@ def test_preprocessing_step_fields_survive_dump():
     assert _recipe_fingerprint(plain.model_dump_json()) != _recipe_fingerprint(
         rotated.model_dump_json()
     )
+
+
+@pytest.mark.parametrize("exporting", [False, True])
+def test_pipeline_lowers_kernels_unless_exporting(exporting):
+    """LLMExporter passes export_dirpath; NNEF export needs unlowered modules."""
+    from unittest.mock import patch
+
+    from neuropress.kernel_lowering import AutoKernelLowering
+
+    cfg = QuantizationRecipeConfig.from_json(_composite_recipe_json())
+    extra = {"export_dirpath": None} if exporting else {}
+    with patch.object(AutoKernelLowering, "apply") as apply:
+        run_quantization_pipeline(
+            _MixedModel(),
+            tokenizer=_MockTokenizer(),
+            recipe=cfg.build(),
+            _load_dataset=_mock_load_dataset,
+            **extra,
+        )
+    assert apply.called is not exporting
+
+
+def test_pipeline_quantizes_the_model_inside_an_export_wrapper():
+    """LLMExporter.prepare passes its wrapper, which cannot take batches."""
+
+    class TorchToNNEFWrappedLLM(nn.Module):
+        pass
+
+    class Wrapper(TorchToNNEFWrappedLLM):
+        def __init__(self, model):
+            super().__init__()
+            self.model = model
+
+        def forward(self, *args, **kwargs):
+            raise AssertionError("calibration must not call the export wrapper")
+
+    inner = _MixedModel()
+    proj_before = inner.proj.weight.detach().clone()
+    wrapper = Wrapper(inner)
+    cfg = QuantizationRecipeConfig.from_json(_composite_recipe_json())
+    result = run_quantization_pipeline(
+        wrapper,
+        tokenizer=_MockTokenizer(),
+        recipe=cfg.build(),
+        _load_dataset=_mock_load_dataset,
+        export_dirpath=None,
+    )
+    assert result is wrapper
+    assert not torch.equal(inner.proj.weight, proj_before)
+    assert hasattr(inner, "__neuropress_manifest__")
