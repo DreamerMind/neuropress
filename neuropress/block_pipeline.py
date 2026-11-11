@@ -298,8 +298,12 @@ class BlockQuantizationPipeline:
         """Yield adapted blocks while advancing aligned float/student activations.
 
         Blocks may be loaded lazily. ``propagate(previous_batch, output)`` forms
-        the next block's batch; the default uses the output directly. Retain
-        only the results needed by the caller to preserve bounded memory.
+        the next block's batch; the default uses the output directly, so a dict
+        output is passed to the next block as keyword arguments. Outputs are
+        plain CPU tensor trees (see :func:`move_batch`): a ``ModelOutput`` is
+        a ``dict`` here, fresh or resumed, so ``propagate`` should read
+        ``output["last_hidden_state"]`` rather than the attribute. Retain only
+        the results needed by the caller to preserve bounded memory.
         """
         reference = [move_batch(batch, "cpu") for batch in calibration_data]
         student = reference

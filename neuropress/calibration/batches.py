@@ -7,7 +7,15 @@ from torch import nn
 
 
 def move_batch(value: Any, device: torch.device | str, *, copy: bool = False) -> Any:
-    """Detach and move tensors inside dictionaries, tuples and lists."""
+    """Detach and move tensors inside dictionaries, tuples and lists.
+
+    Containers come back as plain ``dict``/``tuple``/``list``: a Hugging Face
+    ``ModelOutput`` becomes a ``dict`` (index it by key, not attribute) and a
+    namedtuple becomes a ``tuple``. This is deliberate: block streams are
+    checkpointed and reloaded with ``torch.load(weights_only=True)``, which
+    rejects container subclasses, so preserving them would make a resumed run
+    see different types than a fresh one.
+    """
     if isinstance(value, torch.Tensor):
         return value.detach().to(device, copy=copy)
     if isinstance(value, dict):

@@ -52,8 +52,12 @@ for result in runner.run(named_float_blocks, calibration_batches):
     consume(result)
 ```
 
-By default, each block output becomes the next block input. Supply
-`propagate(previous_batch, output)` to preserve masks or other arguments. Use
+By default, each block output becomes the next block input (a dict output is
+passed as keyword arguments). Supply `propagate(previous_batch, output)` to
+preserve masks or other arguments. Streams are plain CPU tensor trees so that
+checkpoints reload with `weights_only=True`: a Hugging Face `ModelOutput` arrives
+as a `dict` and a namedtuple as a `tuple`, in fresh and resumed runs alike, so
+read `output["last_hidden_state"]` rather than the attribute. Use
 `run_block` directly when the model needs its own traversal. Blocks must not share
 weights across boundaries. Apply whole-model preprocessing before partitioning,
 and kernel lowering after calibration. An optional `inference_model` callback can

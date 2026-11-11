@@ -519,3 +519,41 @@ def test_keyword_calls_feed_collectors_like_positional_calls(wrapper, monkeypatc
     assert keyword is not None
     assert len(lookups) == 1  # once per hook, not once per call
     torch.testing.assert_close(keyword, hessian(x), rtol=0, atol=0)
+
+
+def test_block_streams_are_plain_trees_whether_fresh_or_resumed(tmp_path):
+    import collections
+
+    class Output(collections.OrderedDict):
+        """Stands in for transformers' ModelOutput (an OrderedDict subclass)."""
+
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(32, 32, bias=False)
+
+        def forward(self, hidden_states):
+            return Output(last_hidden_state=self.proj(hidden_states))
+
+    def propagate(batch, output):
+        return {"hidden_states": output["last_hidden_state"]}
+
+    torch.manual_seed(14)
+    blocks = [Block().eval() for _ in range(2)]
+    data = [{"hidden_states": torch.randn(4, 32)}]
+    runs = []
+    for _ in range(2):  # the second run resumes every block from checkpoints
+        runner = BlockQuantizationPipeline(
+            recipe(), checkpoint_dir=tmp_path, run_id="trees"
+        )
+        runs.append(
+            list(
+                runner.run(enumerate_names(deepcopy(blocks)), data, propagate=propagate)
+            )
+        )
+    fresh, resumed = runs
+    assert all(result.resumed for result in resumed)
+    for a, b in zip(fresh, resumed, strict=True):
+        assert type(a.student_outputs[0]) is dict
+        assert type(b.student_outputs[0]) is dict
+        torch.testing.assert_close(a.student_outputs, b.student_outputs)
