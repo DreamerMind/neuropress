@@ -41,6 +41,7 @@ import torch
 from torch import nn
 from torch_to_nnef.exceptions import T2NErrorImpossibleQuantization
 
+from .calibration.batches import materialize
 from .calibration.probe import StatisticRequest, StatisticsRegistry
 from .estimator import QuantizationParamEstimator
 from .graph.graph import QGraph
@@ -222,7 +223,10 @@ def _gptq_layer(
             raise ValueError("Teacher reconstruction statistics are missing")
         try:
             calib.weight_tensor = reconstruction.reconstruct_linear_weight(
-                _w, calib.hessian, stat["cross"], reconstruction_damp_percent
+                _w,
+                materialize(calib.hessian),
+                materialize(stat["cross"]),
+                reconstruction_damp_percent,
             )
         except (ValueError, torch.linalg.LinAlgError) as exc:
             # An ill-conditioned or nonfinite teacher fit says nothing about
@@ -1545,8 +1549,7 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
         h = result.get("hessian")
         if h is None:
             return None
-        if not isinstance(h, torch.Tensor):
-            h = h.to_base_tensor()
+        h = materialize(h)
         if h.shape != (K, K):
             return None
         # Persist for next run (CPU float32 to avoid GPU-memory pinning).  The

@@ -4,6 +4,21 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch_to_nnef.tensor.opaque import OpaqueTensor
+
+
+def materialize(tensor: torch.Tensor) -> torch.Tensor:
+    """Return *tensor* as a plain tensor, loading an opaque one such as ``OffloadedTensor``.
+
+    ``isinstance(x, torch.Tensor)`` cannot detect these: ``OffloadedTensor``
+    subclasses ``torch.Tensor``, its ``.to()`` retargets the shared object
+    instead of returning a copy, and an in-place write to it lands in a
+    temporary reload. Each call on an offloaded tensor reads it from disk
+    again, so the result is never shared with the stored statistic.
+    """
+    while isinstance(tensor, OpaqueTensor):
+        tensor = tensor.to_base_tensor()
+    return tensor
 
 
 def move_batch(

@@ -23,6 +23,7 @@ from typing import Annotated
 import torch
 from torch.types import Device
 
+from ..calibration.batches import materialize
 from ..calibration.probe import HessianAccumulator, StatField
 from ..qscheme.descriptor import GranularityType
 from ..qscheme.group import QSchemeGroup
@@ -379,19 +380,17 @@ class GPTQCalibration(CalibrationMethodOnActivation[T_SUPPORTED_QSCHEMES]):
 
     def _quantize_preprocess(self) -> QProcessingData:
         w = self._clone_weights()
-        hessian = self.hessian
-        if hessian is not None and not isinstance(hessian, torch.Tensor):
-            hessian = hessian.to_base_tensor()
-        assert hessian is not None
+        shared = self.hessian
+        assert shared is not None
         # Drop our references; the caller may still share the tensor (e.g. a
         # registry statistic that is cached after estimation), so everything
         # below copies before it writes. Relocation brings a CPU-accumulated
-        # Hessian to the weights for this layer only.
+        # Hessian to the weights for this layer only, and a disk-offloaded one
+        # reloads as a fresh tensor that is ours to write.
         self.hessian = None
         if self._hessian_accumulator is not None:
             self._hessian_accumulator.hessian = None
-        shared = hessian
-        hessian = hessian.to(device=w.device, dtype=torch.float32)
+        hessian = materialize(shared).to(device=w.device, dtype=torch.float32)
         owned = hessian is not shared
         del shared
 

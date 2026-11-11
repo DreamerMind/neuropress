@@ -668,3 +668,47 @@ def test_injected_statistics_are_not_copied_by_the_registry():
     # would be a second K x K allocation for every layer.
     assert calib.hessian is hessian
     assert calib.nsamples == 3
+
+
+@pytest.mark.parametrize("teacher", [False, True])
+def test_disk_offloaded_hessians_quantize_like_in_memory_ones(
+    teacher, monkeypatch, tmp_path
+):
+    from dataclasses import dataclass
+
+    from torch_to_nnef.tensor.offload import OffloadedTensor
+
+    from neuropress.calibration.probe import HessianAccumulator
+
+    offloaded = []
+
+    @dataclass
+    class OffloadingHessian(HessianAccumulator):
+        offload_intermediate_tensor_on_disk: bool = True
+
+        @property
+        def offload_dir(self):
+            return tmp_path
+
+        def result(self):
+            offloaded.append(isinstance(self.hessian, OffloadedTensor))
+            return super().result()
+
+    torch.manual_seed(17)
+    original = nn.Sequential(nn.Linear(32, 16, bias=False)).eval()
+    x = torch.randn(4, 32)
+    x[:, :2] = 0  # dead columns make GPTQ write into its Hessian
+    models = [deepcopy(original), deepcopy(original)]
+    for model, offload in zip(models, [False, True], strict=True):
+        if offload:
+            monkeypatch.setitem(COLLECTOR_REGISTRY, "hessian", OffloadingHessian)
+        pipeline = QuantizationPipeline(recipe(teacher).build())
+        pipeline.run(model, [x * 1.2], reference_data=[x])
+        assert not pipeline.last_plan.kept_float
+    assert offloaded == [True]
+    torch.testing.assert_close(
+        models[1][0].weight.decompress_to_u8(),
+        models[0][0].weight.decompress_to_u8(),
+        rtol=0,
+        atol=0,
+    )

@@ -18,6 +18,7 @@ import torch
 from torch import nn
 from torch.types import Device
 
+from ..batches import materialize
 from .collectors import Collector
 
 LOGGER = logging.getLogger(__name__)
@@ -163,9 +164,9 @@ class HessianAccumulator(Collector):
         if self.hessian is None:
             hessian = torch.zeros(n_features, n_features, device=dev)
         else:
-            hessian = self.hessian * self.nsamples / (self.nsamples + batch_size)
-            if not isinstance(hessian, torch.Tensor):
-                hessian = hessian.to_base_tensor()
+            hessian = (
+                materialize(self.hessian) * self.nsamples / (self.nsamples + batch_size)
+            )
             hessian = hessian.to(dev)
 
         self.nsamples += batch_size
