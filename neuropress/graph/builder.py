@@ -18,6 +18,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from ..calibration.batches import call_batch
 from .graph import QGraph
 from .node import QNode, QValue
 
@@ -82,12 +83,7 @@ class RuntimeModuleGraphProvider:
 
         try:
             with torch.inference_mode():
-                if isinstance(example_inputs, dict):
-                    model(**example_inputs)
-                elif isinstance(example_inputs, list | tuple):
-                    model(*example_inputs)
-                else:
-                    model(example_inputs)
+                call_batch(model, example_inputs)
         finally:
             for h in hooks:
                 h.remove()
