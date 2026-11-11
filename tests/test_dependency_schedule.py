@@ -488,3 +488,25 @@ def test_staged_blocks_copy_a_teacher_only_when_a_later_stage_pairs(
         config(teacher), target_paths=("q", "k", "out")
     ).run_block("b", Branches().eval(), [x * 1.1], [x])
     assert len(copies) == int(teacher)
+
+
+@pytest.mark.parametrize("teacher", [False, True])
+def test_later_stage_pairing_is_probed_once_per_block(teacher, monkeypatch):
+    from neuropress.estimators import GPTQEstimator
+
+    prepared = []
+    prepare = GPTQEstimator.prepare
+
+    def spy(self, model):
+        prepared.append(self)
+        return prepare(self, model)
+
+    monkeypatch.setattr(GPTQEstimator, "prepare", spy)
+    model = nn.Sequential(*(nn.Linear(32, 32, bias=False) for _ in range(4))).eval()
+    x = torch.randn(4, 32)
+    result = BlockQuantizationPipeline(
+        config(teacher), target_paths=("0", "1", "2", "3")
+    ).run_block("b", model, [x * 1.1], [x])
+    assert len(result.schedule.stages) == 4
+    # One prepare per stage that runs, plus a single probe for all later ones.
+    assert len(prepared) == 4 + 1

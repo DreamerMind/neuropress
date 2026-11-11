@@ -7,7 +7,6 @@ import hashlib
 import json
 import weakref
 from collections.abc import Callable, Iterable, Iterator
-from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -189,17 +188,22 @@ class BlockQuantizationPipeline:
         path = self.checkpoint_dir / hashlib.sha256(name.encode()).hexdigest()[:20]
         return path, digest.hexdigest()
 
-    def _stage_pairs(self, model: nn.Module, stage: tuple[str, ...] | None) -> bool:
-        """Whether the recipe would request paired statistics for *stage*.
+    def _later_stages_pair(
+        self, model: nn.Module, stages: tuple[tuple[str, ...] | None, ...]
+    ) -> bool:
+        """Whether the recipe would request paired statistics after stage one.
 
-        Probes a separately built estimator, so the one that later runs the
-        stage is prepared exactly as often as in an unprobed run. The probed
-        targets are still float here, as they will be when their stage runs.
+        Selection only filters targets, so one probe over the union of the
+        later stages answers for all of them. It uses a separately built
+        estimator, so the ones that run the stages are prepared exactly as
+        often as in an unprobed run. The probed targets are still float here,
+        as they will be when their stage runs.
         """
+        later = {path for stage in stages[1:] if stage is not None for path in stage}
+        if not later:
+            return False
         estimator = self.config.build().param_estimator
-        with (
-            estimator.select_targets(set(stage)) if stage is not None else nullcontext()
-        ):
+        with estimator.select_targets(later):
             estimator.prepare(model)
             registry = StatisticsRegistry()
             registry.register_requests(estimator.declare_statistics())
@@ -273,9 +277,7 @@ class BlockQuantizationPipeline:
         # one of them will pair; it stays in host memory and reaches the
         # forward device only for the stages that do.
         teacher = (
-            copy.deepcopy(model)
-            if any(self._stage_pairs(model, stage) for stage in stages[1:])
-            else None
+            copy.deepcopy(model) if self._later_stages_pair(model, stages) else None
         )
 
         def place_teacher() -> nn.Module:
