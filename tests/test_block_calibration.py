@@ -712,3 +712,43 @@ def test_disk_offloaded_hessians_quantize_like_in_memory_ones(
         rtol=0,
         atol=0,
     )
+
+
+def test_checkpoint_resumes_when_the_device_is_spelled_differently(tmp_path):
+    torch.manual_seed(92)
+    original = nn.Sequential(nn.Linear(32, 32, bias=False)).eval()
+    x = torch.randn(4, 32)
+    first, second = (
+        BlockQuantizationPipeline(
+            recipe(),
+            forward_device=device,
+            estimation_device=device,
+            checkpoint_dir=tmp_path,
+            run_id="devices",
+        )
+        for device in ("cpu", "cpu:0")
+    )
+    first.run_block("block", deepcopy(original), [x], [x])
+    assert second.run_block("block", deepcopy(original), [x], [x]).resumed
+
+
+def test_checkpoint_fingerprint_is_stable_and_rejects_opaque_leaves():
+    import hashlib
+
+    from neuropress.block_pipeline import _fingerprint
+
+    def digest(value):
+        result = hashlib.sha256()
+        _fingerprint(value, result)
+        return result.hexdigest()
+
+    mixed = {"a": torch.ones(2), 1: None, (2, "b"): torch.float16}
+    assert digest(mixed) == digest(dict(reversed(mixed.items())))
+    assert digest({1: 0}) != digest({"1": 0})
+    assert digest([True]) != digest([1])
+
+    class Cache:
+        pass
+
+    with pytest.raises(TypeError, match="Cannot checkpoint a block stream"):
+        digest({"x": torch.ones(1), "cache": Cache()})

@@ -23,6 +23,22 @@ from .plan import QuantizationPlan
 from .recipe_config import QuantizationRecipeConfig
 from .t2n.model_io import load_quantized_model, save_quantized_model
 
+# Leaves that hash identically across processes. Checkpointed streams are
+# reloaded with torch.load(weights_only=True), which accepts little more than
+# these anyway; a default object repr would embed a memory address and make
+# every restart look like a different run.
+_PLAIN_LEAVES = (
+    type(None),
+    bool,
+    int,
+    float,
+    complex,
+    str,
+    bytes,
+    torch.dtype,
+    torch.device,
+)
+
 
 def _fingerprint(value: Any, digest: Any) -> None:
     if isinstance(value, torch.Tensor):
@@ -30,16 +46,33 @@ def _fingerprint(value: Any, digest: Any) -> None:
         digest.update(str((tensor.dtype, tuple(tensor.shape))).encode())
         digest.update(tensor.reshape(-1).view(torch.uint8).numpy())
     elif isinstance(value, dict):
-        digest.update(b"dict")
-        for key in sorted(value):
-            digest.update(str(key).encode())
-            _fingerprint(value[key], digest)
+        digest.update(str(("dict", len(value))).encode())
+        # Keys of mixed types do not sort against each other; order by type,
+        # then by value within a type, and hash each key with its type so that
+        # 1 and "1" stay distinct.
+        for key, item in sorted(
+            value.items(), key=lambda kv: (type(kv[0]).__qualname__, repr(kv[0]))
+        ):
+            _fingerprint(key, digest)
+            _fingerprint(item, digest)
     elif isinstance(value, list | tuple):
         digest.update(str((type(value).__name__, len(value))).encode())
         for item in value:
             _fingerprint(item, digest)
+    elif isinstance(value, _PLAIN_LEAVES):
+        digest.update(f"{type(value).__qualname__}:{value!r}".encode())
     else:
-        digest.update(repr(value).encode())
+        raise TypeError(
+            f"Cannot checkpoint a block stream holding {type(value).__qualname__}: "
+            "checkpointed batches and outputs must be tensor trees of dicts, "
+            "lists and tuples with plain scalar leaves"
+        )
+
+
+def _device_kind(device: torch.device) -> str:
+    # 'cuda' and 'cuda:0' select the same kernels; only the backend can
+    # change the numerics a checkpoint captured.
+    return device.type
 
 
 @dataclass
@@ -134,7 +167,7 @@ class BlockQuantizationPipeline:
         digest = hashlib.sha256()
         _fingerprint(
             {
-                "schema": 1,
+                "schema": 2,
                 **(
                     {"target_paths": self.target_paths}
                     if self.target_paths is not None
@@ -144,8 +177,8 @@ class BlockQuantizationPipeline:
                 "name": name,
                 "recipe": self.config.model_dump_json(),
                 "input_source": self.input_source,
-                "forward_device": str(self.forward_device),
-                "estimation_device": str(self.estimation_device),
+                "forward_device": _device_kind(self.forward_device),
+                "estimation_device": _device_kind(self.estimation_device),
                 "torch": torch.__version__,
                 "model": model.state_dict(),
                 "student": student,

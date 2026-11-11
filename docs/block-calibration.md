@@ -68,8 +68,12 @@ every statistics collection and the propagated student stream, with or without
 
 Checkpoints store the adapted model and both propagated streams. A completed
 checkpoint is reused only when the float weights, incoming streams, recipe,
-devices and run identity match. Missing completion metadata triggers recomputation;
-a mismatched completed checkpoint raises instead of silently reusing stale data.
+device types and run identity match (`cuda` and `cuda:0` count as the same).
+Missing completion metadata triggers recomputation; a mismatched completed
+checkpoint raises instead of silently reusing stale data. With checkpointing
+enabled, stream leaves must be tensors or plain scalars (`None`, numbers,
+strings, dtypes, devices); any other object raises a `TypeError` up front,
+since its fingerprint would differ between runs and it could not be reloaded.
 Use separate directories for independent runs; concurrent writers are unsupported.
 
 Paired observations are a collector capability, not a GPTQ runner branch.
