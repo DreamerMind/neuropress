@@ -432,3 +432,41 @@ def test_registry_relocates_one_statistic_per_access():
     assert registry.get(a, relocate=False)["hessian"] is hessian
     # Tensor subclasses (e.g. disk-offloaded Hessians) are not materialized.
     assert registry.get(b)["hessian"] is offloaded
+
+
+@pytest.mark.parametrize("ordered", [True, False])
+@pytest.mark.parametrize("dead", [False, True])
+def test_gptq_never_writes_to_a_shared_hessian(ordered, dead):
+    from neuropress.methods.gptq import GPTQCalibration
+    from neuropress.methods.zp_scale_calib import NormZpScaleCalibration
+    from neuropress.qscheme.descriptor import Granularity
+
+    torch.manual_seed(12)
+    layer = nn.Linear(32, 16, bias=False)
+    x = torch.randn(64, 32)
+    if dead:
+        x[:, :3] = 0
+    hessian = 2 * x.t() @ x / x.shape[0]
+
+    def codes(h):
+        gran = Granularity.per_group([32])
+        calib = GPTQCalibration(
+            granularity=gran,
+            possible_quantizers=[
+                NormZpScaleCalibration(nbits=4, symmetric=True, granularity=gran)
+            ],
+            quant_col_in_hessian_diag_magnitude_order=ordered,
+        )
+        calib.weight_tensor = layer.weight
+        calib.module_class = nn.Linear
+        calib.module = layer
+        calib.name = "layer"
+        calib.init()
+        calib.hessian, calib.nsamples = h, x.shape[0]
+        calib.compute_quantization()
+        return calib.quantized_codes
+
+    shared = hessian.clone()
+    actual = codes(shared)
+    torch.testing.assert_close(shared, hessian, rtol=0, atol=0)
+    torch.testing.assert_close(actual, codes(hessian.clone()), rtol=0, atol=0)
