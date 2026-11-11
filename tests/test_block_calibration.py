@@ -609,3 +609,18 @@ def test_shared_weights_are_caught_after_blocks_change_device(alias, monkeypatch
     monkeypatch.setattr(runner, "run_block", round_trip)
     with pytest.raises(ValueError, match="share parameter storage"):
         list(runner.run(enumerate_names(blocks), [torch.randn(2, 32)]))
+
+
+def test_reconstruction_keeps_float32_for_low_precision_weights():
+    torch.manual_seed(15)
+    weight = torch.randn(16, 32).to(torch.bfloat16)
+    x = torch.randn(256, 32)
+    hessian = 2 * x.t() @ x / x.shape[0]
+    # A correction far below bf16 resolution at these weight magnitudes.
+    cross = hessian @ torch.full((32, 16), 1e-4)
+    cross = cross.t().contiguous()
+    fitted = reconstruct_linear_weight(weight, hessian, cross, 0.01)
+    expected = reconstruct_linear_weight(weight.float(), hessian, cross, 0.01)
+    assert fitted.dtype == torch.float32
+    torch.testing.assert_close(fitted, expected, rtol=0, atol=0)
+    assert not torch.equal(fitted, weight.float())

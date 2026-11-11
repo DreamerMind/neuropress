@@ -59,6 +59,10 @@ def reconstruct_linear_weight(
     Minimizes teacher-output squared error plus lambda * ||W_new - W||².
     ``cross`` is the teacher-minus-student output/input product; it must use
     the same normalization as ``hessian``. Lambda is damping times mean(H.diag).
+
+    The result stays float32 whatever the source dtype: GPTQ quantizes in
+    float32, and rounding a bf16/fp16 weight back to its own precision first
+    would erase corrections smaller than that format's resolution.
     """
     if damping <= 0:
         raise ValueError("Reconstruction damping must be positive")
@@ -73,4 +77,4 @@ def reconstruct_linear_weight(
     result = weight.float() + correction
     if not torch.isfinite(result).all():
         raise ValueError("Nonfinite reconstructed weight")
-    return result.to(weight.dtype)
+    return result
