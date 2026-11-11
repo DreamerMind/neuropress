@@ -432,3 +432,37 @@ def test_tolerated_layer_failures_are_reported_not_fatal(target_paths, monkeypat
     assert result.kept_float == {"1": "forced failure"}
     assert hasattr(model[0].weight, "decompress_to_u8")
     assert type(model[1].weight) is nn.Parameter
+
+
+@pytest.mark.parametrize(
+    ("kind", "traced"),
+    [
+        ("same", 1),
+        ("shapes", 2),
+        ("scalars", 2),
+        ("mask", 4),  # value-dependent shapes: every batch is traced
+        ("positions", 1),  # integer indexing keeps a fixed shape
+    ],
+)
+def test_trace_replays_each_batch_structure_once(kind, traced):
+    class Counting(Branches):
+        calls = 0
+
+        def forward(self, x, scale=1.0):
+            Counting.calls += 1
+            if kind == "mask":
+                x = x[x[:, 0] > -10]  # boolean mask: shape depends on values
+            if kind == "positions":
+                x = x + torch.ones(64, 32)[torch.arange(x.shape[0])]
+            return super().forward(x) * scale
+
+    model = Counting().eval()
+    shapes = [2, 2, 3, 3] if kind == "shapes" else [2] * 4
+    batches = [torch.randn(n, 32) for n in shapes]
+    if kind == "scalars":
+        batches = [
+            {"x": b, "scale": s} for b, s in zip(batches, [1.0, 2.0] * 2, strict=True)
+        ]
+    schedule = QuantizationSchedule.trace(model, batches, ["q", "k", "out"])
+    assert schedule.stages == (("q", "k"), ("out",))
+    assert Counting.calls == traced

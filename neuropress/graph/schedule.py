@@ -17,10 +17,54 @@ def _tensors(tree):
     return [value for value in tree_flatten(tree)[0] if isinstance(value, torch.Tensor)]
 
 
+_SCALARS = (bool, int, float, str, type(None))
+
+
+def _structure(batch) -> tuple | None:
+    """Everything except tensor values that can steer a traced forward.
+
+    Value-dependent Python control flow is rejected during tracing, so two
+    batches with equal structure execute the same operations and yield the
+    same dependencies. ``None`` marks a batch whose leaves cannot be compared
+    (arbitrary objects); such batches are always traced.
+    """
+    leaves, spec = tree_flatten(batch)
+    key: list = [str(spec)]
+    for leaf in leaves:
+        if isinstance(leaf, torch.Tensor):
+            key.append(
+                (leaf.shape, leaf.stride(), leaf.dtype, leaf.device, leaf.layout)
+            )
+        elif isinstance(leaf, _SCALARS):
+            key.append((type(leaf), leaf))
+        else:
+            return None
+    return tuple(key)
+
+
+def _value_dependent_shape(func, args) -> bool:
+    """True for ops whose output shape depends on tensor values (e.g. nonzero).
+
+    Downstream Python can branch on such shapes, so equal batch structure no
+    longer implies an equal execution path. Integer-tensor indexing (rotary
+    caches indexed by position ids) has a shape fixed by its index tensors;
+    only boolean masks make ``index.Tensor`` value dependent.
+    """
+    if torch.Tag.dynamic_output_shape not in func.tags:
+        return False
+    if func is torch.ops.aten.index.Tensor:
+        return any(
+            index is not None and index.dtype in (torch.bool, torch.uint8)
+            for index in args[1]
+        )
+    return True
+
+
 class _Dependencies(TorchDispatchMode):
     def __init__(self):
         super().__init__()
         self.values = {}
+        self.value_dependent_shapes = False
 
     def sources(self, tree):
         result = set()
@@ -43,6 +87,8 @@ class _Dependencies(TorchDispatchMode):
             raise ValueError(
                 "Dependency tracing does not support tensor-dependent Python control flow"
             )
+        if not self.value_dependent_shapes and _value_dependent_shape(func, args):
+            self.value_dependent_shapes = True
         sources = self.sources((args, kwargs))
         result = func(*args, **(kwargs or {}))
         self.tag(result, sources)
@@ -71,6 +117,12 @@ class QuantizationSchedule:
 
         Functional attention, activations, reshapes and residual additions retain
         provenance. Dependencies are unioned across batches before ranking.
+        Batches whose structure (tree, shapes, strides, dtypes, devices and
+        scalar leaves) matches an already traced batch are skipped, since they
+        replay the same operations; this keeps a fixed-length calibration set
+        at one traced forward per block. Batches are always traced when a
+        prior trace of the same structure produced value-dependent shapes
+        (nonzero, boolean masks), as in token routing.
         """
         targets = tuple(targets)
         if not targets or len(set(targets)) != len(targets):
@@ -97,8 +149,12 @@ class QuantizationSchedule:
                 storages[key] = name
         dependencies = {name: set() for name in targets}
         count = 0
+        traced = set()
         for batch in batches:
             count += 1
+            structure = _structure(batch)
+            if structure is not None and structure in traced:
+                continue
             tracker = _Dependencies()
             for name, module in modules.items():
                 tracker.tag(tuple(module.parameters()), {name})
@@ -144,6 +200,8 @@ class QuantizationSchedule:
                 raise ValueError(
                     f"Targets not executed in a calibration batch: {set(targets) - seen}"
                 )
+            if structure is not None and not tracker.value_dependent_shapes:
+                traced.add(structure)
         if not count:
             raise ValueError("Dependency tracing requires calibration batches")
         stages = []

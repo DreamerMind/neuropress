@@ -133,6 +133,13 @@ by the recipe; assignments outside the selected weight stage are rejected. A
 target the estimator tolerates failing on (such as a GPTQ Cholesky failure) counts
 as handled: it stays float and is reported in `kept_float`, as in whole-block mode.
 
+Batches with the same structure (tree, shapes, strides, dtypes, devices and scalar
+leaves) replay the same operations, because tensor-dependent branches are
+rejected, so the trace runs once per distinct structure. A fixed-length
+calibration set costs one traced forward per block. Forwards that produce
+value-dependent shapes (`nonzero`, boolean masks, token routing) are traced on
+every batch.
+
 Existing estimators with `filter_fn` support stage selection while preserving
 format filters. Composite estimators forward selection to each member. Future
 estimators can implement `select_targets(paths)` as a context manager, restoring
