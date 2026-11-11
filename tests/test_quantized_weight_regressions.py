@@ -1169,3 +1169,20 @@ def test_lowered_embedding_returns_the_replaced_dtype(format_name):
     assert out.dtype == torch.float32
     # The kernels decode through the f16 scale dtype.
     torch.testing.assert_close(out, expected[ids], rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_vq_gptq_correction_leaves_the_callers_hessian_untouched():
+    from neuropress.methods.vq_gptq import VQGPTQCorrector
+
+    torch.manual_seed(5)
+    module = nn.Linear(16, 8, bias=False)
+    x = torch.randn(64, 16, device="cuda")
+    x[:, :2] = 0  # dead columns: the corrector patches their diagonal
+    full_h = x.t() @ x
+    saved = full_h.clone()
+    centroids = torch.randn(16, 4, device="cuda")
+    VQGPTQCorrector(vector_len=4).correct(
+        "layer", module, centroids, full_h, torch.device("cuda")
+    )
+    torch.testing.assert_close(full_h, saved, rtol=0, atol=0)

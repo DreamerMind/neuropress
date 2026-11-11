@@ -370,6 +370,12 @@ class StatisticsRegistry:
         *relocate* is false (e.g. to persist the statistic as collected).
         Tensor subclasses such as disk-offloaded Hessians are returned as-is;
         their consumers materialize them on demand.
+
+        Treat the result as read-only: it is the stored statistic itself when
+        it already lives on the target device and a copy otherwise, so a write
+        would change the registry in one setup and not the other. Copy before
+        writing. Results are not memoized, so each relocating call allocates;
+        consumers fetch a statistic once per layer.
         """
         dedupe_key = f"{request.target_key}::{request.stat_type}"
         value = self._stats.get(dedupe_key)

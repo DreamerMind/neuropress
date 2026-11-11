@@ -122,8 +122,13 @@ class VQGPTQCorrector:
             H = H[perm][:, perm]
 
         dead = H.diagonal() == 0
-        H.diagonal()[dead] = 1.0
-        w2d[:, dead] = 0.0
+        if dead.any():
+            if H is full_h:
+                # Already float32 on the device, so H is the caller's (often
+                # a registry statistic); patch a copy instead.
+                H = H.clone()
+            H.diagonal()[dead] = 1.0
+            w2d[:, dead] = 0.0
 
         try:
             U = self.cholesky_inv_upper(H)
