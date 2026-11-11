@@ -185,14 +185,19 @@ class StatisticsRegistry:
         *,
         reference_data: Iterable | None = None,
         reference_model: nn.Module | None = None,
+        reference_device: torch.device | str | None = "cpu",
     ) -> None:
         """Run a single forward pass over *calibration_data*, populating stats.
 
         Collectors are selected through COLLECTOR_REGISTRY. Paired collectors
         additionally require reference_data aligned batch-for-batch. Module paths
         and invocation order must match the reference_model (default: model).
-        Teacher outputs are snapshotted on CPU for one batch at a time. Hooks
-        are removed even when pairing or a forward pass fails.
+        Teacher outputs of one batch are snapshotted on *reference_device* until
+        the student pass consumes them. The CPU default bounds device memory
+        when every linear of a whole model pairs; ``None`` keeps them where
+        the teacher produced them, which saves two transfers per paired output
+        when one block's worth fits on the device. Hooks are removed even when
+        pairing or a forward pass fails.
         """
         hooks: list[Any] = []
         module_map = dict(model.named_modules())
@@ -229,7 +234,9 @@ class StatisticsRegistry:
 
             def reference_hook(module, inputs, output, _key=key):
                 if not collecting_student:
-                    observations[_key].append(move_batch(output, "cpu", copy=True))
+                    observations[_key].append(
+                        move_batch(output, reference_device, copy=True)
+                    )
 
             hooks.append(
                 teacher_modules[self._requests[key].target_key].register_forward_hook(

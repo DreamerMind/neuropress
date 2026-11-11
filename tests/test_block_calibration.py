@@ -797,3 +797,42 @@ def test_only_paired_collection_leaves_inference_mode(teacher, monkeypatch):
     )
     # Paired samples may feed autograd later, which rejects inference tensors.
     assert modes == [not teacher]
+
+
+def test_teacher_snapshots_can_stay_on_the_teachers_device(monkeypatch):
+    seen = []
+
+    class Record(PairedCollector):
+        def update_pair(self, inputs, output, reference):
+            seen.append(reference.device.type)
+
+        def result(self):
+            return {}
+
+    monkeypatch.setitem(COLLECTOR_REGISTRY, "record", Record)
+    model = nn.Sequential(nn.Linear(8, 8)).to("meta")
+    x = torch.empty(2, 8, device="meta")
+    registry = StatisticsRegistry()
+    registry.register_requests([StatisticRequest(target_key="0", stat_type="record")])
+    # The default parks snapshots on the host, which a meta tensor (no data)
+    # would refuse; None keeps them where the teacher produced them.
+    registry.collect(model, [x], reference_data=[x], reference_device=None)
+    assert seen == ["meta"]
+
+
+def test_block_runs_keep_teacher_snapshots_on_the_forward_device(monkeypatch):
+    import neuropress.block_pipeline as block_pipeline
+
+    devices = []
+    run = block_pipeline.QuantizationPipeline.run
+
+    def spy(self, *args, **kwargs):
+        devices.append(kwargs["reference_device"])
+        return run(self, *args, **kwargs)
+
+    monkeypatch.setattr(block_pipeline.QuantizationPipeline, "run", spy)
+    x = torch.randn(4, 32)
+    BlockQuantizationPipeline(recipe(True)).run_block(
+        "b", nn.Sequential(nn.Linear(32, 16, bias=False)).eval(), [x * 1.1], [x]
+    )
+    assert devices == [None]

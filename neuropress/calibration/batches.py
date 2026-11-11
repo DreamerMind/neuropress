@@ -23,7 +23,7 @@ def materialize(tensor: torch.Tensor) -> torch.Tensor:
 
 def move_batch(
     value: Any,
-    device: torch.device | str,
+    device: torch.device | str | None,
     *,
     copy: bool = False,
     tensor_subclasses: bool = True,
@@ -40,10 +40,14 @@ def move_batch(
     With ``tensor_subclasses=False``, only plain ``torch.Tensor`` and
     ``nn.Parameter`` leaves move and subclasses are returned untouched: for
     ``OffloadedTensor``, even ``.detach()`` reloads the data from disk.
+    ``device=None`` leaves every tensor on its own device (with ``copy``, a
+    clone there).
     """
     if isinstance(value, torch.Tensor):
         if not tensor_subclasses and type(value) not in (torch.Tensor, nn.Parameter):
             return value
+        if device is None:
+            return value.detach().clone() if copy else value.detach()
         return value.detach().to(device, copy=copy)
     options = {"copy": copy, "tensor_subclasses": tensor_subclasses}
     if isinstance(value, dict):

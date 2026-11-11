@@ -316,6 +316,9 @@ class BlockQuantizationPipeline:
                         move_batch(batch, self.forward_device) for batch in reference
                     ),
                     reference_model=place_teacher if index else None,
+                    # One block's teacher outputs fit next to the block, and
+                    # parking them on the host would cost two transfers each.
+                    reference_device=None,
                     estimation_device=self.estimation_device,
                     collection_model=observed,
                     target_paths=set(stage) if stage is not None else None,

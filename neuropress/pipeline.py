@@ -66,6 +66,7 @@ class QuantizationPipeline:
         *,
         reference_data: Iterable | None = None,
         reference_model: nn.Module | Callable[[], nn.Module] | None = None,
+        reference_device: str | torch.device | None = "cpu",
         estimation_device: str | torch.device | None = None,
         collection_model: nn.Module | None = None,
         target_paths: set[str] | None = None,
@@ -87,6 +88,9 @@ class QuantizationPipeline:
                 A zero-argument callable is invoked only when the estimator
                 requests paired statistics, so a teacher that is expensive to
                 place on the forward device is not placed for nothing.
+            reference_device: Where teacher outputs wait for the student pass
+                (see :meth:`StatisticsRegistry.collect`); ``None`` keeps them
+                on the teacher's device.
             estimation_device: Move the model and statistics here after collection.
                 The returned model remains on this device. The estimator is
                 prepared again only if this actually moves the model.
@@ -164,6 +168,7 @@ class QuantizationPipeline:
                 calibration_iter,
                 reference_data=reference_data,
                 reference_model=teacher,
+                reference_device=reference_device,
             )
             if estimation_device is not None:
                 registry.to(estimation_device)

@@ -84,8 +84,12 @@ Register a `PairedCollector` in `COLLECTOR_REGISTRY` and declare its statistic i
 an estimator to receive aligned student inputs/output and teacher output.
 Ordinary and paired requests share the same collection pass, including in
 `CompositeEstimator` recipes. `QuantizationPipeline.run` also accepts
-`reference_data`, `reference_model` and `estimation_device` directly. Nested
-composite configs preserve their full estimator-specific JSON fields.
+`reference_data`, `reference_model` and `estimation_device` directly. Teacher
+outputs wait for the student pass on `reference_device`: the host by default,
+which bounds device memory when a whole model pairs every linear. Block runs pass
+`None` to keep one block's teacher outputs on the forward device, which saves a
+round trip per paired output and batch. Nested composite configs preserve their
+full estimator-specific JSON fields.
 Use `target_key=""` to collect paired observations at the block root for a
 whole-block estimator. Collection and stream propagation run without gradients;
 estimation can use autograd, including differentiation through nonlinear blocks.
