@@ -588,3 +588,24 @@ def test_estimator_is_rebound_only_when_the_model_moves(device, prepares):
         nn.Linear(4, 4).eval(), [torch.randn(2, 4)], estimation_device=device
     )
     assert bound == ["cpu", device][:prepares]
+
+
+@pytest.mark.parametrize("alias", [False, True])
+def test_shared_weights_are_caught_after_blocks_change_device(alias, monkeypatch):
+    blocks = [nn.Sequential(nn.Linear(32, 32, bias=False)).eval() for _ in range(3)]
+    shared = blocks[0][0].weight
+    blocks[2][0].weight = (
+        nn.Parameter(shared.detach().view_as(shared)) if alias else shared
+    )
+    runner = BlockQuantizationPipeline(recipe())
+    run_block = runner.run_block
+
+    def round_trip(name, block, *args):
+        # Moving to a forward device and back gives every parameter new
+        # storage, exactly like a cuda round trip does on a GPU host.
+        block.double().float()
+        return run_block(name, block, *args)
+
+    monkeypatch.setattr(runner, "run_block", round_trip)
+    with pytest.raises(ValueError, match="share parameter storage"):
+        list(runner.run(enumerate_names(blocks), [torch.randn(2, 32)]))

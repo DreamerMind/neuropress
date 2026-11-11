@@ -308,12 +308,21 @@ class BlockQuantizationPipeline:
         reference = [move_batch(batch, "cpu") for batch in calibration_data]
         student = reference
         seen = set()
+        # Two records, because run_block moves each block to the forward
+        # device and back, which gives every parameter fresh storage: identity
+        # catches a Parameter object reused by a later block, and the storage
+        # snapshot catches distinct Parameters viewing the same memory (those
+        # keep the original storage alive, so its weakref stays valid).
+        # Keyed by id with a liveness check: Tensor.__eq__ is elementwise, so
+        # set membership cannot compare Parameters by identity.
+        visited: dict[int, weakref.ref] = {}
         parameters = {}
         for name, block in blocks:
             if name in seen:
                 raise ValueError(f"Duplicate block name: {name}")
             seen.add(name)
             current_parameters = {}
+            current_visited = {}
             for parameter in block.parameters():
                 if parameter.numel() == 0:
                     continue
@@ -322,12 +331,17 @@ class BlockQuantizationPipeline:
                     parameter.untyped_storage().data_ptr(),
                 )
                 previous = parameters.get(storage)
-                if previous is not None and previous() is not None:
+                reused = visited.get(id(parameter))
+                if (reused is not None and reused() is parameter) or (
+                    previous is not None and previous() is not None
+                ):
                     raise ValueError(
                         "Blocks must not share parameter storage across boundaries"
                     )
                 current_parameters[storage] = weakref.ref(parameter.untyped_storage())
+                current_visited[id(parameter)] = weakref.ref(parameter)
             parameters.update(current_parameters)
+            visited.update(current_visited)
             result = self.run_block(name, block, student, reference)
             student = [
                 propagate(batch, output) if propagate else output
