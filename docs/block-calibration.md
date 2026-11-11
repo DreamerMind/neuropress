@@ -97,6 +97,13 @@ Collections without paired statistics run under `torch.inference_mode()`, so
 their statistics are inference tensors; paired collection uses `torch.no_grad()`
 so that paired samples stay usable in autograd.
 
+Collectors receive a module's call arguments in declaration order, with keyword
+arguments placed where the parameter is declared and `*args`/`**kwargs`
+expanded. An unpaired collector takes the first of them, so a module called only
+with keywords (`m(hidden_states=x)`) is observed on its input, like `m(x)`.
+Earlier versions fell back to the output for keyword-only calls, so activation
+statistics of such modules change.
+
 ## Dependency stages within a block
 
 Set `target_paths` on `BlockQuantizationPipeline` to alternate collection and
