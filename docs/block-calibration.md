@@ -93,6 +93,9 @@ full estimator-specific JSON fields.
 Use `target_key=""` to collect paired observations at the block root for a
 whole-block estimator. Collection and stream propagation run without gradients;
 estimation can use autograd, including differentiation through nonlinear blocks.
+Collections without paired statistics run under `torch.inference_mode()`, so
+their statistics are inference tensors; paired collection uses `torch.no_grad()`
+so that paired samples stay usable in autograd.
 
 ## Dependency stages within a block
 
