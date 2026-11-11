@@ -557,3 +557,34 @@ def test_block_streams_are_plain_trees_whether_fresh_or_resumed(tmp_path):
         assert type(a.student_outputs[0]) is dict
         assert type(b.student_outputs[0]) is dict
         torch.testing.assert_close(a.student_outputs, b.student_outputs)
+
+
+@pytest.mark.parametrize(("device", "prepares"), [("cpu", 1), ("meta", 2)])
+def test_estimator_is_rebound_only_when_the_model_moves(device, prepares):
+    from neuropress.estimator import QuantizationParamEstimator
+    from neuropress.estimator_configs import EstimatorConfig
+    from neuropress.plan import QuantizationPlan
+
+    bound = []
+
+    class Counting(QuantizationParamEstimator):
+        def prepare(self, model):
+            bound.append(next(model.parameters()).device.type)
+
+        def declare_statistics(self):
+            return []
+
+        def estimate(self, graph, registry, recipe):
+            return QuantizationPlan()
+
+    class CountingConfig(EstimatorConfig):
+        type: str = "test_counting"
+
+        def build(self):
+            return Counting()
+
+    config = QuantizationRecipeConfig(estimator=CountingConfig(), kernel_lowering=None)
+    QuantizationPipeline(config.build()).run(
+        nn.Linear(4, 4).eval(), [torch.randn(2, 4)], estimation_device=device
+    )
+    assert bound == ["cpu", device][:prepares]

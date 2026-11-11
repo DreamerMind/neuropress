@@ -28,6 +28,18 @@ from .recipe import QuantizationRecipe
 LOGGER = logging.getLogger(__name__)
 
 
+def _resides_on(model: nn.Module, device: str | torch.device) -> bool:
+    """True if every parameter and buffer of *model* is already on *device*."""
+    device = torch.device(device)
+    if device.index is None and device.type != "cpu":
+        # "cuda" means the current device; compare against what .to() picks.
+        device = torch.empty(0, device=device).device
+    return all(
+        tensor.device == device
+        for tensor in itertools.chain(model.parameters(), model.buffers())
+    )
+
+
 class QuantizationPipeline:
     """Orchestrates the full quantization flow.
 
@@ -76,7 +88,8 @@ class QuantizationPipeline:
                 requests paired statistics, so a teacher that is expensive to
                 place on the forward device is not placed for nothing.
             estimation_device: Move the model and statistics here after collection.
-                The returned model remains on this device.
+                The returned model remains on this device. The estimator is
+                prepared again only if this actually moves the model.
             collection_model: Optional inference view used for graph/statistics forwards.
                 It must preserve target module paths and their unadapted weights.
             target_paths: Optional estimator selection and assignment boundary.
@@ -153,9 +166,13 @@ class QuantizationPipeline:
                 reference_model=teacher,
             )
             if estimation_device is not None:
-                model.to(estimation_device)
                 registry.to(estimation_device)
-                estimator.prepare(model)
+                # Rebind only when the move relocates something: prepare()
+                # records device-dependent state, and calling it again for a
+                # no-op move would only expose non-idempotent estimators.
+                if not _resides_on(model, estimation_device):
+                    model.to(estimation_device)
+                    estimator.prepare(model)
 
             # -- Step 5: Estimate QSchemes -------------------------------------
             LOGGER.info("Step 5: Estimating QSchemes")
