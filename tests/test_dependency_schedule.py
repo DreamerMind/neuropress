@@ -510,3 +510,75 @@ def test_later_stage_pairing_is_probed_once_per_block(teacher, monkeypatch):
     assert len(result.schedule.stages) == 4
     # One prepare per stage that runs, plus a single probe for all later ones.
     assert len(prepared) == 4 + 1
+
+
+class Tracked(Branches):
+    """Record device moves; 'cpu:0' stands in for an accelerator on CPU hosts."""
+
+    def __init__(self):
+        super().__init__()
+        self.location = "cpu"
+        self.moves = 0
+
+    def _go(self, location):
+        if location != self.location:
+            self.moves += 1
+            self.location = location
+
+    def to(self, *args, **kwargs):
+        device = torch._C._nn._parse_to(*args, **kwargs)[0]
+        if device is not None:
+            self._go(str(device))
+        return super().to(*args, **kwargs)
+
+    def cpu(self):
+        self._go("cpu")
+        return super().cpu()
+
+
+def test_block_crosses_to_the_forward_device_once_per_run():
+    model = Tracked().eval()
+    x = torch.randn(4, 32)
+    result = BlockQuantizationPipeline(
+        config(),
+        forward_device="cpu:0",
+        estimation_device="cpu:0",
+        target_paths=("q", "k", "out"),
+    ).run_block("b", model, [x * 1.1], [x])
+    assert len(result.schedule.stages) == 2
+    # Reference forward, trace, both stages and the student forward share one
+    # residency on the forward device; the block is handed back on the host.
+    assert model.moves == 2
+    assert model.location == "cpu"
+
+
+def test_failed_stage_returns_every_placed_module_to_the_host(monkeypatch):
+    import neuropress.block_pipeline as block_pipeline
+
+    views, teachers = [], []
+    run = block_pipeline.QuantizationPipeline.run
+
+    def fail_second_stage(self, model, data, *, reference_model=None, **kwargs):
+        if reference_model is not None:
+            teachers.append(reference_model())
+            raise RuntimeError("stage failed")
+        return run(self, model, data, reference_model=reference_model, **kwargs)
+
+    def inference_model(model):
+        views.append(deepcopy(model))
+        return views[-1]
+
+    monkeypatch.setattr(block_pipeline.QuantizationPipeline, "run", fail_second_stage)
+    model = Tracked().eval()
+    x = torch.randn(4, 32)
+    with pytest.raises(RuntimeError, match="stage failed"):
+        BlockQuantizationPipeline(
+            config(True),
+            forward_device="cpu:0",
+            estimation_device="cpu:0",
+            target_paths=("q", "k", "out"),
+            inference_model=inference_model,
+        ).run_block("b", model, [x * 1.1], [x])
+    assert len(views) == 2 and len(teachers) == 1
+    # Earlier views are released rather than moved; only this test holds them.
+    assert [m.location for m in (model, views[-1], *teachers)] == ["cpu"] * 3

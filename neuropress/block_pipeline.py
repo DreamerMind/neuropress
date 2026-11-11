@@ -150,13 +150,18 @@ class BlockQuantizationPipeline:
     @torch.no_grad()
     def forward(self, model: nn.Module, batches: list[Any]) -> list[Any]:
         """Run batches on the forward device and return detached CPU outputs."""
+        outputs = self._forward(model, batches)
+        model.cpu()
+        return outputs
+
+    @torch.no_grad()
+    def _forward(self, model: nn.Module, batches: list[Any]) -> list[Any]:
+        # Like forward(), but leaves the model on the forward device.
         model.to(self.forward_device).eval()
-        outputs = [
+        return [
             move_batch(call_batch(model, move_batch(batch, self.forward_device)), "cpu")
             for batch in batches
         ]
-        model.cpu()
-        return outputs
 
     def _checkpoint(
         self, name: str, model: nn.Module, student: list[Any], reference: list[Any]
@@ -209,6 +214,15 @@ class BlockQuantizationPipeline:
             registry.register_requests(estimator.declare_statistics())
             return registry.requires_pairing()
 
+    def _inference_view(self, model: nn.Module) -> nn.Module:
+        """Return the module that statistics and the student forward observe."""
+        if self.inference_model is None:
+            return model
+        # Build the view from a host block, so that a copying view never holds
+        # two copies of the block on the forward device at once.
+        model.cpu()
+        return self.inference_model(model)
+
     def run_block(
         self,
         name: str,
@@ -256,40 +270,43 @@ class BlockQuantizationPipeline:
                 else None,
             )
 
-        reference_outputs = self.forward(model, reference)
+        # The block stays on the forward device from the reference forward to
+        # the student forward: every phase in between needs it there, or on the
+        # estimation device, where QuantizationPipeline.run moves it itself. It
+        # returns to the host only where a copy is taken from it, and on
+        # failure the finally clause brings back everything placed on a device.
         source = reference if self.input_source == "float" else student
         schedule = None
-        # Without target_paths the whole block is one stage that selects
-        # every estimator target, exactly like a whole-model pipeline run.
-        stages: tuple[tuple[str, ...] | None, ...] = (None,)
-        if self.target_paths is not None:
-            model.to(self.forward_device).eval()
-            schedule = QuantizationSchedule.trace(
-                model,
-                (move_batch(batch, self.forward_device) for batch in source),
-                self.target_paths,
-            )
-            model.cpu()
-            stages = schedule.stages
-        # The first stage collects before any adaptation, so the observed block
-        # is its own float teacher. Later stages see adapted weights and need a
-        # frozen copy, taken now (before stage one adapts anything) but only if
-        # one of them will pair; it stays in host memory and reaches the
-        # forward device only for the stages that do.
-        teacher = (
-            copy.deepcopy(model) if self._later_stages_pair(model, stages) else None
-        )
+        teacher = None
+        observed = None
+        plan = QuantizationPlan()
 
         def place_teacher() -> nn.Module:
             assert teacher is not None
             return teacher.to(self.forward_device).eval()
 
-        plan = QuantizationPlan()
         try:
-            for index, stage in enumerate(stages):
-                observed = (
-                    self.inference_model(model) if self.inference_model else model
+            reference_outputs = self._forward(model, reference)
+            # Without target_paths the whole block is one stage that selects
+            # every estimator target, exactly like a whole-model pipeline run.
+            stages: tuple[tuple[str, ...] | None, ...] = (None,)
+            if self.target_paths is not None:
+                schedule = QuantizationSchedule.trace(
+                    model,
+                    (move_batch(batch, self.forward_device) for batch in source),
+                    self.target_paths,
                 )
+                stages = schedule.stages
+            # The first stage collects before any adaptation, so the observed
+            # block is its own float teacher. Later stages see adapted weights
+            # and need a frozen copy, taken now (before stage one adapts
+            # anything) but only if one of them will pair; it is copied in host
+            # memory and reaches the forward device only for stages that pair.
+            if self._later_stages_pair(model, stages):
+                model.cpu()
+                teacher = copy.deepcopy(model)
+            for index, stage in enumerate(stages):
+                observed = self._inference_view(model)
                 observed.to(self.forward_device).eval()
                 pipeline = QuantizationPipeline(self.config.build())
                 pipeline.run(
@@ -304,18 +321,18 @@ class BlockQuantizationPipeline:
                     target_paths=set(stage) if stage is not None else None,
                 )
                 plan.kept_float.update(pipeline.last_plan.kept_float)
-                observed.cpu()
-                model.cpu()
+                # A separate inference view is rebuilt for the next stage, so
+                # dropping it frees its device memory without a transfer.
+                observed = None
                 if teacher is not None:
                     teacher.cpu()
+            observed = self._inference_view(model)
+            student_outputs = self._forward(observed, student)
+            observed = None
         finally:
-            if teacher is not None:
-                teacher.cpu()
-        model.cpu()
-        inference = (
-            self.inference_model(model) if self.inference_model is not None else model
-        )
-        student_outputs = self.forward(inference, student)
+            for module in (observed, teacher, model):
+                if module is not None:
+                    module.cpu()
         result = BlockCalibrationResult(
             name,
             model,

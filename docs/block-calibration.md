@@ -3,8 +3,11 @@
 `BlockQuantizationPipeline` runs existing recipes on a lazy sequence of independent
 float blocks. It carries aligned reference and quantized-upstream activation
 streams, collects statistics on a forward device, and estimates/packs weights on
-an independently selected device. The caller supplies block boundaries and any
-batch propagation convention; the runner has no GPTQ or model-family dispatch.
+an independently selected device. A block moves to the forward device once and
+stays there (or on the estimation device) until its student stream is computed,
+then returns to the host, also when a stage fails. The caller supplies block
+boundaries and any batch propagation convention; the runner has no GPTQ or
+model-family dispatch.
 
 There are three useful configurations:
 
