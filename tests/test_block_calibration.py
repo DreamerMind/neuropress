@@ -470,3 +470,52 @@ def test_gptq_never_writes_to_a_shared_hessian(ordered, dead):
     actual = codes(shared)
     torch.testing.assert_close(shared, hessian, rtol=0, atol=0)
     torch.testing.assert_close(actual, codes(hessian.clone()), rtol=0, atol=0)
+
+
+class _Variadic(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.inner = nn.Linear(32, 16, bias=False)
+
+    def forward(self, *args, **kwargs):
+        return self.inner(*args, **kwargs)
+
+
+class _Keyword(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.inner = nn.Linear(32, 16, bias=False)
+
+    def forward(self, hidden_states, scale=1.0):
+        return self.inner(hidden_states) * scale
+
+
+@pytest.mark.parametrize("wrapper", [_Variadic, _Keyword])
+def test_keyword_calls_feed_collectors_like_positional_calls(wrapper, monkeypatch):
+    import neuropress.calibration.probe.registry as registry_module
+
+    lookups = []
+    signature = registry_module.inspect.signature
+
+    def counting(fn):
+        lookups.append(fn)
+        return signature(fn)
+
+    monkeypatch.setattr(registry_module.inspect, "signature", counting)
+    torch.manual_seed(13)
+    module = wrapper().eval()
+    x = [torch.randn(6, 32) for _ in range(3)]
+    request = StatisticRequest(target_key="", stat_type="hessian")
+
+    def hessian(batches):
+        registry = StatisticsRegistry()
+        registry.register_requests([request])
+        registry.collect(module, batches)
+        return registry.get(request)["hessian"]
+
+    keyword = hessian(
+        [{"hidden_states": b} if wrapper is _Keyword else {"input": b} for b in x]
+    )
+    assert keyword is not None
+    assert len(lookups) == 1  # once per hook, not once per call
+    torch.testing.assert_close(keyword, hessian(x), rtol=0, atol=0)

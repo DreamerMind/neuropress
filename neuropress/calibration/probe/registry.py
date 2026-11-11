@@ -25,6 +25,42 @@ from .collectors import (
 )
 
 
+def _forward_signature(module: nn.Module) -> inspect.Signature | None:
+    try:
+        return inspect.signature(module.forward)
+    except (TypeError, ValueError):  # builtins / C extensions
+        return None
+
+
+def _positional_inputs(
+    signature: inspect.Signature | None, args: tuple, kwargs: dict
+) -> tuple:
+    """Flatten a call into its arguments in declaration order.
+
+    Keyword arguments land where the parameter is declared, so a module
+    called as ``m(hidden_states=x)`` yields ``x`` first just like ``m(x)``.
+    Variadic ``*args`` and ``**kwargs`` are expanded in place rather than
+    surfacing as one tuple or dict that no collector can consume.
+    """
+    if signature is not None:
+        try:
+            bound = signature.bind(*args, **kwargs)
+        except TypeError:
+            pass
+        else:
+            flat: list[Any] = []
+            for name, value in bound.arguments.items():
+                kind = signature.parameters[name].kind
+                if kind is inspect.Parameter.VAR_POSITIONAL:
+                    flat.extend(value)
+                elif kind is inspect.Parameter.VAR_KEYWORD:
+                    flat.extend(value.values())
+                else:
+                    flat.append(value)
+            return tuple(flat)
+    return (*args, *kwargs.values())
+
+
 def _relocate(value: Any, device: torch.device) -> Any:
     """Copy plain tensors inside a statistic to *device*, sharing nothing else.
 
@@ -254,16 +290,25 @@ class StatisticsRegistry:
                 if hasattr(collector, "module") and collector.module is None:
                     collector.module = mod
 
+                signature_memo: list[inspect.Signature | None] = []
+
                 def _act_hook(
-                    module, inputs, kwargs, outputs, _col=collector, _key=dedupe_key
+                    module,
+                    inputs,
+                    kwargs,
+                    outputs,
+                    _col=collector,
+                    _key=dedupe_key,
+                    _signature=signature_memo,
                 ):
                     if not collecting_student:
                         return
                     if kwargs:
-                        bound = inspect.signature(module.forward).bind(
-                            *inputs, **kwargs
-                        )
-                        inputs = tuple(bound.arguments.values())
+                        # Resolved once per hook: introspection is too slow
+                        # for every call in the calibration loop.
+                        if not _signature:
+                            _signature.append(_forward_signature(module))
+                        inputs = _positional_inputs(_signature[0], inputs, kwargs)
                     if isinstance(_col, PairedCollector):
                         if not observations[_key]:
                             raise ValueError(
