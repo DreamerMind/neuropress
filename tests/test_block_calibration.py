@@ -412,3 +412,23 @@ def test_checkpoint_resume_restores_eval_mode_for_all_modules(tmp_path):
         torch.testing.assert_close(
             resumed.model(x), resumed.student_outputs[0], rtol=0, atol=0
         )
+
+
+def test_registry_relocates_one_statistic_per_access():
+    class Offloaded(torch.Tensor):
+        pass
+
+    registry = StatisticsRegistry()
+    hessian = torch.eye(4)
+    offloaded = torch.Tensor._make_subclass(Offloaded, torch.eye(4))
+    registry.set_stat("a", "hessian", {"hessian": hessian, "nsamples": 3})
+    registry.set_stat("b", "hessian", {"hessian": offloaded, "nsamples": 3})
+    registry.to("meta")
+    a = StatisticRequest(target_key="a", stat_type="hessian")
+    b = StatisticRequest(target_key="b", stat_type="hessian")
+    assert registry.get(a)["hessian"].device.type == "meta"
+    assert registry.get(a)["nsamples"] == 3
+    # The collected original stays where the collector left it.
+    assert registry.get(a, relocate=False)["hessian"] is hessian
+    # Tensor subclasses (e.g. disk-offloaded Hessians) are not materialized.
+    assert registry.get(b)["hessian"] is offloaded

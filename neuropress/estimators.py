@@ -417,7 +417,8 @@ class GPTQEstimator(QuantizationParamEstimator):
                 # Save hessian to cache for future runs (skip if already cached).
                 if cached_h is None:
                     stat = registry.get(
-                        StatisticRequest(target_key=name, stat_type="hessian")
+                        StatisticRequest(target_key=name, stat_type="hessian"),
+                        relocate=False,
                     )
                     if stat is not None:
                         cache.save("hessian", name, stat)
@@ -426,7 +427,8 @@ class GPTQEstimator(QuantizationParamEstimator):
                     stat = registry.get(
                         StatisticRequest(
                             target_key=name, stat_type="linear_reconstruction"
-                        )
+                        ),
+                        relocate=False,
                     )
                     if stat is not None:
                         cache.save("linear_reconstruction", name, stat)

@@ -25,6 +25,24 @@ from .collectors import (
 )
 
 
+def _relocate(value: Any, device: torch.device) -> Any:
+    """Copy plain tensors inside a statistic to *device*, sharing nothing else.
+
+    Only exact ``torch.Tensor``/``nn.Parameter`` leaves move: calling ``.to``
+    or ``.detach`` on a tensor subclass like ``OffloadedTensor`` reloads it
+    from disk, which is what deferred relocation exists to avoid.
+    """
+    if type(value) in (torch.Tensor, nn.Parameter):
+        return value.detach().to(device)
+    if isinstance(value, dict):
+        return {key: _relocate(item, device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_relocate(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_relocate(item, device) for item in value)
+    return value
+
+
 class StatisticsRegistry:
     """Collect and store calibration statistics.
 
@@ -45,6 +63,7 @@ class StatisticsRegistry:
         self._requests: dict[str, StatisticRequest] = {}  # key → request
         self._stats: dict[str, Any] = {}  # key → statistic value
         self._collectors: dict[str, Collector] = {}  # pre-registered collectors
+        self._device: torch.device | None = None  # see to()
 
     # ------------------------------------------------------------------
     # Registration
@@ -274,8 +293,15 @@ class StatisticsRegistry:
     # ------------------------------------------------------------------
 
     def to(self, device: torch.device | str) -> StatisticsRegistry:
-        """Move collected tensor statistics before estimation on another device."""
-        self._stats = move_batch(self._stats, device)
+        """Deliver statistics on *device* from now on, one statistic per access.
+
+        Nothing is moved here: :meth:`get` returns a copy on *device* and the
+        registry keeps the collected original where its collector left it. A
+        Hessian that ``HessianAccumulator`` kept on the CPU (or offloaded to
+        disk) therefore reaches the estimation device only while its own layer
+        is estimated, instead of every Hessian of the model at once.
+        """
+        self._device = torch.device(device)
         return self
 
     def set_stat(self, target_key: str, stat_type: str, value: Any) -> None:
@@ -286,10 +312,19 @@ class StatisticsRegistry:
         """
         self._stats[f"{target_key}::{stat_type}"] = value
 
-    def get(self, request: StatisticRequest) -> Any:
-        """Return collected statistic for *request*."""
+    def get(self, request: StatisticRequest, *, relocate: bool = True) -> Any:
+        """Return collected statistic for *request*.
+
+        After :meth:`to`, plain tensors come back on that device unless
+        *relocate* is false (e.g. to persist the statistic as collected).
+        Tensor subclasses such as disk-offloaded Hessians are returned as-is;
+        their consumers materialize them on demand.
+        """
         dedupe_key = f"{request.target_key}::{request.stat_type}"
-        return self._stats.get(dedupe_key)
+        value = self._stats.get(dedupe_key)
+        if relocate and self._device is not None:
+            value = _relocate(value, self._device)
+        return value
 
     def has(self, request: StatisticRequest) -> bool:
         """Return True if the statistic for *request* has been collected."""
