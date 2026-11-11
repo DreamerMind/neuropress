@@ -624,3 +624,31 @@ def test_reconstruction_keeps_float32_for_low_precision_weights():
     assert fitted.dtype == torch.float32
     torch.testing.assert_close(fitted, expected, rtol=0, atol=0)
     assert not torch.equal(fitted, weight.float())
+
+
+@pytest.mark.parametrize(
+    "error",
+    [torch.linalg.LinAlgError("not positive-definite"), ValueError("Nonfinite")],
+)
+def test_failed_teacher_fit_falls_back_to_self_gptq(error, monkeypatch, caplog):
+    import neuropress.calibration.probe.reconstruction as reconstruction
+
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(reconstruction, "reconstruct_linear_weight", fail)
+    torch.manual_seed(16)
+    original = nn.Sequential(nn.Linear(32, 16, bias=False)).eval()
+    x = torch.randn(4, 32)
+    models = [deepcopy(original), deepcopy(original)]
+    for model, teacher in zip(models, [False, True], strict=True):
+        pipeline = QuantizationPipeline(recipe(teacher).build())
+        pipeline.run(model, [x * 1.2], reference_data=[x])
+        assert not pipeline.last_plan.kept_float
+    torch.testing.assert_close(
+        models[1][0].weight.decompress_to_u8(),
+        models[0][0].weight.decompress_to_u8(),
+        rtol=0,
+        atol=0,
+    )
+    assert "Teacher reconstruction failed" in caplog.text

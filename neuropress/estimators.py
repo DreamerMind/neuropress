@@ -213,16 +213,27 @@ def _gptq_layer(
     calib.init()
     registry.inject(calib, name)
     if reconstruction_damp_percent is not None:
-        from .calibration.probe.reconstruction import reconstruct_linear_weight
+        from .calibration.probe import reconstruction
 
         stat = registry.get(
             StatisticRequest(target_key=name, stat_type="linear_reconstruction")
         )
         if stat is None or stat["cross"] is None or calib.hessian is None:
             raise ValueError("Teacher reconstruction statistics are missing")
-        calib.weight_tensor = reconstruct_linear_weight(
-            _w, calib.hessian, stat["cross"], reconstruction_damp_percent
-        )
+        try:
+            calib.weight_tensor = reconstruction.reconstruct_linear_weight(
+                _w, calib.hessian, stat["cross"], reconstruction_damp_percent
+            )
+        except (ValueError, torch.linalg.LinAlgError) as exc:
+            # An ill-conditioned or nonfinite teacher fit says nothing about
+            # whether ordinary GPTQ can quantize this layer, so do that rather
+            # than leaving the whole layer float.
+            LOGGER.warning(
+                "Teacher reconstruction failed for '%s' (%s); "
+                "quantizing the unreconstructed weight",
+                name,
+                exc,
+            )
     _, scheme, *_ = calib.compute_quantization()
     return QuantizedWeight(
         calib.quantized_codes.cpu(),
