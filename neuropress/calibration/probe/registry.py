@@ -311,8 +311,11 @@ class StatisticsRegistry:
 
                 hooks.append(mod.register_forward_hook(_act_hook, with_kwargs=True))
 
+        # Paired samples may feed gradient-based estimators, which cannot use
+        # inference tensors; everything else keeps inference mode's savings.
+        grad_mode = torch.no_grad() if paired else torch.inference_mode()
         try:
-            with torch.no_grad():
+            with grad_mode:
                 if paired:
                     missing = object()
                     for batch, reference in zip_longest(

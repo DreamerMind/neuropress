@@ -776,3 +776,24 @@ def test_extra_gptq_cache_stages_are_not_requested_as_statistics(teacher):
     estimator.prepare(nn.Sequential(nn.Linear(32, 16, bias=False)))
     types = {request.stat_type for request in estimator.declare_statistics()}
     assert types == ({"hessian", "linear_reconstruction"} if teacher else {"hessian"})
+
+
+@pytest.mark.parametrize("teacher", [False, True])
+def test_only_paired_collection_leaves_inference_mode(teacher, monkeypatch):
+    from neuropress.calibration.probe import HessianAccumulator
+
+    modes = []
+    update = HessianAccumulator.update
+
+    def spy(self, data):
+        modes.append(torch.is_inference_mode_enabled())
+        return update(self, data)
+
+    monkeypatch.setattr(HessianAccumulator, "update", spy)
+    model = nn.Sequential(nn.Linear(32, 16, bias=False)).eval()
+    x = torch.randn(4, 32)
+    QuantizationPipeline(recipe(teacher).build()).run(
+        model, [x * 1.1], reference_data=[x]
+    )
+    # Paired samples may feed autograd later, which rejects inference tensors.
+    assert modes == [not teacher]
