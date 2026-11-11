@@ -30,7 +30,7 @@ RUN_INTEGRATION=1 uv run pytest tests/integration/ -v
 
 2. **Targets** – `WeightTarget` (`module_id/param_name`) and `ActivationTarget` (`value_id`) identify what to quantize.
 
-3. **StatisticsRegistry** – `QuantizationParamEstimator.declare_statistics()` returns `StatisticRequest` objects. The registry deduplicates them (key = `target_key::stat_type`), installs hooks, runs a forward pass over calibration data, and stores results. Supported stat types: `"min_max"` and `"hessian"`.
+3. **StatisticsRegistry** – `QuantizationParamEstimator.declare_statistics()` returns `StatisticRequest` objects. The registry deduplicates them (key = `target_key::stat_type`), installs hooks, runs a forward pass over calibration data, and stores results. Supported stat types include `"min_max"`, `"hessian"` and the paired `"linear_reconstruction"`. A `PairedCollector` also receives the matching output of a teacher model run on aligned `reference_data`; the pipeline builds a teacher only if `requires_pairing()` says some request needs one. With an `estimation_device`, `registry.to()` makes `get()` return each statistic on that device at access time, one at a time, while `inject()` hands statistics over as collected (GPTQ places each Hessian itself). The estimator is prepared again only if moving to the estimation device actually relocates the model. `collection_model` lets statistics come from an inference view of the model, and `target_paths` scopes the estimator through `select_targets()` and rejects assignments outside that set.
 
 4. **QuantizationRecipe** – ties together `allowed_weight_qschemes`, `allowed_activation_qschemes`, a `QuantizationParamEstimator`, and a `ModuleQuantizationAdapter`.
 
@@ -50,6 +50,9 @@ RUN_INTEGRATION=1 uv run pytest tests/integration/ -v
 | `GPTQCalibration` | Full GPTQ implementation (Frantar et al. ICLR 2023) |
 | `GPTQMixedPrecisionCalibration` | GPTQ with per-column-group bit-width allocation via `MixedAllocationStrategy` |
 | `MixedPrecisionLinear` | Drop-in replacement for `nn.Linear` produced by `split_mixed_precision_linear` |
+| `PairedCollector` | Collector fed aligned student inputs/output and teacher output (`update_pair`) |
+| `BlockQuantizationPipeline` | Runs a recipe one block at a time, propagating aligned float and student streams, with optional checkpoint resume |
+| `QuantizationSchedule` | Dependency stages of target modules, traced from tensor dataflow, for collect/adapt barriers inside a block |
 
 ### Calibration data shapes (4-D convention)
 
@@ -72,6 +75,10 @@ Flow: `StatisticsRegistry.register_method(method, target_key)` scans `Annotated`
 ### Estimator config / implementation split
 
 `VptqGroupEstimatorConfig` (`estimator_configs.py`) is the user-facing Pydantic model; `VPTQGroupEstimator` (`estimators.py`) is the runtime dataclass. The config's `build()` passes every field explicitly, so **`VPTQGroupEstimator` is the single source of truth for defaults** — `VptqGroupEstimatorConfig` derives its defaults from the dataclass fields via `_vd()` at class definition time. If you add a field to `VPTQGroupEstimator`, add a corresponding `_vd("field_name")` default in the config.
+
+### Block calibration (`block_pipeline.py`, `graph/schedule.py`)
+
+`BlockQuantizationPipeline` drives `QuantizationPipeline` per block instead of per model, so only one block's activations and statistics are live. It keeps two streams: the float reference (original block on float inputs) and the student (adapted block on adapted inputs), passed between blocks as plain CPU tensor trees (`calibration/batches.py`). With `target_paths`, `QuantizationSchedule.trace` ranks targets by observed tensor dependencies, and each stage runs a fresh recipe restricted to that stage, so later stages collect through already adapted weights. The first stage pairs against the still-float block; a frozen float copy is made only when a later stage requests paired statistics. Teacher reconstruction (`GPTQEstimator(reconstruction="teacher")`) fits a ridge correction toward the teacher output before GPTQ and falls back to plain GPTQ if the fit fails. Usage and the trace contract are in `docs/block-calibration.md`.
 
 ### Pipeline wiring: `_cache` and `_spans`
 
