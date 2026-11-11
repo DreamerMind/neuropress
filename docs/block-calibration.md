@@ -125,7 +125,9 @@ calls to a target, inputs depending on the target's own parameters, nested targe
 shared target parameter storage and targets
 missing from a batch are rejected. Python side effects, foreign computation and
 unobserved paths are outside this contract. Every selected target must be handled
-by the recipe; assignments outside the selected weight stage are rejected.
+by the recipe; assignments outside the selected weight stage are rejected. A
+target the estimator tolerates failing on (such as a GPTQ Cholesky failure) counts
+as handled: it stays float and is reported in `kept_float`, as in whole-block mode.
 
 Existing estimators with `filter_fn` support stage selection while preserving
 format filters. Composite estimators forward selection to each member. Future

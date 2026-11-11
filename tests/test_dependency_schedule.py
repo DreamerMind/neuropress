@@ -408,3 +408,27 @@ def test_inference_view_serves_collection_with_and_without_stages(target_paths):
     assert len(views) == stages + 1
     # The first collection observes the untouched float block.
     assert views[0]
+
+
+@pytest.mark.parametrize("target_paths", [None, ("0", "1")])
+def test_tolerated_layer_failures_are_reported_not_fatal(target_paths, monkeypatch):
+    import neuropress.estimators as estimators
+
+    layer = estimators._gptq_layer
+
+    def fail_second(name, *args, **kwargs):
+        if name == "1":
+            raise ValueError("forced failure")
+        return layer(name, *args, **kwargs)
+
+    monkeypatch.setattr(estimators, "_gptq_layer", fail_second)
+    model = nn.Sequential(
+        nn.Linear(32, 32, bias=False), nn.Linear(32, 32, bias=False)
+    ).eval()
+    x = torch.randn(4, 32)
+    result = BlockQuantizationPipeline(config(), target_paths=target_paths).run_block(
+        "b", model, [x], [x]
+    )
+    assert result.kept_float == {"1": "forced failure"}
+    assert hasattr(model[0].weight, "decompress_to_u8")
+    assert type(model[1].weight) is nn.Parameter
