@@ -61,24 +61,6 @@ def _positional_inputs(
     return (*args, *kwargs.values())
 
 
-def _relocate(value: Any, device: torch.device) -> Any:
-    """Copy plain tensors inside a statistic to *device*, sharing nothing else.
-
-    Only exact ``torch.Tensor``/``nn.Parameter`` leaves move: calling ``.to``
-    or ``.detach`` on a tensor subclass like ``OffloadedTensor`` reloads it
-    from disk, which is what deferred relocation exists to avoid.
-    """
-    if type(value) in (torch.Tensor, nn.Parameter):
-        return value.detach().to(device)
-    if isinstance(value, dict):
-        return {key: _relocate(item, device) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_relocate(item, device) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_relocate(item, device) for item in value)
-    return value
-
-
 class StatisticsRegistry:
     """Collect and store calibration statistics.
 
@@ -392,7 +374,7 @@ class StatisticsRegistry:
         dedupe_key = f"{request.target_key}::{request.stat_type}"
         value = self._stats.get(dedupe_key)
         if relocate and self._device is not None:
-            value = _relocate(value, self._device)
+            value = move_batch(value, self._device, tensor_subclasses=False)
         return value
 
     def has(self, request: StatisticRequest) -> bool:
