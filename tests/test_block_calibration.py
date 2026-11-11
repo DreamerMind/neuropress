@@ -752,3 +752,27 @@ def test_checkpoint_fingerprint_is_stable_and_rejects_opaque_leaves():
 
     with pytest.raises(TypeError, match="Cannot checkpoint a block stream"):
         digest({"x": torch.ones(1), "cache": Cache()})
+
+
+@pytest.mark.parametrize("teacher", [False, True])
+def test_extra_gptq_cache_stages_are_not_requested_as_statistics(teacher):
+    from dataclasses import dataclass, fields
+
+    from neuropress.estimators import GPTQEstimator
+    from neuropress.quantization.cache import CacheStageDescriptor
+
+    @dataclass
+    class CachesCodes(GPTQEstimator):
+        def cache_stages(self):
+            return [
+                *super().cache_stages(),
+                CacheStageDescriptor("codes", "Packed codes", scope="calibration"),
+            ]
+
+    base = recipe(teacher).build().param_estimator
+    estimator = CachesCodes(
+        **{f.name: getattr(base, f.name) for f in fields(base) if f.init}
+    )
+    estimator.prepare(nn.Sequential(nn.Linear(32, 16, bias=False)))
+    types = {request.stat_type for request in estimator.declare_statistics()}
+    assert types == ({"hessian", "linear_reconstruction"} if teacher else {"hessian"})

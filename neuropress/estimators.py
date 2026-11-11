@@ -340,14 +340,26 @@ class GPTQEstimator(QuantizationParamEstimator):
             )
         return stages
 
+    def _statistic_types(self) -> list[str]:
+        """Collected statistic types; each is cached under the stage of that name.
+
+        Listed on their own rather than derived from :meth:`cache_stages`, so
+        a subclass can cache something that is not a statistic (packed codes,
+        say) without requesting a stat type no collector serves.
+        """
+        types = ["hessian"]
+        if self.reconstruction == "teacher":
+            types.append("linear_reconstruction")
+        return types
+
     def declare_statistics(self) -> list[StatisticRequest]:
         """Request uncached Hessians and, when selected, paired reconstruction stats."""
-        stages = [stage.name for stage in self.cache_stages()]
+        types = self._statistic_types()
         return [
-            StatisticRequest(target_key=name, stat_type=stage)
+            StatisticRequest(target_key=name, stat_type=stat_type)
             for name in self._target_modules
-            for stage in stages
-            if not self._cache.has(stage, name)
+            for stat_type in types
+            if not self._cache.has(stat_type, name)
         ]
 
     def estimate(
