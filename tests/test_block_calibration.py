@@ -652,3 +652,19 @@ def test_failed_teacher_fit_falls_back_to_self_gptq(error, monkeypatch, caplog):
         atol=0,
     )
     assert "Teacher reconstruction failed" in caplog.text
+
+
+def test_injected_statistics_are_not_copied_by_the_registry():
+    from neuropress.methods.gptq import GPTQCalibration
+    from neuropress.qscheme.descriptor import Granularity
+
+    registry = StatisticsRegistry()
+    hessian = torch.eye(4)
+    registry.set_stat("layer", "hessian", {"hessian": hessian, "nsamples": 3})
+    registry.to("meta")
+    calib = GPTQCalibration(granularity=Granularity.per_channel())
+    registry.inject(calib, "layer")
+    # GPTQ relocates per layer to its weights' device; a registry copy here
+    # would be a second K x K allocation for every layer.
+    assert calib.hessian is hessian
+    assert calib.nsamples == 3

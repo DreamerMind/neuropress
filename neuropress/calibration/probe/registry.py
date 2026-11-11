@@ -163,7 +163,13 @@ class StatisticsRegistry:
         self.register_requests(requests)
 
     def inject(self, method: Any, target_key: str) -> None:
-        """Set annotated fields on *method* from collected stats."""
+        """Set annotated fields on *method* from collected stats.
+
+        Statistics are injected as collected, ignoring :meth:`to`: the
+        calibration methods consuming them (GPTQ) place each Hessian on their
+        weights' device themselves, copying only when they must, so relocating
+        here would allocate a second K x K copy per layer.
+        """
         hints = typing.get_type_hints(type(method), include_extras=True)
         cache: dict[str, Any] = {}
         for attr, hint in hints.items():
@@ -176,7 +182,8 @@ class StatisticsRegistry:
                     cache[meta.stat_type] = self.get(
                         StatisticRequest(
                             target_key=target_key, stat_type=meta.stat_type
-                        )
+                        ),
+                        relocate=False,
                     )
                 result = cache[meta.stat_type]
                 if result is None:
