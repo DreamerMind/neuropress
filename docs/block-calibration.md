@@ -92,9 +92,10 @@ with no observed dependency, then runs a fresh recipe for each group. Later
 stages collect new statistics through the already adapted stages. Teacher
 observations always see the unchanged float block: the first stage collects
 before any adaptation and pairs against the observed block itself, and later
-stages use a frozen copy kept in host memory. That copy is placed on the forward
-device only for stages whose estimator requests paired statistics, so
-self-reconstruction recipes never hold a second block on the device.
+stages use a frozen copy kept in host memory. That copy is made only if a later
+stage's estimator requests paired statistics, and placed on the forward device
+only for those stages, so self-reconstruction recipes never hold a second block
+in host or device memory.
 
 ```python
 from neuropress import QuantizationSchedule

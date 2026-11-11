@@ -466,3 +466,25 @@ def test_trace_replays_each_batch_structure_once(kind, traced):
     schedule = QuantizationSchedule.trace(model, batches, ["q", "k", "out"])
     assert schedule.stages == (("q", "k"), ("out",))
     assert Counting.calls == traced
+
+
+@pytest.mark.parametrize("teacher", [False, True])
+def test_staged_blocks_copy_a_teacher_only_when_a_later_stage_pairs(
+    teacher, monkeypatch
+):
+    import neuropress.block_pipeline as block_pipeline
+
+    copies = []
+    deepcopy_ = block_pipeline.copy.deepcopy
+
+    def spy(value, *args, **kwargs):
+        if isinstance(value, Branches):
+            copies.append(value)
+        return deepcopy_(value, *args, **kwargs)
+
+    monkeypatch.setattr(block_pipeline.copy, "deepcopy", spy)
+    x = torch.randn(4, 32)
+    BlockQuantizationPipeline(
+        config(teacher), target_paths=("q", "k", "out")
+    ).run_block("b", Branches().eval(), [x * 1.1], [x])
+    assert len(copies) == int(teacher)

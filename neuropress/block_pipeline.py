@@ -7,6 +7,7 @@ import hashlib
 import json
 import weakref
 from collections.abc import Callable, Iterable, Iterator
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -15,6 +16,7 @@ import torch
 from torch import nn
 
 from .calibration.batches import call_batch, move_batch
+from .calibration.probe import StatisticsRegistry
 from .graph.schedule import QuantizationSchedule
 from .pipeline import QuantizationPipeline
 from .plan import QuantizationPlan
@@ -154,6 +156,22 @@ class BlockQuantizationPipeline:
         path = self.checkpoint_dir / hashlib.sha256(name.encode()).hexdigest()[:20]
         return path, digest.hexdigest()
 
+    def _stage_pairs(self, model: nn.Module, stage: tuple[str, ...] | None) -> bool:
+        """Whether the recipe would request paired statistics for *stage*.
+
+        Probes a separately built estimator, so the one that later runs the
+        stage is prepared exactly as often as in an unprobed run. The probed
+        targets are still float here, as they will be when their stage runs.
+        """
+        estimator = self.config.build().param_estimator
+        with (
+            estimator.select_targets(set(stage)) if stage is not None else nullcontext()
+        ):
+            estimator.prepare(model)
+            registry = StatisticsRegistry()
+            registry.register_requests(estimator.declare_statistics())
+            return registry.requires_pairing()
+
     def run_block(
         self,
         name: str,
@@ -218,9 +236,14 @@ class BlockQuantizationPipeline:
             stages = schedule.stages
         # The first stage collects before any adaptation, so the observed block
         # is its own float teacher. Later stages see adapted weights and need a
-        # frozen copy; it stays in host memory and reaches the forward device
-        # only for stages whose estimator requests paired statistics.
-        teacher = copy.deepcopy(model) if len(stages) > 1 else None
+        # frozen copy, taken now (before stage one adapts anything) but only if
+        # one of them will pair; it stays in host memory and reaches the
+        # forward device only for the stages that do.
+        teacher = (
+            copy.deepcopy(model)
+            if any(self._stage_pairs(model, stage) for stage in stages[1:])
+            else None
+        )
 
         def place_teacher() -> nn.Module:
             assert teacher is not None
