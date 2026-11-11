@@ -204,6 +204,9 @@ class BlockQuantizationPipeline:
         reference_outputs = self.forward(model, reference)
         source = reference if self.input_source == "float" else student
         schedule = None
+        # Without target_paths the whole block is one stage that selects
+        # every estimator target, exactly like a whole-model pipeline run.
+        stages: tuple[tuple[str, ...] | None, ...] = (None,)
         if self.target_paths is not None:
             model.to(self.forward_device).eval()
             schedule = QuantizationSchedule.trace(
@@ -212,44 +215,44 @@ class BlockQuantizationPipeline:
                 self.target_paths,
             )
             model.cpu()
-            teacher = copy.deepcopy(model).to(self.forward_device).eval()
-            plan = QuantizationPlan()
-            try:
-                for stage in schedule.stages:
-                    observed = (
-                        self.inference_model(model) if self.inference_model else model
-                    )
-                    observed.to(self.forward_device).eval()
-                    pipeline = QuantizationPipeline(self.config.build())
-                    pipeline.run(
-                        model,
-                        (move_batch(batch, self.forward_device) for batch in source),
-                        reference_data=(
-                            move_batch(batch, self.forward_device)
-                            for batch in reference
-                        ),
-                        reference_model=teacher,
-                        estimation_device=self.estimation_device,
-                        collection_model=observed,
-                        target_paths=set(stage),
-                    )
-                    plan.kept_float.update(pipeline.last_plan.kept_float)
-                    observed.cpu()
-                    model.cpu()
-            finally:
+            stages = schedule.stages
+        # The first stage collects before any adaptation, so the observed block
+        # is its own float teacher. Later stages see adapted weights and need a
+        # frozen copy; it stays in host memory and reaches the forward device
+        # only for stages whose estimator requests paired statistics.
+        teacher = copy.deepcopy(model) if len(stages) > 1 else None
+
+        def place_teacher() -> nn.Module:
+            assert teacher is not None
+            return teacher.to(self.forward_device).eval()
+
+        plan = QuantizationPlan()
+        try:
+            for index, stage in enumerate(stages):
+                observed = (
+                    self.inference_model(model) if self.inference_model else model
+                )
+                observed.to(self.forward_device).eval()
+                pipeline = QuantizationPipeline(self.config.build())
+                pipeline.run(
+                    model,
+                    (move_batch(batch, self.forward_device) for batch in source),
+                    reference_data=(
+                        move_batch(batch, self.forward_device) for batch in reference
+                    ),
+                    reference_model=place_teacher if index else None,
+                    estimation_device=self.estimation_device,
+                    collection_model=observed,
+                    target_paths=set(stage) if stage is not None else None,
+                )
+                plan.kept_float.update(pipeline.last_plan.kept_float)
+                observed.cpu()
+                model.cpu()
+                if teacher is not None:
+                    teacher.cpu()
+        finally:
+            if teacher is not None:
                 teacher.cpu()
-        else:
-            model.to(self.forward_device).eval()
-            pipeline = QuantizationPipeline(self.config.build())
-            pipeline.run(
-                model,
-                (move_batch(batch, self.forward_device) for batch in source),
-                reference_data=(
-                    move_batch(batch, self.forward_device) for batch in reference
-                ),
-                estimation_device=self.estimation_device,
-            )
-            plan = pipeline.last_plan
         model.cpu()
         inference = (
             self.inference_model(model) if self.inference_model is not None else model

@@ -58,7 +58,9 @@ By default, each block output becomes the next block input. Supply
 weights across boundaries. Apply whole-model preprocessing before partitioning,
 and kernel lowering after calibration. An optional `inference_model` callback can
 provide a non-mutating inference view, for example f32 materialization of packed
-weights for GPU calibration; include that contract in `run_id`.
+weights for GPU calibration; include that contract in `run_id`. The view serves
+every statistics collection and the propagated student stream, with or without
+`target_paths`, so it must also accept the untouched float block.
 
 Checkpoints store the adapted model and both propagated streams. A completed
 checkpoint is reused only when the float weights, incoming streams, recipe,
@@ -84,7 +86,11 @@ adaptation at dependency barriers inside each block. The runner traces the
 explicit target modules across the supplied calibration batches, groups targets
 with no observed dependency, then runs a fresh recipe for each group. Later
 stages collect new statistics through the already adapted stages. Teacher
-observations always use a separate, unchanged float block.
+observations always see the unchanged float block: the first stage collects
+before any adaptation and pairs against the observed block itself, and later
+stages use a frozen copy kept in host memory. That copy is placed on the forward
+device only for stages whose estimator requests paired statistics, so
+self-reconstruction recipes never hold a second block on the device.
 
 ```python
 from neuropress import QuantizationSchedule

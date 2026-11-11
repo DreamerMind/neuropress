@@ -93,6 +93,23 @@ class StatisticsRegistry:
         self._requests[dedupe_key] = request
         self._collectors[dedupe_key] = collector
 
+    def requires_pairing(self) -> bool:
+        """Return True if any registered request is served by a paired collector.
+
+        Callers use this to avoid preparing a teacher model and reference
+        stream that :meth:`collect` would never run.
+        """
+        for dedupe_key, req in self._requests.items():
+            collector = self._collectors.get(dedupe_key)
+            if collector is not None:
+                if isinstance(collector, PairedCollector):
+                    return True
+            elif issubclass(
+                COLLECTOR_REGISTRY.get(req.stat_type, Collector), PairedCollector
+            ):
+                return True
+        return False
+
     def register_method(self, method: Any, target_key: str) -> None:
         """Auto-register stat requests from ``Annotated[..., StatField(...)]`` hints."""
         hints = typing.get_type_hints(type(method), include_extras=True)

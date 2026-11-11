@@ -5,7 +5,7 @@ from __future__ import annotations
 import itertools
 import logging
 import math
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import nullcontext
 from typing import Any
 
@@ -53,7 +53,7 @@ class QuantizationPipeline:
         example_inputs: Any = None,
         *,
         reference_data: Iterable | None = None,
-        reference_model: nn.Module | None = None,
+        reference_model: nn.Module | Callable[[], nn.Module] | None = None,
         estimation_device: str | torch.device | None = None,
         collection_model: nn.Module | None = None,
         target_paths: set[str] | None = None,
@@ -72,6 +72,9 @@ class QuantizationPipeline:
                 is active, in which case it is materialised upfront).
             reference_data: Aligned original-float batches for paired statistics.
             reference_model: Teacher model; defaults to the unadapted student.
+                A zero-argument callable is invoked only when the estimator
+                requests paired statistics, so a teacher that is expensive to
+                place on the forward device is not placed for nothing.
             estimation_device: Move the model and statistics here after collection.
                 The returned model remains on this device.
             collection_model: Optional inference view used for graph/statistics forwards.
@@ -126,6 +129,9 @@ class QuantizationPipeline:
             requests = estimator.declare_statistics()
             registry = StatisticsRegistry()
             registry.register_requests(requests)
+            teacher = reference_model
+            if teacher is not None and not isinstance(teacher, nn.Module):
+                teacher = teacher() if registry.requires_pairing() else None
 
             # -- Step 4: Global calibration (single lazy pass) -----------------
             LOGGER.info("Step 4: Running global calibration")
@@ -144,7 +150,7 @@ class QuantizationPipeline:
                 observed_model,
                 calibration_iter,
                 reference_data=reference_data,
-                reference_model=reference_model,
+                reference_model=teacher,
             )
             if estimation_device is not None:
                 model.to(estimation_device)

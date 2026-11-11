@@ -338,3 +338,73 @@ def test_self_dependent_target_inputs_are_rejected_and_hooks_removed():
     assert all(
         not m._forward_hooks and not m._forward_pre_hooks for m in model.modules()
     )
+
+
+@pytest.mark.parametrize("teacher", [False, True])
+def test_teacher_factory_runs_only_for_paired_statistics(teacher):
+    calls = []
+    original = Branches().eval()
+
+    def factory():
+        calls.append(1)
+        return original
+
+    x = torch.randn(4, 32)
+    QuantizationPipeline(config(teacher).build()).run(
+        deepcopy(original), [x * 1.1], reference_data=[x], reference_model=factory
+    )
+    assert len(calls) == int(teacher)
+
+
+@pytest.mark.parametrize("teacher", [False, True])
+def test_staged_blocks_place_a_teacher_only_when_a_later_stage_pairs(
+    teacher, monkeypatch
+):
+    import neuropress.block_pipeline as block_pipeline
+
+    placed = []
+    run = block_pipeline.QuantizationPipeline.run
+
+    def spy(self, *args, reference_model=None, **kwargs):
+        if reference_model is not None:
+            assert not isinstance(reference_model, nn.Module)
+            factory = reference_model
+
+            def reference_model():
+                placed.append(kwargs["target_paths"])
+                return factory()
+
+        return run(self, *args, reference_model=reference_model, **kwargs)
+
+    monkeypatch.setattr(block_pipeline.QuantizationPipeline, "run", spy)
+    x = torch.randn(4, 32)
+    BlockQuantizationPipeline(
+        config(teacher), target_paths=("q", "k", "out")
+    ).run_block("b", Branches().eval(), [x * 1.1], [x])
+    # Stage one pairs against the still-float observed block itself.
+    assert placed == ([{"out"}] if teacher else [])
+
+
+@pytest.mark.parametrize("target_paths", [None, ("q", "k", "out")])
+def test_inference_view_serves_collection_with_and_without_stages(target_paths):
+    views = []
+
+    def inference_model(model):
+        views.append(all(not hasattr(m.weight, "decompress_to_u8") for m in model))
+        return model
+
+    class Flat(nn.Sequential):
+        def __init__(self):
+            super().__init__(*(nn.Linear(32, 32, bias=False) for _ in range(3)))
+
+    model = Flat().eval()
+    paths = None if target_paths is None else ("0", "1", "2")
+    x = torch.randn(4, 32)
+    BlockQuantizationPipeline(
+        config(), target_paths=paths, inference_model=inference_model
+    ).run_block("b", model, [x], [x])
+    stages = 1 if paths is None else 3
+    # One view per collection stage, then one for the propagated student.
+    assert len(views) == stages + 1
+    # The first collection observes the untouched float block.
+    assert views[0]
