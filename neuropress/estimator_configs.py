@@ -385,8 +385,6 @@ class HqqEstimatorConfig(EstimatorConfig):
         )
 
 
-@estimator_config("vptq")
-@estimator_config("vptq_group")  # backward-compat alias
 def _resolve_cluster_backend(name: str, n_iter: int):
     """Resolve a backend name to an instance, deferring the import.
 
@@ -398,6 +396,8 @@ def _resolve_cluster_backend(name: str, n_iter: int):
     return backend_by_name(name, n_iter=n_iter)
 
 
+@estimator_config("vptq")
+@estimator_config("vptq_group")  # backward-compat alias
 class VptqGroupEstimatorConfig(EstimatorConfig):
     """JSON-serialisable config for :class:`.VPTQGroupEstimator`.
 

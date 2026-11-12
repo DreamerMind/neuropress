@@ -40,3 +40,19 @@ def test_forwards_seed_and_iterations():
 def test_unknown_name_raises_with_valid_options():
     with pytest.raises(ValueError, match="torch"):
         backend_by_name("nope")
+
+
+@pytest.mark.parametrize("name", ["vptq", "vptq_group"])
+def test_vptq_recipes_resolve_to_the_vptq_config(name):
+    from neuropress.estimator_configs import VptqGroupEstimatorConfig
+    from neuropress.estimators import VPTQGroupEstimator
+    from neuropress.recipe_config import QuantizationRecipeConfig
+
+    config = QuantizationRecipeConfig.model_validate(
+        {"estimator": {"type": name}, "kernel_lowering": None}
+    )
+    assert isinstance(config.estimator, VptqGroupEstimatorConfig)
+    assert isinstance(config.build().param_estimator, VPTQGroupEstimator)
+    # A dumped recipe (as stored in manifests and checkpoints) parses back.
+    again = QuantizationRecipeConfig.model_validate_json(config.model_dump_json())
+    assert again == config
