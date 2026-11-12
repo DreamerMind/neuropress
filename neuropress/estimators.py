@@ -9,7 +9,7 @@ import operator
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from functools import reduce
-from typing import Any
+from typing import Any, ClassVar
 
 try:
     from rich.markup import escape as _re
@@ -41,6 +41,7 @@ import torch
 from torch import nn
 from torch_to_nnef.exceptions import T2NErrorImpossibleQuantization
 
+from .calibration.batches import materialize
 from .calibration.probe import StatisticRequest, StatisticsRegistry
 from .estimator import QuantizationParamEstimator
 from .graph.graph import QGraph
@@ -79,6 +80,21 @@ def _weight_identity(weight: torch.Tensor) -> tuple[str, int]:
         if not weight.is_meta and weight.numel() > 0:
             return "storage", weight.data_ptr()
     return "object", id(weight)
+
+
+def _targets_device(
+    targets: dict[str, nn.Module], fallback: torch.device | None
+) -> torch.device | None:
+    """Return where the target weights live now, or *fallback* without any.
+
+    Estimators read this when estimation starts rather than trusting the
+    device seen by ``prepare``: the pipeline may move the model in between.
+    """
+    for module in targets.values():
+        weight = getattr(module, "weight", None)
+        if isinstance(weight, torch.Tensor):
+            return weight.device
+    return fallback
 
 
 def _walk_targets(
@@ -160,6 +176,7 @@ def collect_tied_aliases(
 def _add_tied_aliases(
     assignments: dict[str, Any], aliases: dict[str, list[str]]
 ) -> dict[str, Any]:
+    """Give every tied alias its primary's entry (an assignment or a kept-float reason)."""
     for name, tied in aliases.items():
         if name in assignments:
             for alias in tied:
@@ -182,6 +199,7 @@ def _gptq_layer(
     symmetric: bool,
     damp_percent: float,
     damp_auto_increment: float,
+    reconstruction_damp_percent: float | None = None,
 ) -> QuantizedWeight:
     """Estimate codes and a scheme for a module without replacing its weight.
 
@@ -211,6 +229,31 @@ def _gptq_layer(
     calib.device = device
     calib.init()
     registry.inject(calib, name)
+    if reconstruction_damp_percent is not None:
+        from .calibration.probe import reconstruction
+
+        stat = registry.get(
+            StatisticRequest(target_key=name, stat_type="linear_reconstruction")
+        )
+        if stat is None or stat["cross"] is None or calib.hessian is None:
+            raise ValueError("Teacher reconstruction statistics are missing")
+        try:
+            calib.weight_tensor = reconstruction.reconstruct_linear_weight(
+                _w,
+                materialize(calib.hessian),
+                materialize(stat["cross"]),
+                reconstruction_damp_percent,
+            )
+        except (ValueError, torch.linalg.LinAlgError) as exc:
+            # An ill-conditioned or nonfinite teacher fit says nothing about
+            # whether ordinary GPTQ can quantize this layer, so do that rather
+            # than leaving the whole layer float.
+            LOGGER.warning(
+                "Teacher reconstruction failed for '%s' (%s); "
+                "quantizing the unreconstructed weight",
+                name,
+                exc,
+            )
     _, scheme, *_ = calib.compute_quantization()
     return QuantizedWeight(
         calib.quantized_codes.cpu(),
@@ -234,6 +277,8 @@ class GPTQEstimator(QuantizationParamEstimator):
     for the adapter; legacy Python callbacks receive dequantized values there.
     """
 
+    requires_graph: ClassVar[bool] = False
+
     module_classes: tuple[type[nn.Module], ...] = field(default=(nn.Linear,))
     filter_fn: Callable[[str, nn.Module], bool] | None = None
     weight_transform: str | Callable[[torch.Tensor, str], Any] | None = None
@@ -242,6 +287,8 @@ class GPTQEstimator(QuantizationParamEstimator):
     symmetric: bool = True
     damp_percent: float = 0.01
     damp_auto_increment: float = 0.0025
+    reconstruction: str = "self"
+    reconstruction_damp_percent: float = 0.01
 
     # Set by prepare() - not part of the public construction interface.
     _target_modules: dict[str, nn.Module] = field(
@@ -262,10 +309,18 @@ class GPTQEstimator(QuantizationParamEstimator):
                 matching *module_classes* and *filter_fn* are recorded as
                 targets for the subsequent Hessian collection and GPTQ pass.
         """
+        if self.reconstruction not in {"self", "teacher"}:
+            raise ValueError("reconstruction must be self or teacher")
+        if self.reconstruction_damp_percent <= 0:
+            raise ValueError("reconstruction_damp_percent must be positive")
         self._device = next(model.parameters()).device
         self._target_modules = collect_target_modules(
             model, self.module_classes, self.filter_fn
         )
+        if self.reconstruction == "teacher" and any(
+            not isinstance(mod, nn.Linear) for mod in self._target_modules.values()
+        ):
+            raise ValueError("Teacher GPTQ currently supports nn.Linear targets only")
         self._tied_aliases = collect_tied_aliases(
             model, self.module_classes, self.filter_fn
         )
@@ -285,7 +340,12 @@ class GPTQEstimator(QuantizationParamEstimator):
         )
 
     def cache_stages(self) -> list[CacheStageDescriptor]:
-        """Declare the per-layer Hessian cache stage (calibration-scoped)."""
+        """Declare the Hessian cache stage.
+
+        Teacher reconstruction products are not cached: they depend on the
+        reference stream and teacher the caller passes, which neither cache
+        fingerprint covers, so a cached entry could silently go stale.
+        """
         return [
             CacheStageDescriptor(
                 "hessian",
@@ -294,22 +354,27 @@ class GPTQEstimator(QuantizationParamEstimator):
             )
         ]
 
-    def declare_statistics(self) -> list[StatisticRequest]:
-        """Return one Hessian request per target module.
+    def _statistic_types(self) -> list[str]:
+        """Collected statistic types; a type with a cache stage of its name is cached.
 
-        Returns an empty list when all hessians are already in cache, causing
-        the pipeline to skip the calibration forward pass entirely.
+        Listed on their own rather than derived from :meth:`cache_stages`, so
+        a subclass can cache something that is not a statistic (packed codes,
+        say) without requesting a stat type no collector serves.
         """
-        cache = self._cache
-        if all(cache.has("hessian", name) for name in self._target_modules):
-            LOGGER.info(
-                "GPTQEstimator: all %d hessians in cache - skipping calibration.",
-                len(self._target_modules),
-            )
-            return []
+        types = ["hessian"]
+        if self.reconstruction == "teacher":
+            types.append("linear_reconstruction")
+        return types
+
+    def declare_statistics(self) -> list[StatisticRequest]:
+        """Request uncached Hessians and, when selected, paired reconstruction stats."""
+        types = self._statistic_types()
+        cached = {stage.name for stage in self.cache_stages()}
         return [
-            StatisticRequest(target_key=name, stat_type="hessian")
+            StatisticRequest(target_key=name, stat_type=stat_type)
             for name in self._target_modules
+            for stat_type in types
+            if stat_type not in cached or not self._cache.has(stat_type, name)
         ]
 
     def estimate(
@@ -322,6 +387,7 @@ class GPTQEstimator(QuantizationParamEstimator):
 
         Packing and parameter replacement are deferred to the model adapter.
         """
+        self._device = _targets_device(self._target_modules, self._device)
         ids_seen: set[int] = set()
         assignments: dict[str, Any] = {}
         kept_float: dict[str, str] = {}
@@ -373,6 +439,11 @@ class GPTQEstimator(QuantizationParamEstimator):
                             symmetric=self.symmetric,
                             damp_percent=self.damp_percent,
                             damp_auto_increment=self.damp_auto_increment,
+                            reconstruction_damp_percent=(
+                                self.reconstruction_damp_percent
+                                if self.reconstruction == "teacher"
+                                else None
+                            ),
                         )
                 except Exception as exc:
                     LOGGER.error("GPTQ failed for '%s': %s - skipping", name, exc)
@@ -384,7 +455,8 @@ class GPTQEstimator(QuantizationParamEstimator):
                 # Save hessian to cache for future runs (skip if already cached).
                 if cached_h is None:
                     stat = registry.get(
-                        StatisticRequest(target_key=name, stat_type="hessian")
+                        StatisticRequest(target_key=name, stat_type="hessian"),
+                        relocate=False,
                     )
                     if stat is not None:
                         cache.save("hessian", name, stat)
@@ -398,7 +470,7 @@ class GPTQEstimator(QuantizationParamEstimator):
 
         return QuantizationPlan(
             weight_assignments=_add_tied_aliases(assignments, self._tied_aliases),
-            kept_float=kept_float,
+            kept_float=_add_tied_aliases(kept_float, self._tied_aliases),
         )
 
 
@@ -479,6 +551,8 @@ class GPTQPanelEstimator(QuantizationParamEstimator):
     Other module types receive the selected dequantized weight values.
     """
 
+    requires_graph: ClassVar[bool] = False
+
     module_classes: tuple[type[nn.Module], ...] = field(default=(nn.Conv2d,))
     filter_fn: Callable[[str, nn.Module], bool] | None = None
     group_size: int = 32
@@ -531,6 +605,7 @@ class GPTQPanelEstimator(QuantizationParamEstimator):
         recipe: QuantizationRecipe,
     ) -> QuantizationPlan:
         """Return mixed weight assignments; defer layer splitting to the adapter."""
+        self._device = _targets_device(self._target_modules, self._device)
         assignments = {}
         kept_float: dict[str, str] = {}
         for name, mod in self._target_modules.items():
@@ -555,7 +630,7 @@ class GPTQPanelEstimator(QuantizationParamEstimator):
                 assignments[name] = assignment
         return QuantizationPlan(
             weight_assignments=_add_tied_aliases(assignments, self._tied_aliases),
-            kept_float=kept_float,
+            kept_float=_add_tied_aliases(kept_float, self._tied_aliases),
         )
 
 
@@ -572,6 +647,8 @@ class MinMaxZpWeightEstimator(QuantizationParamEstimator):
     quantization is per-tensor. The plan carries codes and scales; the adapter
     performs storage conversion and parameter replacement.
     """
+
+    requires_graph: ClassVar[bool] = False
 
     module_classes: tuple[type[nn.Module], ...] = field(default=(nn.Embedding,))
     filter_fn: Callable[[str, nn.Module], bool] | None = None
@@ -646,7 +723,7 @@ class MinMaxZpWeightEstimator(QuantizationParamEstimator):
             )
         return QuantizationPlan(
             weight_assignments=_add_tied_aliases(assignments, self._tied_aliases),
-            kept_float=kept_float,
+            kept_float=_add_tied_aliases(kept_float, self._tied_aliases),
         )
 
     def _grid(
@@ -770,6 +847,8 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
             Overrides *use_tiered*.
     """
 
+    requires_graph: ClassVar[bool] = False
+
     module_classes: tuple[type[nn.Module], ...] = field(default=(nn.Linear,))
     filter_fn: Callable[[str, nn.Module], bool] | None = None
     num_centroids: int = 256
@@ -809,6 +888,9 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
     ecvq_warmup_iters: int = 20
 
     _target_modules: dict[str, nn.Module] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    _tied_aliases: dict[str, list[str]] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
     _device: torch.device | None = field(
@@ -912,6 +994,9 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
         """
         self._device = next(model.parameters()).device
         self._target_modules = collect_target_modules(
+            model, self.module_classes, self.filter_fn
+        )
+        self._tied_aliases = collect_tied_aliases(
             model, self.module_classes, self.filter_fn
         )
         LOGGER.info(
@@ -1490,8 +1575,7 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
         h = result.get("hessian")
         if h is None:
             return None
-        if not isinstance(h, torch.Tensor):
-            h = h.to_base_tensor()
+        h = materialize(h)
         if h.shape != (K, K):
             return None
         # Persist for next run (CPU float32 to avoid GPU-memory pinning).  The
@@ -2395,6 +2479,8 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
         from .transforms.vq import QTensorTractVQ, VQScheme
         from .transforms.vq_packing import IndexPacking
 
+        self._device = _targets_device(self._target_modules, self._device)
+
         assignments: dict[str, Any] = {}
         cache = self._cache
         spans = self._spans
@@ -2991,7 +3077,28 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
                     indices_flat, vq, dequant_to_dtype=target_dtype
                 )
 
-        return QuantizationPlan(weight_assignments=assignments)
+        # Every target the loops above skipped (incompatible shape, a group
+        # with no compatible layer, a failed assignment) stays float and is
+        # reported, so a staged run sees it as handled.
+        kept_float = {
+            name: self._skip_reason(mod)
+            for name, mod in self._target_modules.items()
+            if name not in assignments
+        }
+        return QuantizationPlan(
+            weight_assignments=_add_tied_aliases(assignments, self._tied_aliases),
+            kept_float=_add_tied_aliases(kept_float, self._tied_aliases),
+        )
+
+    def _skip_reason(self, mod: nn.Module) -> str:
+        """Explain why VPTQ left *mod* float, as precisely as its shape allows."""
+        w = mod.weight
+        if w.ndim < 2:
+            return f"weight is {w.ndim}D"
+        K = int(w.shape[1]) if w.ndim == 2 else int(w.numel() // w.shape[0])
+        if K % self.vector_len:
+            return f"K={K} not divisible by vector_len={self.vector_len}"
+        return "not quantized by VPTQ; see the log for the cause"
 
 
 # ---------------------------------------------------------------------------
@@ -3013,6 +3120,19 @@ class CompositeEstimator(QuantizationParamEstimator):
     """
 
     estimators: list[QuantizationParamEstimator] = field(default_factory=list)
+
+    @property
+    def requires_graph(self) -> bool:  # type: ignore[override]
+        """Whether any member reads the graph."""
+        return any(estimator.requires_graph for estimator in self.estimators)
+
+    @contextlib.contextmanager
+    def select_targets(self, paths: set[str]) -> Iterator[None]:
+        """Scope every member to one stage, unwinding partial entry on failure."""
+        with contextlib.ExitStack() as stack:
+            for estimator in self.estimators:
+                stack.enter_context(estimator.select_targets(paths))
+            yield
 
     def prepare(self, model: nn.Module) -> None:
         """Prepare all sub-estimators.
@@ -3059,6 +3179,10 @@ class CompositeEstimator(QuantizationParamEstimator):
             merged.weight_assignments.update(plan.weight_assignments)
             merged.kept_float.update(plan.kept_float)
             merged.activation_assignments.update(plan.activation_assignments)
+        # A target one member quantized is not float, whichever member also
+        # reported leaving it float (overlapping filters).
+        for name in merged.weight_assignments:
+            merged.kept_float.pop(name, None)
         return merged
 
 
@@ -3124,6 +3248,8 @@ class HQQEstimator(QuantizationParamEstimator):
     Selected codes and affine schemes are retained in the plan. Named formats
     and legacy Python weight transforms are applied by the model adapter.
     """
+
+    requires_graph: ClassVar[bool] = False
 
     module_classes: tuple[type[nn.Module], ...] = field(default=(nn.Linear,))
     filter_fn: Callable[[str, nn.Module], bool] | None = None
@@ -3209,5 +3335,5 @@ class HQQEstimator(QuantizationParamEstimator):
 
         return QuantizationPlan(
             weight_assignments=_add_tied_aliases(assignments, self._tied_aliases),
-            kept_float=kept_float,
+            kept_float=_add_tied_aliases(kept_float, self._tied_aliases),
         )

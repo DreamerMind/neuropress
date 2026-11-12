@@ -92,6 +92,29 @@ def _recipe_fingerprint(recipe_config_json: str) -> str:
     return hashlib.sha256(recipe_config_json.encode()).hexdigest()[:12]
 
 
+# safetensors metadata key holding a cache entry's non-tensor values as JSON.
+_SCALARS_KEY = "neuropress.scalars"
+
+
+def _split_scalars(
+    stage: str, key: str, data: dict[str, Any]
+) -> tuple[dict[str, torch.Tensor], dict[str, bool | int | float]]:
+    """Separate tensors from plain scalars; reject anything else."""
+    tensors: dict[str, torch.Tensor] = {}
+    scalars: dict[str, bool | int | float] = {}
+    for name, value in data.items():
+        if isinstance(value, torch.Tensor):
+            tensors[name] = value
+        elif isinstance(value, bool | int | float):
+            scalars[name] = value
+        else:
+            raise TypeError(
+                f"Cannot cache {stage}/{key}: {name!r} is a "
+                f"{type(value).__name__}, not a tensor or a plain scalar"
+            )
+    return tensors, scalars
+
+
 @runtime_checkable
 class CacheManager(Protocol):
     """Protocol for cache backends."""
@@ -100,12 +123,12 @@ class CacheManager(Protocol):
         """Return True if the given stage/key is present in the cache."""
         ...
 
-    def load(self, stage: str, key: str) -> dict[str, torch.Tensor] | None:
-        """Return the cached tensor dict, or None on miss."""
+    def load(self, stage: str, key: str) -> dict[str, Any] | None:
+        """Return the cached dict (tensors and plain scalars), or None on miss."""
         ...
 
-    def save(self, stage: str, key: str, data: dict[str, torch.Tensor]) -> None:
-        """Persist *data* under *stage*/*key*."""
+    def save(self, stage: str, key: str, data: dict[str, Any]) -> None:
+        """Persist *data* (tensors and plain scalars) under *stage*/*key*."""
         ...
 
 
@@ -116,11 +139,11 @@ class NullCacheManager:
         """Return ``False``: a null cache never holds anything."""
         return False
 
-    def load(self, stage: str, key: str) -> dict[str, torch.Tensor] | None:
+    def load(self, stage: str, key: str) -> dict[str, Any] | None:
         """Return ``None``: a null cache never holds anything."""
         return None
 
-    def save(self, stage: str, key: str, data: dict[str, torch.Tensor]) -> None:
+    def save(self, stage: str, key: str, data: dict[str, Any]) -> None:
         """Discard *data*: a null cache does not persist."""
 
 
@@ -178,29 +201,44 @@ class DiskCacheManager:
         return self._path(stage, key).exists()
 
     def load(self, stage: str, key: str) -> dict[str, torch.Tensor] | None:
-        """Return the cached tensor dict, or ``None`` on miss or read failure."""
-        from safetensors.torch import load_file
+        """Return the cached dict, or ``None`` on miss or read failure."""
+        from safetensors import safe_open
 
         path = self._path(stage, key)
         if not path.exists():
             return None
         try:
-            data = dict(load_file(str(path)))
+            with safe_open(str(path), framework="pt") as handle:
+                data: dict[str, Any] = {k: handle.get_tensor(k) for k in handle.keys()}
+                scalars = (handle.metadata() or {}).get(_SCALARS_KEY)
+            if scalars is not None:
+                data.update(json.loads(scalars))
             LOGGER.debug("cache hit  %s/%s", stage, key)
             return data
         except Exception as exc:
             LOGGER.warning("cache load failed  %s/%s: %s", stage, key, exc)
             return None
 
-    def save(self, stage: str, key: str, data: dict[str, torch.Tensor]) -> None:
-        """Persist *data* under *stage*/*key*; log and continue on failure."""
+    def save(self, stage: str, key: str, data: dict[str, Any]) -> None:
+        """Persist *data* under *stage*/*key*; log and continue on I/O failure.
+
+        Values are tensors or plain ``bool``/``int``/``float`` scalars (a
+        Hessian carries its ``nsamples``); scalars are stored in the file's
+        metadata and come back with their type. Any other value is a caller
+        bug and raises ``TypeError`` instead of silently leaving no entry.
+        """
         from safetensors.torch import save_file
 
+        tensors, scalars = _split_scalars(stage, key, data)
         path = self._path(stage, key)
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            cpu_data = {k: v.detach().contiguous().cpu() for k, v in data.items()}
-            save_file(cpu_data, str(path))
+            cpu_data = {k: v.detach().contiguous().cpu() for k, v in tensors.items()}
+            save_file(
+                cpu_data,
+                str(path),
+                metadata={_SCALARS_KEY: json.dumps(scalars)} if scalars else None,
+            )
             size_mb = path.stat().st_size / (1024 * 1024)
             LOGGER.info("cache save  %s/%s  %.1f MB", stage, key, size_mb)
         except Exception as exc:

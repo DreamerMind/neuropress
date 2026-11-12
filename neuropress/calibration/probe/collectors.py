@@ -24,6 +24,18 @@ class Collector(ABC):
         """Return accumulated statistics as a dict."""
 
 
+class PairedCollector(Collector):
+    """Collector requiring aligned student inputs/output and teacher output."""
+
+    def update(self, data: torch.Tensor) -> None:
+        """Reject unpaired observations."""
+        raise ValueError("Paired statistics require reference observations")
+
+    @abstractmethod
+    def update_pair(self, inputs: tuple, output: Any, reference: Any) -> None:
+        """Accumulate a matched module invocation from the two forward streams."""
+
+
 COLLECTOR_REGISTRY: dict[str, type[Collector]] = {}
 
 

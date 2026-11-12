@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, ClassVar
 
 from torch import nn
 
@@ -34,9 +36,10 @@ class QuantizationParamEstimator(ABC):
 
     Subclasses that need to inspect the model before statistics collection
     (e.g. to discover target layers or record the compute device) should
-    override :meth:`prepare`.  The pipeline calls ``prepare(model)``
-    automatically before :meth:`declare_statistics` when the method is present,
-    so overriding it here makes the contract explicit for all implementations.
+    override :meth:`prepare`.  The pipeline calls ``prepare(model)`` once,
+    before :meth:`declare_statistics`. An explicit estimation device moves
+    the model after collection, so :meth:`estimate` reads device placement
+    from the target modules instead of from state recorded in ``prepare``.
 
     The pipeline wires up :attr:`_cache` and :attr:`_spans` via
     :meth:`set_cache` / :meth:`set_span_collector` before calling
@@ -48,6 +51,12 @@ class QuantizationParamEstimator(ABC):
     # can always call self._cache / self._spans unconditionally.
     _cache: CacheManager = _NULL_CACHE
     _spans: SpanCollector = _DEFAULT_SPANS
+
+    #: Whether :meth:`estimate` reads its ``graph`` argument. Building the
+    #: graph costs one extra forward pass, so the pipeline passes an empty
+    #: :class:`QGraph` to estimators that set this to ``False``. A block
+    #: pipeline traces one block at a time, so the graph never spans more.
+    requires_graph: ClassVar[bool] = True
 
     # ------------------------------------------------------------------
     # Cache stages
@@ -81,13 +90,39 @@ class QuantizationParamEstimator(ABC):
         """Bind this estimator to *model* before statistics collection.
 
         The default implementation is a no-op.  Subclasses override this to
-        discover target layers, record the compute device, or perform any other
-        one-time setup that requires access to the full model.
+        discover target layers. It runs once, before statistics collection, and
+        must not modify model weights. An explicit estimation device moves the
+        model after it runs, so :meth:`estimate` must read device placement
+        from the target modules rather than from state recorded here.
 
         Args:
             model: The model that will be passed through the pipeline.
         """
         ...
+
+    @contextmanager
+    def select_targets(self, paths: set[str]) -> Iterator[None]:
+        """Temporarily restrict estimation to a stage, preserving target filters.
+
+        Estimators with module filters inherit this implementation. Other
+        estimators must implement this contract explicitly to support staging.
+        Enter before prepare and leave after adaptation. The original filter
+        is restored even when collection or estimation fails. Custom estimators
+        must provide the same context-manager contract.
+        """
+        if not hasattr(self, "filter_fn"):
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support target selection"
+            )
+        paths = frozenset(paths)
+        previous = self.filter_fn
+        self.filter_fn = lambda name, module: (
+            name in paths and (previous is None or previous(name, module))
+        )
+        try:
+            yield
+        finally:
+            self.filter_fn = previous
 
     @abstractmethod
     def declare_statistics(self) -> list[StatisticRequest]:

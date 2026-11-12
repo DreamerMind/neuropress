@@ -1,0 +1,448 @@
+"""Memory-bounded block calibration with aligned float and student streams."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import importlib.metadata
+import json
+import weakref
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal
+
+import torch
+from torch import nn
+
+from .calibration.batches import call_batch, move_batch
+from .calibration.probe import StatisticsRegistry
+from .graph.schedule import QuantizationSchedule
+from .pipeline import QuantizationPipeline
+from .plan import QuantizationPlan
+from .recipe_config import QuantizationRecipeConfig
+from .t2n.model_io import load_quantized_model, save_quantized_model
+
+# Leaves that hash identically across processes. Checkpointed streams are
+# reloaded with torch.load(weights_only=True), which accepts little more than
+# these anyway; a default object repr would embed a memory address and make
+# every restart look like a different run.
+_PLAIN_LEAVES = (
+    type(None),
+    bool,
+    int,
+    float,
+    complex,
+    str,
+    bytes,
+    torch.dtype,
+    torch.device,
+)
+
+
+def _fingerprint(value: Any, digest: Any) -> None:
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().cpu().contiguous()
+        digest.update(str((tensor.dtype, tuple(tensor.shape))).encode())
+        digest.update(tensor.reshape(-1).view(torch.uint8).numpy())
+    elif isinstance(value, dict):
+        digest.update(str(("dict", len(value))).encode())
+        # Keys of mixed types do not sort against each other; order by type,
+        # then by value within a type, and hash each key with its type so that
+        # 1 and "1" stay distinct.
+        for key, item in sorted(
+            value.items(), key=lambda kv: (type(kv[0]).__qualname__, repr(kv[0]))
+        ):
+            _fingerprint(key, digest)
+            _fingerprint(item, digest)
+    elif isinstance(value, list | tuple):
+        digest.update(str((type(value).__name__, len(value))).encode())
+        for item in value:
+            _fingerprint(item, digest)
+    elif isinstance(value, _PLAIN_LEAVES):
+        digest.update(f"{type(value).__qualname__}:{value!r}".encode())
+    else:
+        raise TypeError(
+            f"Cannot checkpoint a block stream holding {type(value).__qualname__}: "
+            "checkpointed batches and outputs must be tensor trees of dicts, "
+            "lists and tuples with plain scalar leaves"
+        )
+
+
+def _package_version() -> str:
+    """Installed neuropress version, so a release with other numerics recomputes."""
+    try:
+        return importlib.metadata.version("neuropress")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
+
+
+def _device_kind(device: torch.device) -> str:
+    # 'cuda' and 'cuda:0' select the same kernels; only the backend can
+    # change the numerics a checkpoint captured.
+    return device.type
+
+
+@dataclass
+class BlockCalibrationResult:
+    """Adapted block and aligned CPU outputs before/after quantization.
+
+    ``reference_outputs`` always come from the original float block applied to
+    float-stream inputs. ``student_outputs`` use quantized upstream inputs and
+    the adapted block. A resumed result restores both streams and the model.
+    """
+
+    name: str
+    model: nn.Module
+    reference_outputs: list[Any]
+    student_outputs: list[Any]
+    kept_float: dict[str, str]
+    resumed: bool = False
+    schedule: QuantizationSchedule | None = None
+
+
+class BlockQuantizationPipeline:
+    """Execute recipes one float block at a time, with optional teacher observations.
+
+    ``input_source='float'`` collects each block's statistics on the original
+    float stream, equivalent to a full float-model collection for a deterministic
+    partition. ``'sequential'`` collects on the adapted upstream stream. The
+    estimator's requests, including paired collectors, determine the objective.
+
+    ``inference_model`` may supply an inference view of an adapted block, for
+    example a copy with packed weights materialized for GPU calibration. It must
+    not mutate the original block. Its semantics must be included in ``run_id``
+    when checkpointing. Block inputs/outputs are CPU tensor trees between calls.
+
+    ``target_paths`` enables dependency stages within each block: collect and
+    adapt independent targets together, then recollect for dependent targets.
+    The trace requires a functional eval forward; teacher weights stay frozen.
+    """
+
+    def __init__(
+        self,
+        config: QuantizationRecipeConfig,
+        *,
+        input_source: Literal["float", "sequential"] = "sequential",
+        forward_device: str | torch.device = "cpu",
+        estimation_device: str | torch.device = "cpu",
+        checkpoint_dir: str | Path | None = None,
+        run_id: str | None = None,
+        inference_model: Callable[[nn.Module], nn.Module] | None = None,
+        target_paths: tuple[str, ...] | None = None,
+    ) -> None:
+        if input_source not in {"float", "sequential"}:
+            raise ValueError("input_source must be float or sequential")
+        if config.preprocessing:
+            raise ValueError("Apply whole-model preprocessing before block calibration")
+        if config.kernel_lowering is not None:
+            raise ValueError(
+                "Set kernel_lowering=None; lower kernels after block calibration"
+            )
+        if checkpoint_dir is not None and not run_id:
+            raise ValueError(
+                "Checkpointing requires run_id identifying the model/data/forward contract"
+            )
+        if target_paths is not None and input_source != "sequential":
+            raise ValueError("Dependency stages require input_source=sequential")
+        self.target_paths = tuple(target_paths) if target_paths is not None else None
+        self.config = config
+        self.input_source = input_source
+        self.forward_device = torch.device(forward_device)
+        self.estimation_device = torch.device(estimation_device)
+        self.checkpoint_dir = (
+            Path(checkpoint_dir) if checkpoint_dir is not None else None
+        )
+        self.run_id = run_id
+        self.inference_model = inference_model
+
+    @torch.no_grad()
+    def forward(self, model: nn.Module, batches: list[Any]) -> list[Any]:
+        """Run batches on the forward device and return detached CPU outputs."""
+        outputs = self._forward(model, batches)
+        model.cpu()
+        return outputs
+
+    @torch.no_grad()
+    def _forward(self, model: nn.Module, batches: list[Any]) -> list[Any]:
+        # Like forward(), but leaves the model on the forward device.
+        model.to(self.forward_device).eval()
+        return [
+            move_batch(call_batch(model, move_batch(batch, self.forward_device)), "cpu")
+            for batch in batches
+        ]
+
+    def _checkpoint(
+        self, name: str, model: nn.Module, student: list[Any], reference: list[Any]
+    ) -> tuple[Path | None, str]:
+        if self.checkpoint_dir is None:
+            return None, ""
+        digest = hashlib.sha256()
+        _fingerprint(
+            {
+                "schema": 3,
+                **(
+                    {"target_paths": self.target_paths}
+                    if self.target_paths is not None
+                    else {}
+                ),
+                "run_id": self.run_id,
+                "name": name,
+                "recipe": self.config.model_dump_json(),
+                "input_source": self.input_source,
+                "forward_device": _device_kind(self.forward_device),
+                "estimation_device": _device_kind(self.estimation_device),
+                "torch": torch.__version__,
+                "neuropress": _package_version(),
+                "model": model.state_dict(),
+                "student": student,
+                "reference": reference,
+            },
+            digest,
+        )
+        # One slot per fingerprint: a run with another recipe, run_id or input
+        # stream computes into its own slot instead of colliding with this one.
+        fingerprint = digest.hexdigest()
+        block = hashlib.sha256(name.encode()).hexdigest()[:20]
+        return self.checkpoint_dir / block / fingerprint[:20], fingerprint
+
+    def _later_stages_pair(
+        self, model: nn.Module, stages: tuple[tuple[str, ...] | None, ...]
+    ) -> bool:
+        """Whether the recipe would request paired statistics after stage one.
+
+        Selection only filters targets, so one probe over the union of the
+        later stages answers for all of them. It uses a separately built
+        estimator, so the ones that run the stages are prepared exactly as
+        often as in an unprobed run. The probed targets are still float here,
+        as they will be when their stage runs.
+        """
+        later = {path for stage in stages[1:] if stage is not None for path in stage}
+        if not later:
+            return False
+        estimator = self.config.build().param_estimator
+        with estimator.select_targets(later):
+            estimator.prepare(model)
+            registry = StatisticsRegistry()
+            registry.register_requests(estimator.declare_statistics())
+            return registry.requires_pairing()
+
+    def _inference_view(self, model: nn.Module) -> nn.Module:
+        """Return the module that statistics and the student forward observe."""
+        if self.inference_model is None:
+            return model
+        # Build the view from a host block, so that a copying view never holds
+        # two copies of the block on the forward device at once.
+        model.cpu()
+        return self.inference_model(model)
+
+    def run_block(
+        self,
+        name: str,
+        model: nn.Module,
+        student_data: Iterable,
+        reference_data: Iterable,
+    ) -> BlockCalibrationResult:
+        """Calibrate and adapt a fresh float block; return both propagated streams.
+
+        Batches must be aligned, nonempty, and accepted by the block's forward.
+        Statistics use the forward device; estimation and packing use the
+        estimation device. Checkpoints validate the recipe, inputs and float
+        weights before loading, and commit metadata only after saving all state.
+        """
+        student = [move_batch(batch, "cpu") for batch in student_data]
+        reference = [move_batch(batch, "cpu") for batch in reference_data]
+        if not student or len(student) != len(reference):
+            raise ValueError(
+                "Nonempty, aligned student and reference batches are required"
+            )
+        path, fingerprint = self._checkpoint(name, model, student, reference)
+        if path is not None and (path / "complete.json").exists():
+            metadata = json.loads((path / "complete.json").read_text())
+            if metadata["fingerprint"] != fingerprint:
+                # Only a truncated-fingerprint collision lands here.
+                raise ValueError(
+                    f"Checkpoint mismatch for block {name}; use a fresh checkpoint directory"
+                )
+            model.cpu()
+            load_quantized_model(
+                model, path / "model.safetensors", kernel_lowering=None
+            )
+            model.eval()
+            streams = torch.load(path / "streams.pt", weights_only=True)
+            return BlockCalibrationResult(
+                name,
+                model,
+                streams["reference"],
+                streams["student"],
+                metadata["kept_float"],
+                True,
+                QuantizationSchedule(
+                    tuple(tuple(stage) for stage in metadata["schedule"])
+                )
+                if metadata.get("schedule") is not None
+                else None,
+            )
+
+        # The block stays on the forward device from the reference forward to
+        # the student forward: every phase in between needs it there, or on the
+        # estimation device, where QuantizationPipeline.run moves it itself. It
+        # returns to the host only where a copy is taken from it, and on
+        # failure the finally clause brings back everything placed on a device.
+        source = reference if self.input_source == "float" else student
+        schedule = None
+        teacher = None
+        observed = None
+        plan = QuantizationPlan()
+
+        def place_teacher() -> nn.Module:
+            assert teacher is not None
+            return teacher.to(self.forward_device).eval()
+
+        try:
+            reference_outputs = self._forward(model, reference)
+            # Without target_paths the whole block is one stage that selects
+            # every estimator target, exactly like a whole-model pipeline run.
+            stages: tuple[tuple[str, ...] | None, ...] = (None,)
+            if self.target_paths is not None:
+                # Batches are compared on the host and only the traced ones
+                # cross to the forward device.
+                schedule = QuantizationSchedule.trace(
+                    model, source, self.target_paths, device=self.forward_device
+                )
+                stages = schedule.stages
+            # The first stage collects before any adaptation, so the observed
+            # block is its own float teacher. Later stages see adapted weights
+            # and need a frozen copy, taken now (before stage one adapts
+            # anything) but only if one of them will pair; it is copied in host
+            # memory and reaches the forward device only for stages that pair.
+            if self._later_stages_pair(model, stages):
+                model.cpu()
+                teacher = copy.deepcopy(model)
+            for index, stage in enumerate(stages):
+                observed = self._inference_view(model)
+                observed.to(self.forward_device).eval()
+                pipeline = QuantizationPipeline(self.config.build())
+                pipeline.run(
+                    model,
+                    (move_batch(batch, self.forward_device) for batch in source),
+                    reference_data=(
+                        move_batch(batch, self.forward_device) for batch in reference
+                    ),
+                    reference_model=place_teacher if index else None,
+                    # One block's teacher outputs fit next to the block, and
+                    # parking them on the host would cost two transfers each.
+                    reference_device=None,
+                    estimation_device=self.estimation_device,
+                    collection_model=observed,
+                    target_paths=set(stage) if stage is not None else None,
+                )
+                plan.kept_float.update(pipeline.last_plan.kept_float)
+                # A separate inference view is rebuilt for the next stage, so
+                # dropping it frees its device memory without a transfer.
+                observed = None
+                if teacher is not None:
+                    teacher.cpu()
+            observed = self._inference_view(model)
+            student_outputs = self._forward(observed, student)
+            observed = None
+        finally:
+            for module in (observed, teacher, model):
+                if module is not None:
+                    module.cpu()
+        result = BlockCalibrationResult(
+            name,
+            model,
+            reference_outputs,
+            student_outputs,
+            dict(plan.kept_float),
+            schedule=schedule,
+        )
+        if path is not None:
+            path.mkdir(parents=True, exist_ok=True)
+            save_quantized_model(
+                model, path / "model.safetensors", self.config.model_dump_json()
+            )
+            torch.save(
+                {"reference": reference_outputs, "student": student_outputs},
+                path / "streams.pt",
+            )
+            temporary = path / "complete.json.tmp"
+            temporary.write_text(
+                json.dumps(
+                    {
+                        "fingerprint": fingerprint,
+                        "kept_float": result.kept_float,
+                        "schedule": schedule.stages if schedule else None,
+                    }
+                )
+            )
+            temporary.replace(path / "complete.json")
+        return result
+
+    def run(
+        self,
+        blocks: Iterable[tuple[str, nn.Module]],
+        calibration_data: Iterable,
+        *,
+        propagate: Callable[[Any, Any], Any] | None = None,
+    ) -> Iterator[BlockCalibrationResult]:
+        """Yield adapted blocks while advancing aligned float/student activations.
+
+        Blocks may be loaded lazily. ``propagate(previous_batch, output)`` forms
+        the next block's batch; the default uses the output directly, so a dict
+        output is passed to the next block as keyword arguments. Outputs are
+        plain CPU tensor trees (see :func:`move_batch`): a ``ModelOutput`` is
+        a ``dict`` here, fresh or resumed, so ``propagate`` should read
+        ``output["last_hidden_state"]`` rather than the attribute. Retain only
+        the results needed by the caller to preserve bounded memory.
+        """
+        reference = [move_batch(batch, "cpu") for batch in calibration_data]
+        student = reference
+        seen = set()
+        # Two records, because run_block moves each block to the forward
+        # device and back, which gives every parameter fresh storage: identity
+        # catches a Parameter object reused by a later block, and the storage
+        # snapshot catches distinct Parameters viewing the same memory (those
+        # keep the original storage alive, so its weakref stays valid).
+        # Keyed by id with a liveness check: Tensor.__eq__ is elementwise, so
+        # set membership cannot compare Parameters by identity.
+        visited: dict[int, weakref.ref] = {}
+        parameters = {}
+        for name, block in blocks:
+            if name in seen:
+                raise ValueError(f"Duplicate block name: {name}")
+            seen.add(name)
+            current_parameters = {}
+            current_visited = {}
+            for parameter in block.parameters():
+                if parameter.numel() == 0:
+                    continue
+                storage = (
+                    str(parameter.device),
+                    parameter.untyped_storage().data_ptr(),
+                )
+                previous = parameters.get(storage)
+                reused = visited.get(id(parameter))
+                if (reused is not None and reused() is parameter) or (
+                    previous is not None and previous() is not None
+                ):
+                    raise ValueError(
+                        "Blocks must not share parameter storage across boundaries"
+                    )
+                current_parameters[storage] = weakref.ref(parameter.untyped_storage())
+                current_visited[id(parameter)] = weakref.ref(parameter)
+            parameters.update(current_parameters)
+            visited.update(current_visited)
+            result = self.run_block(name, block, student, reference)
+            student = [
+                propagate(batch, output) if propagate else output
+                for batch, output in zip(student, result.student_outputs, strict=True)
+            ]
+            reference = [
+                propagate(batch, output) if propagate else output
+                for batch, output in zip(
+                    reference, result.reference_outputs, strict=True
+                )
+            ]
+            yield result

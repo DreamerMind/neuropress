@@ -23,6 +23,7 @@ from typing import Annotated
 import torch
 from torch.types import Device
 
+from ..calibration.batches import materialize
 from ..calibration.probe import HessianAccumulator, StatField
 from ..qscheme.descriptor import GranularityType
 from ..qscheme.group import QSchemeGroup
@@ -379,16 +380,24 @@ class GPTQCalibration(CalibrationMethodOnActivation[T_SUPPORTED_QSCHEMES]):
 
     def _quantize_preprocess(self) -> QProcessingData:
         w = self._clone_weights()
-        hessian = self.hessian
-        if hessian is not None and not isinstance(hessian, torch.Tensor):
-            hessian = hessian.to_base_tensor()
-        assert hessian is not None
-        # Free the stored hessian to reclaim memory.
+        shared = self.hessian
+        assert shared is not None
+        # Drop our references; the caller may still share the tensor (e.g. a
+        # registry statistic that is cached after estimation), so everything
+        # below copies before it writes. Relocation brings a CPU-accumulated
+        # Hessian to the weights for this layer only, and a disk-offloaded one
+        # reloads as a fresh tensor that is ours to write.
         self.hessian = None
         if self._hessian_accumulator is not None:
             self._hessian_accumulator.hessian = None
+        hessian = materialize(shared).to(device=w.device, dtype=torch.float32)
+        owned = hessian is not shared
+        del shared
 
-        w, hessian = _fix_dead_diag(w, hessian)
+        if (torch.diag(hessian) == 0).any():
+            if not owned:
+                hessian, owned = hessian.clone(), True
+            w, hessian = _fix_dead_diag(w, hessian)
 
         qschemes: list = []
         if self.static_groups:
@@ -401,7 +410,9 @@ class GPTQCalibration(CalibrationMethodOnActivation[T_SUPPORTED_QSCHEMES]):
 
         perm = None
         if self.quant_col_in_hessian_diag_magnitude_order:
-            perm, w, hessian = _reorder_by_hessian_diag(w, hessian)
+            perm, w, hessian = _reorder_by_hessian_diag(w, hessian)  # copies
+        elif not owned:
+            hessian = hessian.clone()  # damping below writes the diagonal
 
         inv_hinv, damp_percent = self._apply_damp_and_compute_inv_hessian_chol_upper(
             hessian
@@ -558,7 +569,9 @@ def _reorder_by_hessian_diag(
     w: torch.Tensor, hessian: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     perm = torch.argsort(torch.diag(hessian), descending=True)
-    return perm, w[:, perm], hessian[perm][:, perm]
+    # One gather instead of hessian[perm][:, perm], which materializes an
+    # intermediate [K, K] copy.
+    return perm, w[:, perm], hessian[perm.unsqueeze(1), perm]
 
 
 def _is_conv1d_transpose(module_class: type | None) -> bool:

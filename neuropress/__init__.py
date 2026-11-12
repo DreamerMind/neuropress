@@ -1,6 +1,7 @@
 """neuropress – graph-aware quantization framework."""
 
 from .adapter import ModuleQuantizationAdapter, WeightAssignmentAdapter
+from .block_pipeline import BlockCalibrationResult, BlockQuantizationPipeline
 from .calibration import (
     COLLECTOR_REGISTRY,
     DATASET_REGISTRY,
@@ -25,6 +26,7 @@ from .estimators import (
     MinMaxZpWeightEstimator,
 )
 from .graph import QGraph, QNode, QValue, RuntimeModuleGraphProvider
+from .graph.schedule import QuantizationSchedule
 from .kernel_lowering import AutoKernelLowering, KernelLowering
 from .methods import METHOD_REGISTRY
 from .pipeline import QuantizationPipeline
@@ -79,6 +81,8 @@ __all__ = [
     "AdapterConfig",
     "AutoKernelLowering",
     "AutoKernelLoweringConfig",
+    "BlockCalibrationResult",
+    "BlockQuantizationPipeline",
     "CalibrationConfig",
     "CalibrationProbe",
     "CompositeEstimator",
@@ -110,6 +114,7 @@ __all__ = [
     "QuantizationPlan",
     "QuantizationRecipe",
     "QuantizationRecipeConfig",
+    "QuantizationSchedule",
     "QuantizedWeight",
     "RuntimeModuleGraphProvider",
     "SmoothQuantStep",

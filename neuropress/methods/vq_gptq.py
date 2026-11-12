@@ -28,6 +28,10 @@ from torch import nn
 
 LOGGER = logging.getLogger(__name__)
 
+# Device types already warned about. Process-wide, because block calibration
+# builds a fresh estimator, and so a fresh corrector, for every stage.
+_WARNED_DEVICE_TYPES: set[str] = set()
+
 
 @dataclass
 class VQGPTQCorrector:
@@ -101,6 +105,13 @@ class VQGPTQCorrector:
         bits = IndexPacking.bits_for(centroids.shape[0])
 
         if device.type != "cuda":
+            if device.type not in _WARNED_DEVICE_TYPES:
+                _WARNED_DEVICE_TYPES.add(device.type)
+                LOGGER.warning(
+                    "VQGPTQCorrector: GPTQ correction needs a CUDA estimation "
+                    "device, got %s; keeping plain VQ assignments.",
+                    device,
+                )
             return None
         w_fp32_bytes = w.numel() * 4
         free_bytes, _ = torch.cuda.mem_get_info(device)
@@ -120,10 +131,19 @@ class VQGPTQCorrector:
             perm = column_perm.to(device)
             w2d = w2d[:, perm]
             H = H[perm][:, perm]
+        # Without a permutation, w2d is the module weight itself when that is
+        # already float32 on the device; every write below goes to this copy.
+        w_corr = w2d.clone()
+        del w2d
 
         dead = H.diagonal() == 0
-        H.diagonal()[dead] = 1.0
-        w2d[:, dead] = 0.0
+        if dead.any():
+            if H is full_h:
+                # Already float32 on the device, so H is the caller's (often
+                # a registry statistic); patch a copy instead.
+                H = H.clone()
+            H.diagonal()[dead] = 1.0
+            w_corr[:, dead] = 0.0
 
         try:
             U = self.cholesky_inv_upper(H)
@@ -146,7 +166,6 @@ class VQGPTQCorrector:
         G = K // VL
         U_diag = U.diagonal()
 
-        w_corr = w2d.clone()
         all_indices: list[torch.Tensor] = []
 
         do_attraction = self.centroid_attraction > 0.0

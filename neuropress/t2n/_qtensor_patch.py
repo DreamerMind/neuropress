@@ -9,12 +9,24 @@ Importing this module patches two upstream issues in ``torch_to_nnef``:
 2. ``QTensor.to()`` — performs an expensive dequant/requant round-trip
    even for device-only moves.
 
+3. ``QTensor.cpu()`` / ``QTensor.cuda()`` - fall through to
+   ``__torch_function__``, which returns a dequantized plain tensor, so
+   ``nn.Module.cpu()`` silently left every quantized weight on its device.
+   Like the patched ``to()``, they move the tensor in place and return it.
+
+4. ``copy.deepcopy`` of a QTensor - dispatched through ``__torch_function__``,
+   which decompressed a temporary and keyed deepcopy's memo on it, so a copy
+   lost its quantization and, once temporaries' ids were reused, could take
+   another layer's weights.
+
 These patches are intended as prototypes for eventual upstream fixes.
 """
 
 from __future__ import annotations
 
+import copy
 import logging
+import warnings
 
 import torch
 from torch_to_nnef.tensor.opaque import OpaqueTensor
@@ -100,4 +112,54 @@ def _qtensor_to(self: QTensor, *args: object, **kwargs: object) -> QTensor:
 
 QTensor.to = _qtensor_to  # type: ignore[assignment]
 
-logger.debug("Patched OpaqueTensor.data and QTensor.to for device handling")
+# ---------------------------------------------------------------------------
+# 3. QTensor.cpu() / QTensor.cuda() - device moves that stay quantized
+# ---------------------------------------------------------------------------
+
+
+def _qtensor_cpu(self: QTensor, memory_format: object = None) -> QTensor:
+    """Move to the host like ``to("cpu")``, keeping the packed form."""
+    return self.to("cpu")
+
+
+def _qtensor_cuda(
+    self: QTensor,
+    device: int | str | torch.device | None = None,
+    non_blocking: bool = False,
+    memory_format: object = None,
+) -> QTensor:
+    """Move to a CUDA device like ``to(device)``, keeping the packed form."""
+    if device is None:
+        device = "cuda"
+    elif isinstance(device, int):
+        device = torch.device("cuda", device)
+    return self.to(device)
+
+
+QTensor.cpu = _qtensor_cpu  # type: ignore[assignment]
+QTensor.cuda = _qtensor_cuda  # type: ignore[assignment]
+
+# ---------------------------------------------------------------------------
+# 4. QTensor.__deepcopy__ - copy the packed form, not a decompressed temporary
+# ---------------------------------------------------------------------------
+
+
+def _qtensor_deepcopy(self: QTensor, memo: dict) -> QTensor:
+    """Deep-copy through the pickle protocol, which QTensor keeps quantized.
+
+    ``copy._reconstruct`` is what ``copy.deepcopy`` itself does for objects
+    without ``__deepcopy__``: it registers the copy in *memo* and deep-copies
+    the reduced state with that memo, so a codebook shared by several layers
+    stays shared within the copy.
+    """
+    if id(self) in memo:
+        return memo[id(self)]
+    with warnings.catch_warnings():
+        # The reduced state holds the wrapper's TypedStorage.
+        warnings.filterwarnings("ignore", message="TypedStorage is deprecated")
+        return copy._reconstruct(self, memo, *self.__reduce_ex__(4))
+
+
+QTensor.__deepcopy__ = _qtensor_deepcopy  # type: ignore[assignment]
+
+logger.debug("Patched OpaqueTensor.data and QTensor.to/cpu/cuda/deepcopy")

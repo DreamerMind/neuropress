@@ -196,6 +196,8 @@ class GptqEstimatorConfig(EstimatorConfig):
     damp_percent: float = 0.01
     damp_auto_increment: float = 0.0025
     weight_transform: str | None = None
+    reconstruction: Literal["self", "teacher"] = "self"
+    reconstruction_damp_percent: float = Field(default=0.01, gt=0)
 
     def build(self) -> GPTQEstimator:
         """Build a :class:`.GPTQEstimator` for the configured target class.
@@ -224,6 +226,8 @@ class GptqEstimatorConfig(EstimatorConfig):
             symmetric=self.symmetric,
             damp_percent=self.damp_percent,
             damp_auto_increment=self.damp_auto_increment,
+            reconstruction=self.reconstruction,
+            reconstruction_damp_percent=self.reconstruction_damp_percent,
         )
 
 
@@ -381,8 +385,6 @@ class HqqEstimatorConfig(EstimatorConfig):
         )
 
 
-@estimator_config("vptq")
-@estimator_config("vptq_group")  # backward-compat alias
 def _resolve_cluster_backend(name: str, n_iter: int):
     """Resolve a backend name to an instance, deferring the import.
 
@@ -394,6 +396,8 @@ def _resolve_cluster_backend(name: str, n_iter: int):
     return backend_by_name(name, n_iter=n_iter)
 
 
+@estimator_config("vptq")
+@estimator_config("vptq_group")  # backward-compat alias
 class VptqGroupEstimatorConfig(EstimatorConfig):
     """JSON-serialisable config for :class:`.VPTQGroupEstimator`.
 

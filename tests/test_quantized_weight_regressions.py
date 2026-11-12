@@ -1169,3 +1169,43 @@ def test_lowered_embedding_returns_the_replaced_dtype(format_name):
     assert out.dtype == torch.float32
     # The kernels decode through the f16 scale dtype.
     torch.testing.assert_close(out, expected[ids], rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_vq_gptq_correction_leaves_the_callers_hessian_and_weight_untouched():
+    from neuropress.methods.vq_gptq import VQGPTQCorrector
+
+    torch.manual_seed(5)
+    module = nn.Linear(16, 8, bias=False)
+    x = torch.randn(64, 16, device="cuda")
+    x[:, :2] = 0  # dead columns: the corrector patches their diagonal
+    full_h = x.t() @ x
+    saved = full_h.clone()
+    # A float32 weight already on the device is reshaped without a copy.
+    module.to("cuda")
+    weight = module.weight.detach().clone()
+    centroids = torch.randn(16, 4, device="cuda")
+    VQGPTQCorrector(vector_len=4).correct(
+        "layer", module, centroids, full_h, torch.device("cuda")
+    )
+    torch.testing.assert_close(full_h, saved, rtol=0, atol=0)
+    torch.testing.assert_close(module.weight, weight, rtol=0, atol=0)
+
+
+def test_vq_gptq_correction_warns_once_when_it_cannot_run(caplog, monkeypatch):
+    from neuropress.methods import vq_gptq
+    from neuropress.methods.vq_gptq import VQGPTQCorrector
+
+    monkeypatch.setattr(vq_gptq, "_WARNED_DEVICE_TYPES", set())
+    module = nn.Linear(16, 8, bias=False)
+    centroids = torch.randn(16, 4)
+    with caplog.at_level("WARNING", logger="neuropress.methods.vq_gptq"):
+        # Block calibration builds a fresh corrector for every stage.
+        for _ in range(3):
+            assert (
+                VQGPTQCorrector(vector_len=4).correct(
+                    "layer", module, centroids, torch.eye(16), torch.device("cpu")
+                )
+                is None
+            )
+    assert sum("needs a CUDA" in r.getMessage() for r in caplog.records) == 1

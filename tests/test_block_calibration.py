@@ -1,0 +1,1034 @@
+"""Block execution, composable paired statistics, and teacher reconstruction."""
+
+from copy import deepcopy
+
+import pytest
+import torch
+from torch import nn
+
+from neuropress.block_pipeline import BlockQuantizationPipeline
+from neuropress.calibration.probe import (
+    COLLECTOR_REGISTRY,
+    PairedCollector,
+    StatisticRequest,
+    StatisticsRegistry,
+)
+from neuropress.calibration.probe.reconstruction import reconstruct_linear_weight
+from neuropress.pipeline import QuantizationPipeline
+from neuropress.recipe_config import QuantizationRecipeConfig
+
+
+def recipe(teacher=False):
+    return QuantizationRecipeConfig.model_validate(
+        {
+            "estimator": {
+                "type": "gptq",
+                "group_size": 32,
+                "nbits": 4,
+                "symmetric": True,
+                "weight_transform": "q4_0",
+                "reconstruction": "teacher" if teacher else "self",
+            },
+            "kernel_lowering": None,
+        }
+    )
+
+
+def test_teacher_statistics_match_ridge_objective_without_mutation():
+    torch.manual_seed(4)
+    model = nn.Sequential(nn.Linear(32, 16, bias=True)).eval()
+    weight = model[0].weight.detach().clone()
+    x = torch.randn(3, 24, 32)
+    student = x * torch.linspace(0.7, 1.3, 32)
+    registry = StatisticsRegistry()
+    registry.register_requests(
+        [
+            StatisticRequest(target_key="0", stat_type=s)
+            for s in ["hessian", "linear_reconstruction"]
+        ]
+    )
+    registry.collect(model, [student], reference_data=[x])
+    h = registry.get(StatisticRequest(target_key="0", stat_type="hessian"))["hessian"]
+    cross = registry.get(
+        StatisticRequest(target_key="0", stat_type="linear_reconstruction")
+    )["cross"]
+    new = reconstruct_linear_weight(weight, h, cross, 0.01)
+    flat = student.flatten(0, 1)
+    y = x.flatten(0, 1) @ weight.t()
+    ridge = 0.01 * h.diag().mean()
+    expected = torch.linalg.solve(
+        2 * flat.t() @ flat + ridge * torch.eye(32),
+        2 * flat.t() @ y + ridge * weight.t(),
+    ).t()
+    torch.testing.assert_close(new, expected, rtol=2e-5, atol=2e-6)
+    assert (flat @ new.t() - y).square().sum() < (flat @ weight.t() - y).square().sum()
+    torch.testing.assert_close(model[0].weight, weight, rtol=0, atol=0)
+
+
+def test_teacher_gptq_improves_known_upstream_scale_error():
+    torch.manual_seed(5)
+    original = nn.Sequential(nn.Linear(32, 16, bias=False)).eval()
+    x = torch.randn(4, 64, 32)
+    student = x * 1.5
+    ordinary, teacher = deepcopy(original), deepcopy(original)
+    for model, use_teacher in [(ordinary, False), (teacher, True)]:
+        pipeline = QuantizationPipeline(recipe(use_teacher).build())
+        pipeline.run(model, [student], reference_data=[x], estimation_device="cpu")
+        assert not pipeline.last_plan.kept_float
+    with torch.no_grad():
+        target = original(x)
+        assert (teacher(student) - target).norm() < (
+            ordinary(student) - target
+        ).norm() * 0.3
+
+
+def test_self_and_teacher_match_when_streams_are_identical():
+    torch.manual_seed(6)
+    original = nn.Sequential(nn.Linear(32, 16, bias=False)).eval()
+    x = torch.randn(4, 32)
+    models = [deepcopy(original), deepcopy(original)]
+    for model, use_teacher in zip(models, [False, True], strict=True):
+        QuantizationPipeline(recipe(use_teacher).build()).run(
+            model, [x], reference_data=[x]
+        )
+    torch.testing.assert_close(
+        models[0][0].weight.decompress_to_u8(),
+        models[1][0].weight.decompress_to_u8(),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize("source", ["float", "sequential"])
+def test_block_execution_matches_explicit_schedule_and_resume(source, tmp_path):
+    torch.manual_seed(11)
+    blocks = [
+        nn.Sequential(nn.Linear(32, 32, bias=False), nn.ReLU()).eval() for _ in range(2)
+    ]
+    inputs = [torch.randn(2, 12, 32)]
+    originals = deepcopy(blocks)
+    runner = BlockQuantizationPipeline(
+        recipe(), input_source=source, checkpoint_dir=tmp_path, run_id="toy-v1"
+    )
+    actual = list(runner.run(enumerate_names(blocks), inputs))
+    reference, student = inputs, inputs
+    for expected, result in zip(originals, actual, strict=True):
+        with torch.no_grad():
+            reference_outputs = [expected(x) for x in reference]
+        QuantizationPipeline(recipe().build()).run(
+            expected, reference if source == "float" else student
+        )
+        with torch.no_grad():
+            student = [expected(x) for x in student]
+        reference = reference_outputs
+        torch.testing.assert_close(result.student_outputs[0], student[0])
+        torch.testing.assert_close(result.reference_outputs[0], reference[0])
+    torch.manual_seed(11)
+    fresh = [
+        nn.Sequential(nn.Linear(32, 32, bias=False), nn.ReLU()).eval() for _ in range(2)
+    ]
+    resumed = list(runner.run(enumerate_names(fresh), inputs))
+    assert all(result.resumed for result in resumed)
+    for expected, result in zip(actual, resumed, strict=True):
+        torch.testing.assert_close(
+            result.student_outputs[0], expected.student_outputs[0], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            result.model[0].weight.decompress_to_u8(),
+            expected.model[0].weight.decompress_to_u8(),
+            rtol=0,
+            atol=0,
+        )
+    # Other float weights compute into a slot of their own, and the original
+    # slot still resumes afterwards.
+    other = runner.run_block(
+        "0",
+        nn.Sequential(nn.Linear(32, 32, bias=False), nn.ReLU()).eval(),
+        inputs,
+        inputs,
+    )
+    assert not other.resumed
+    torch.manual_seed(11)
+    again = list(
+        runner.run(
+            enumerate_names(
+                [
+                    nn.Sequential(nn.Linear(32, 32, bias=False), nn.ReLU()).eval()
+                    for _ in range(2)
+                ]
+            ),
+            inputs,
+        )
+    )
+    assert all(result.resumed for result in again)
+
+
+def enumerate_names(blocks):
+    return ((str(i), block) for i, block in enumerate(blocks))
+
+
+@pytest.mark.parametrize("failure", ["missing", "length", "shape"])
+def test_pairing_failures_remove_hooks(failure):
+    model = nn.Sequential(nn.Linear(32, 16)).eval()
+    registry = StatisticsRegistry()
+    registry.register_requests(
+        [StatisticRequest(target_key="0", stat_type="linear_reconstruction")]
+    )
+    x = torch.randn(2, 32)
+    refs = (
+        None
+        if failure == "missing"
+        else ([] if failure == "length" else [torch.randn(3, 32)])
+    )
+    with pytest.raises(ValueError):
+        registry.collect(model, [x], reference_data=refs)
+    assert not model[0]._forward_hooks
+
+
+@pytest.mark.parametrize("estimation_device", [None, "cpu"])
+def test_composite_recipe_roundtrip_and_mixed_collection(estimation_device):
+    config = QuantizationRecipeConfig.model_validate(
+        {
+            "estimator": {
+                "type": "composite",
+                "methods": [
+                    {
+                        "type": "gptq",
+                        "target": "linear",
+                        "group_size": 32,
+                        "weight_transform": "q4_0",
+                        "reconstruction": "teacher",
+                        "reconstruction_damp_percent": 0.03,
+                    },
+                    {"type": "min_max_zp_weight", "target": "embedding", "nbits": 8},
+                ],
+            },
+            "kernel_lowering": None,
+        }
+    )
+    restored = QuantizationRecipeConfig.from_json(config.model_dump_json())
+    assert restored.model_dump() == config.model_dump()
+    model = nn.Sequential(nn.Embedding(128, 32), nn.Linear(32, 16)).eval()
+    pipeline = QuantizationPipeline(restored.build())
+    ids = torch.randint(0, 128, (2, 16))
+    pipeline.run(
+        model, [ids], reference_data=[ids], estimation_device=estimation_device
+    )
+    assert not pipeline.last_plan.kept_float
+    assert set(pipeline.last_plan.weight_assignments) == {"0", "1"}
+    assert hasattr(model[1].weight, "qscheme")
+
+
+def test_future_paired_collector_composes_with_existing_hessian(monkeypatch):
+    class DifferenceCollector(PairedCollector):
+        def __init__(self):
+            self.value = 0.0
+
+        def update_pair(self, inputs, output, reference):
+            self.value += float((output - reference).square().sum())
+
+        def result(self):
+            return {"squared_error": self.value}
+
+    monkeypatch.setitem(COLLECTOR_REGISTRY, "future_objective", DifferenceCollector)
+    model = nn.Sequential(nn.Linear(32, 16)).eval()
+    x = torch.randn(2, 32)
+    registry = StatisticsRegistry()
+    requests = [
+        StatisticRequest(target_key="0", stat_type=s)
+        for s in ["hessian", "future_objective"]
+    ]
+    registry.register_requests(requests + requests)
+    registry.collect(model, [x * 2], reference_data=[x])
+    assert registry.get(requests[0])["hessian"] is not None
+    with torch.no_grad():
+        expected = (model(x * 2) - model(x)).square().sum().item()
+    assert registry.get(requests[1])["squared_error"] == pytest.approx(expected)
+
+
+def test_float_block_statistics_match_whole_model_collection():
+    torch.manual_seed(14)
+    original = nn.Sequential(
+        nn.Sequential(nn.Linear(32, 32, bias=False), nn.ReLU()),
+        nn.Sequential(nn.Linear(32, 32, bias=False), nn.ReLU()),
+    ).eval()
+    whole = deepcopy(original)
+    batches = [torch.randn(2, 16, 32) for _ in range(3)]
+    QuantizationPipeline(recipe().build()).run(whole, batches)
+    blocked = list(
+        BlockQuantizationPipeline(recipe(), input_source="float").run(
+            enumerate_names(original), batches
+        )
+    )
+    for index, result in enumerate(blocked):
+        torch.testing.assert_close(
+            result.model[0].weight.decompress_to_u8(),
+            whole[index][0].weight.decompress_to_u8(),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            result.model[0].weight.qscheme.scale,
+            whole[index][0].weight.qscheme.scale,
+            rtol=0,
+            atol=0,
+        )
+
+
+def test_reference_model_and_repeated_invocations_are_aligned():
+    class Repeated(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(32, 32)
+
+        def forward(self, x):
+            return self.linear(self.linear(x))
+
+    torch.manual_seed(8)
+    teacher = Repeated().eval()
+    student = deepcopy(teacher)
+    with torch.no_grad():
+        student.linear.weight.mul_(0.8)
+    registry = StatisticsRegistry()
+    request = StatisticRequest(target_key="linear", stat_type="linear_reconstruction")
+    registry.register_requests([request])
+    registry.collect(
+        student,
+        [torch.randn(2, 32)],
+        reference_data=[torch.randn(2, 32)],
+        reference_model=teacher,
+    )
+    assert registry.get(request)["nsamples"] == 2
+    assert not student.linear._forward_hooks
+    assert not teacher.linear._forward_hooks
+
+
+@pytest.mark.parametrize("alias", [False, True])
+def test_block_runner_rejects_cross_block_shared_weights(alias):
+    first = nn.Sequential(nn.Linear(32, 32, bias=False)).eval()
+    second = nn.Sequential(nn.Linear(32, 32, bias=False)).eval()
+    second[0].weight = (
+        nn.Parameter(first[0].weight.detach().view_as(first[0].weight))
+        if alias
+        else first[0].weight
+    )
+    runner = BlockQuantizationPipeline(recipe())
+    with pytest.raises(ValueError, match="share parameter storage"):
+        list(runner.run(enumerate_names([first, second]), [torch.randn(2, 32)]))
+
+
+@pytest.mark.parametrize("teacher", [False, True])
+def test_estimators_do_not_mutate_shared_statistics(teacher):
+    from neuropress.graph.graph import QGraph
+
+    model = nn.Sequential(nn.Linear(32, 16, bias=False)).eval()
+    x = torch.randn(2, 20, 32)
+    x[..., :3] = 0
+    config = recipe(teacher).build()
+    estimator = config.param_estimator
+    estimator.prepare(model)
+    registry = StatisticsRegistry()
+    requests = estimator.declare_statistics()
+    registry.register_requests(requests)
+    registry.collect(model, [x], reference_data=[x * 1.2])
+    saved = {
+        request.stat_type: {
+            key: value.clone()
+            for key, value in registry.get(request).items()
+            if isinstance(value, torch.Tensor)
+        }
+        for request in requests
+    }
+    plan = estimator.estimate(QGraph(), registry, config)
+    assert not plan.kept_float
+    for request in requests:
+        for key, value in saved[request.stat_type].items():
+            torch.testing.assert_close(
+                registry.get(request)[key], value, rtol=0, atol=0
+            )
+
+
+def test_block_runner_allows_future_gradient_based_estimators(monkeypatch):
+    from neuropress.estimator import QuantizationParamEstimator
+    from neuropress.estimator_configs import EstimatorConfig
+    from neuropress.plan import QuantizationPlan
+
+    class Samples(PairedCollector):
+        def update_pair(self, inputs, output, reference):
+            self.inputs = inputs[0].detach().clone()
+            self.targets = reference.detach().clone()
+
+        def result(self):
+            return {"inputs": self.inputs, "targets": self.targets}
+
+    class GradientEstimator(QuantizationParamEstimator):
+        def prepare(self, model):
+            self.model = model
+
+        def declare_statistics(self):
+            return [StatisticRequest(target_key="", stat_type="paired_samples")]
+
+        def estimate(self, graph, registry, recipe):
+            samples = registry.get(self.declare_statistics()[0])
+            candidate = deepcopy(self.model).requires_grad_(True)
+            loss = (candidate(samples["inputs"]) - samples["targets"]).square().mean()
+            gradients = torch.autograd.grad(loss, tuple(candidate.parameters()))
+            return QuantizationPlan(
+                weight_assignments={
+                    name: (module.weight - 0.1 * gradient).detach()
+                    for (name, module), gradient in zip(
+                        [
+                            (name, mod)
+                            for name, mod in candidate.named_modules()
+                            if isinstance(mod, nn.Linear)
+                        ],
+                        gradients,
+                        strict=True,
+                    )
+                }
+            )
+
+    class GradientConfig(EstimatorConfig):
+        type: str = "test_gradient"
+
+        def build(self):
+            return GradientEstimator()
+
+    monkeypatch.setitem(COLLECTOR_REGISTRY, "paired_samples", Samples)
+    model = nn.Sequential(
+        nn.Linear(32, 16, bias=False), nn.Tanh(), nn.Linear(16, 8, bias=False)
+    ).eval()
+    original = [model[i].weight.detach().clone() for i in [0, 2]]
+    config = QuantizationRecipeConfig(estimator=GradientConfig(), kernel_lowering=None)
+    x = torch.randn(4, 32)
+    result = BlockQuantizationPipeline(config).run_block("block", model, [x * 1.5], [x])
+    for i, weight in zip([0, 2], original, strict=True):
+        assert not torch.equal(result.model[i].weight, weight)
+    assert torch.isfinite(result.student_outputs[0]).all()
+
+
+def test_checkpoint_resume_restores_eval_mode_for_all_modules(tmp_path):
+    torch.manual_seed(91)
+    original = nn.Sequential(
+        nn.Linear(32, 32, bias=False),
+        nn.Sequential(nn.BatchNorm1d(32), nn.Dropout(0.75)),
+    )
+    x = torch.randn(8, 32)
+    runner = BlockQuantizationPipeline(recipe(), checkpoint_dir=tmp_path, run_id="eval")
+    fresh = runner.run_block("block", deepcopy(original), [x], [x])
+    resumed = runner.run_block("block", deepcopy(original), [x], [x])
+    assert resumed.resumed
+    assert all(not module.training for module in resumed.model.modules())
+    assert all(
+        parameter.device.type == "cpu" for parameter in resumed.model.parameters()
+    )
+    with torch.no_grad():
+        torch.testing.assert_close(resumed.model(x), fresh.model(x), rtol=0, atol=0)
+        torch.testing.assert_close(
+            resumed.model(x), resumed.student_outputs[0], rtol=0, atol=0
+        )
+
+
+def test_registry_relocates_one_statistic_per_access():
+    class Offloaded(torch.Tensor):
+        pass
+
+    registry = StatisticsRegistry()
+    hessian = torch.eye(4)
+    offloaded = torch.Tensor._make_subclass(Offloaded, torch.eye(4))
+    registry.set_stat("a", "hessian", {"hessian": hessian, "nsamples": 3})
+    registry.set_stat("b", "hessian", {"hessian": offloaded, "nsamples": 3})
+    registry.to("meta")
+    a = StatisticRequest(target_key="a", stat_type="hessian")
+    b = StatisticRequest(target_key="b", stat_type="hessian")
+    assert registry.get(a)["hessian"].device.type == "meta"
+    assert registry.get(a)["nsamples"] == 3
+    # The collected original stays where the collector left it.
+    assert registry.get(a, relocate=False)["hessian"] is hessian
+    # Tensor subclasses (e.g. disk-offloaded Hessians) are not materialized.
+    assert registry.get(b)["hessian"] is offloaded
+
+
+@pytest.mark.parametrize("ordered", [True, False])
+@pytest.mark.parametrize("dead", [False, True])
+def test_gptq_never_writes_to_a_shared_hessian(ordered, dead):
+    from neuropress.methods.gptq import GPTQCalibration
+    from neuropress.methods.zp_scale_calib import NormZpScaleCalibration
+    from neuropress.qscheme.descriptor import Granularity
+
+    torch.manual_seed(12)
+    layer = nn.Linear(32, 16, bias=False)
+    x = torch.randn(64, 32)
+    if dead:
+        x[:, :3] = 0
+    hessian = 2 * x.t() @ x / x.shape[0]
+
+    def codes(h):
+        gran = Granularity.per_group([32])
+        calib = GPTQCalibration(
+            granularity=gran,
+            possible_quantizers=[
+                NormZpScaleCalibration(nbits=4, symmetric=True, granularity=gran)
+            ],
+            quant_col_in_hessian_diag_magnitude_order=ordered,
+        )
+        calib.weight_tensor = layer.weight
+        calib.module_class = nn.Linear
+        calib.module = layer
+        calib.name = "layer"
+        calib.init()
+        calib.hessian, calib.nsamples = h, x.shape[0]
+        calib.compute_quantization()
+        return calib.quantized_codes
+
+    shared = hessian.clone()
+    actual = codes(shared)
+    torch.testing.assert_close(shared, hessian, rtol=0, atol=0)
+    torch.testing.assert_close(actual, codes(hessian.clone()), rtol=0, atol=0)
+
+
+class _Variadic(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.inner = nn.Linear(32, 16, bias=False)
+
+    def forward(self, *args, **kwargs):
+        return self.inner(*args, **kwargs)
+
+
+class _Keyword(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.inner = nn.Linear(32, 16, bias=False)
+
+    def forward(self, hidden_states, scale=1.0):
+        return self.inner(hidden_states) * scale
+
+
+@pytest.mark.parametrize("wrapper", [_Variadic, _Keyword])
+def test_keyword_calls_feed_collectors_like_positional_calls(wrapper, monkeypatch):
+    import neuropress.calibration.probe.registry as registry_module
+
+    lookups = []
+    signature = registry_module.inspect.signature
+
+    def counting(fn):
+        lookups.append(fn)
+        return signature(fn)
+
+    monkeypatch.setattr(registry_module.inspect, "signature", counting)
+    torch.manual_seed(13)
+    module = wrapper().eval()
+    x = [torch.randn(6, 32) for _ in range(3)]
+    request = StatisticRequest(target_key="", stat_type="hessian")
+
+    def hessian(batches):
+        registry = StatisticsRegistry()
+        registry.register_requests([request])
+        registry.collect(module, batches)
+        return registry.get(request)["hessian"]
+
+    keyword = hessian(
+        [{"hidden_states": b} if wrapper is _Keyword else {"input": b} for b in x]
+    )
+    assert keyword is not None
+    assert len(lookups) == 1  # once per hook, not once per call
+    torch.testing.assert_close(keyword, hessian(x), rtol=0, atol=0)
+
+
+def test_block_streams_are_plain_trees_whether_fresh_or_resumed(tmp_path):
+    import collections
+
+    class Output(collections.OrderedDict):
+        """Stands in for transformers' ModelOutput (an OrderedDict subclass)."""
+
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(32, 32, bias=False)
+
+        def forward(self, hidden_states):
+            return Output(last_hidden_state=self.proj(hidden_states))
+
+    def propagate(batch, output):
+        return {"hidden_states": output["last_hidden_state"]}
+
+    torch.manual_seed(14)
+    blocks = [Block().eval() for _ in range(2)]
+    data = [{"hidden_states": torch.randn(4, 32)}]
+    runs = []
+    for _ in range(2):  # the second run resumes every block from checkpoints
+        runner = BlockQuantizationPipeline(
+            recipe(), checkpoint_dir=tmp_path, run_id="trees"
+        )
+        runs.append(
+            list(
+                runner.run(enumerate_names(deepcopy(blocks)), data, propagate=propagate)
+            )
+        )
+    fresh, resumed = runs
+    assert all(result.resumed for result in resumed)
+    for a, b in zip(fresh, resumed, strict=True):
+        assert type(a.student_outputs[0]) is dict
+        assert type(b.student_outputs[0]) is dict
+        torch.testing.assert_close(a.student_outputs, b.student_outputs)
+
+
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+def test_estimation_follows_the_model_to_the_estimation_device(device):
+    import neuropress.estimators as estimators
+
+    devices = []
+
+    def record(name, mod, registry, device, **kwargs):
+        devices.append((device.type, mod.weight.device.type))
+        raise RuntimeError("recorded")
+
+    config = recipe().build()
+    estimator = config.param_estimator
+    prepares = []
+    prepare = estimator.prepare
+    estimator.prepare = lambda model: (prepares.append(1), prepare(model))
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(estimators, "_gptq_layer", record)
+        QuantizationPipeline(config).run(
+            nn.Sequential(nn.Linear(32, 16, bias=False)).eval(),
+            [torch.randn(2, 32)],
+            estimation_device=device,
+        )
+    # prepare() binds once, on the host; estimation still runs where the
+    # pipeline moved the model.
+    assert prepares == [1]
+    assert devices == [(device, device)]
+
+
+@pytest.mark.parametrize("alias", [False, True])
+def test_shared_weights_are_caught_after_blocks_change_device(alias, monkeypatch):
+    blocks = [nn.Sequential(nn.Linear(32, 32, bias=False)).eval() for _ in range(3)]
+    shared = blocks[0][0].weight
+    blocks[2][0].weight = (
+        nn.Parameter(shared.detach().view_as(shared)) if alias else shared
+    )
+    runner = BlockQuantizationPipeline(recipe())
+    run_block = runner.run_block
+
+    def round_trip(name, block, *args):
+        # Moving to a forward device and back gives every parameter new
+        # storage, exactly like a cuda round trip does on a GPU host.
+        block.double().float()
+        return run_block(name, block, *args)
+
+    monkeypatch.setattr(runner, "run_block", round_trip)
+    with pytest.raises(ValueError, match="share parameter storage"):
+        list(runner.run(enumerate_names(blocks), [torch.randn(2, 32)]))
+
+
+def test_reconstruction_keeps_float32_for_low_precision_weights():
+    torch.manual_seed(15)
+    weight = torch.randn(16, 32).to(torch.bfloat16)
+    x = torch.randn(256, 32)
+    hessian = 2 * x.t() @ x / x.shape[0]
+    # A correction far below bf16 resolution at these weight magnitudes.
+    cross = hessian @ torch.full((32, 16), 1e-4)
+    cross = cross.t().contiguous()
+    fitted = reconstruct_linear_weight(weight, hessian, cross, 0.01)
+    expected = reconstruct_linear_weight(weight.float(), hessian, cross, 0.01)
+    assert fitted.dtype == torch.float32
+    torch.testing.assert_close(fitted, expected, rtol=0, atol=0)
+    assert not torch.equal(fitted, weight.float())
+
+
+@pytest.mark.parametrize(
+    "error",
+    [torch.linalg.LinAlgError("not positive-definite"), ValueError("Nonfinite")],
+)
+def test_failed_teacher_fit_falls_back_to_self_gptq(error, monkeypatch, caplog):
+    import neuropress.calibration.probe.reconstruction as reconstruction
+
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(reconstruction, "reconstruct_linear_weight", fail)
+    torch.manual_seed(16)
+    original = nn.Sequential(nn.Linear(32, 16, bias=False)).eval()
+    x = torch.randn(4, 32)
+    models = [deepcopy(original), deepcopy(original)]
+    for model, teacher in zip(models, [False, True], strict=True):
+        pipeline = QuantizationPipeline(recipe(teacher).build())
+        pipeline.run(model, [x * 1.2], reference_data=[x])
+        assert not pipeline.last_plan.kept_float
+    torch.testing.assert_close(
+        models[1][0].weight.decompress_to_u8(),
+        models[0][0].weight.decompress_to_u8(),
+        rtol=0,
+        atol=0,
+    )
+    assert "Teacher reconstruction failed" in caplog.text
+
+
+def test_injected_statistics_are_not_copied_by_the_registry():
+    from neuropress.methods.gptq import GPTQCalibration
+    from neuropress.qscheme.descriptor import Granularity
+
+    registry = StatisticsRegistry()
+    hessian = torch.eye(4)
+    registry.set_stat("layer", "hessian", {"hessian": hessian, "nsamples": 3})
+    registry.to("meta")
+    calib = GPTQCalibration(granularity=Granularity.per_channel())
+    registry.inject(calib, "layer")
+    # GPTQ relocates per layer to its weights' device; a registry copy here
+    # would be a second K x K allocation for every layer.
+    assert calib.hessian is hessian
+    assert calib.nsamples == 3
+
+
+@pytest.mark.parametrize("teacher", [False, True])
+def test_disk_offloaded_hessians_quantize_like_in_memory_ones(
+    teacher, monkeypatch, tmp_path
+):
+    from dataclasses import dataclass
+
+    from torch_to_nnef.tensor.offload import OffloadedTensor
+
+    from neuropress.calibration.probe import HessianAccumulator
+
+    offloaded = []
+
+    @dataclass
+    class OffloadingHessian(HessianAccumulator):
+        offload_intermediate_tensor_on_disk: bool = True
+
+        @property
+        def offload_dir(self):
+            return tmp_path
+
+        def result(self):
+            offloaded.append(isinstance(self.hessian, OffloadedTensor))
+            return super().result()
+
+    torch.manual_seed(17)
+    original = nn.Sequential(nn.Linear(32, 16, bias=False)).eval()
+    x = torch.randn(4, 32)
+    x[:, :2] = 0  # dead columns make GPTQ write into its Hessian
+    models = [deepcopy(original), deepcopy(original)]
+    for model, offload in zip(models, [False, True], strict=True):
+        if offload:
+            monkeypatch.setitem(COLLECTOR_REGISTRY, "hessian", OffloadingHessian)
+        pipeline = QuantizationPipeline(recipe(teacher).build())
+        pipeline.run(model, [x * 1.2], reference_data=[x])
+        assert not pipeline.last_plan.kept_float
+    assert offloaded == [True]
+    torch.testing.assert_close(
+        models[1][0].weight.decompress_to_u8(),
+        models[0][0].weight.decompress_to_u8(),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_checkpoint_resumes_when_the_device_is_spelled_differently(tmp_path):
+    torch.manual_seed(92)
+    original = nn.Sequential(nn.Linear(32, 32, bias=False)).eval()
+    x = torch.randn(4, 32)
+    first, second = (
+        BlockQuantizationPipeline(
+            recipe(),
+            forward_device=device,
+            estimation_device=device,
+            checkpoint_dir=tmp_path,
+            run_id="devices",
+        )
+        for device in ("cpu", "cpu:0")
+    )
+    first.run_block("block", deepcopy(original), [x], [x])
+    assert second.run_block("block", deepcopy(original), [x], [x]).resumed
+
+
+def test_checkpoint_fingerprint_is_stable_and_rejects_opaque_leaves():
+    import hashlib
+
+    from neuropress.block_pipeline import _fingerprint
+
+    def digest(value):
+        result = hashlib.sha256()
+        _fingerprint(value, result)
+        return result.hexdigest()
+
+    mixed = {"a": torch.ones(2), 1: None, (2, "b"): torch.float16}
+    assert digest(mixed) == digest(dict(reversed(mixed.items())))
+    assert digest({1: 0}) != digest({"1": 0})
+    assert digest([True]) != digest([1])
+
+    class Cache:
+        pass
+
+    with pytest.raises(TypeError, match="Cannot checkpoint a block stream"):
+        digest({"x": torch.ones(1), "cache": Cache()})
+
+
+@pytest.mark.parametrize("teacher", [False, True])
+def test_extra_gptq_cache_stages_are_not_requested_as_statistics(teacher):
+    from dataclasses import dataclass, fields
+
+    from neuropress.estimators import GPTQEstimator
+    from neuropress.quantization.cache import CacheStageDescriptor
+
+    @dataclass
+    class CachesCodes(GPTQEstimator):
+        def cache_stages(self):
+            return [
+                *super().cache_stages(),
+                CacheStageDescriptor("codes", "Packed codes", scope="calibration"),
+            ]
+
+    base = recipe(teacher).build().param_estimator
+    estimator = CachesCodes(
+        **{f.name: getattr(base, f.name) for f in fields(base) if f.init}
+    )
+    estimator.prepare(nn.Sequential(nn.Linear(32, 16, bias=False)))
+    types = {request.stat_type for request in estimator.declare_statistics()}
+    assert types == ({"hessian", "linear_reconstruction"} if teacher else {"hessian"})
+
+
+@pytest.mark.parametrize("teacher", [False, True])
+def test_only_paired_collection_leaves_inference_mode(teacher, monkeypatch):
+    from neuropress.calibration.probe import HessianAccumulator
+
+    modes = []
+    update = HessianAccumulator.update
+
+    def spy(self, data):
+        modes.append(torch.is_inference_mode_enabled())
+        return update(self, data)
+
+    monkeypatch.setattr(HessianAccumulator, "update", spy)
+    model = nn.Sequential(nn.Linear(32, 16, bias=False)).eval()
+    x = torch.randn(4, 32)
+    QuantizationPipeline(recipe(teacher).build()).run(
+        model, [x * 1.1], reference_data=[x]
+    )
+    # Paired samples may feed autograd later, which rejects inference tensors.
+    assert modes == [not teacher]
+
+
+def test_teacher_snapshots_can_stay_on_the_teachers_device(monkeypatch):
+    seen = []
+
+    class Record(PairedCollector):
+        def update_pair(self, inputs, output, reference):
+            seen.append(reference.device.type)
+
+        def result(self):
+            return {}
+
+    monkeypatch.setitem(COLLECTOR_REGISTRY, "record", Record)
+    model = nn.Sequential(nn.Linear(8, 8)).to("meta")
+    x = torch.empty(2, 8, device="meta")
+    registry = StatisticsRegistry()
+    registry.register_requests([StatisticRequest(target_key="0", stat_type="record")])
+    # The default parks snapshots on the host, which a meta tensor (no data)
+    # would refuse; None keeps them where the teacher produced them.
+    registry.collect(model, [x], reference_data=[x], reference_device=None)
+    assert seen == ["meta"]
+
+
+def test_block_runs_keep_teacher_snapshots_on_the_forward_device(monkeypatch):
+    import neuropress.block_pipeline as block_pipeline
+
+    devices = []
+    run = block_pipeline.QuantizationPipeline.run
+
+    def spy(self, *args, **kwargs):
+        devices.append(kwargs["reference_device"])
+        return run(self, *args, **kwargs)
+
+    monkeypatch.setattr(block_pipeline.QuantizationPipeline, "run", spy)
+    x = torch.randn(4, 32)
+    BlockQuantizationPipeline(recipe(True)).run_block(
+        "b", nn.Sequential(nn.Linear(32, 16, bias=False)).eval(), [x * 1.1], [x]
+    )
+    assert devices == [None]
+
+
+@pytest.mark.parametrize("teacher", [False, True])
+def test_gptq_hessian_cache_is_written_and_reused(teacher, tmp_path):
+    from neuropress.quantization.cache import DiskCacheManager
+
+    torch.manual_seed(9)
+    original = nn.Sequential(nn.Linear(32, 16, bias=False)).eval()
+    x = torch.randn(4, 32)
+    codes = []
+    collected = []
+    for _ in range(2):
+        model = deepcopy(original)
+        config = recipe(teacher).build()
+        estimator = config.param_estimator
+        scopes = {stage.name: stage.scope for stage in estimator.cache_stages()}
+        estimator.set_cache(DiskCacheManager(tmp_path, "cal", "rec", scopes))
+        estimator.prepare(model)
+        collected.append({r.stat_type for r in estimator.declare_statistics()})
+        QuantizationPipeline(config).run(model, [x * 1.1], reference_data=[x])
+        codes.append(model[0].weight.decompress_to_u8())
+    # The Hessian comes from the cache the first run wrote; the teacher
+    # products depend on the reference stream, so they are always collected.
+    assert collected[0] == (
+        {"hessian", "linear_reconstruction"} if teacher else {"hessian"}
+    )
+    assert collected[1] == ({"linear_reconstruction"} if teacher else set())
+    torch.testing.assert_close(codes[0], codes[1], rtol=0, atol=0)
+
+
+def test_disk_cache_round_trips_scalars_and_rejects_other_values(tmp_path):
+    from neuropress.quantization.cache import DiskCacheManager
+
+    cache = DiskCacheManager(tmp_path, "cal", "rec", {"hessian": "calibration"})
+    cache.save("hessian", "a.b", {"hessian": torch.eye(3), "nsamples": 7})
+    loaded = cache.load("hessian", "a.b")
+    assert loaded is not None and loaded["nsamples"] == 7
+    assert isinstance(loaded["nsamples"], int)
+    torch.testing.assert_close(loaded["hessian"], torch.eye(3))
+    with pytest.raises(TypeError, match="not a tensor or a plain scalar"):
+        cache.save("hessian", "a.c", {"hessian": torch.eye(3), "name": "x"})
+    assert not cache.has("hessian", "a.c")
+
+
+def test_tied_alias_of_a_failed_target_is_kept_float(monkeypatch):
+    import neuropress.estimators as estimators
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("singular")
+
+    monkeypatch.setattr(estimators, "_gptq_layer", fail)
+    model = nn.Sequential(nn.Linear(32, 32, bias=False), nn.Linear(32, 32, bias=False))
+    model[1].weight = model[0].weight
+    pipeline = QuantizationPipeline(recipe().build())
+    pipeline.run(model, [torch.randn(4, 32)], target_paths={"0", "1"})
+    assert set(pipeline.last_plan.kept_float) == {"0", "1"}
+
+
+def test_estimators_without_prepare_survive_the_move_to_the_estimation_device():
+    from neuropress.plan import QuantizationPlan
+
+    class Minimal:
+        # Only what the pipeline requires; prepare is optional.
+        def declare_statistics(self):
+            return []
+
+        def estimate(self, graph, registry, recipe):
+            return QuantizationPlan()
+
+    config = recipe().build()
+    config.param_estimator = Minimal()
+    QuantizationPipeline(config).run(
+        nn.Linear(4, 4).eval(), [torch.randn(2, 4)], estimation_device="meta"
+    )
+
+
+@pytest.mark.parametrize("reads_graph", [False, True])
+def test_graph_is_built_only_for_estimators_that_read_it(reads_graph, monkeypatch):
+    from neuropress.estimators import CompositeEstimator, GPTQEstimator
+    from neuropress.graph.builder import RuntimeModuleGraphProvider
+
+    builds = []
+    build = RuntimeModuleGraphProvider.build
+
+    def spy(self, model, inputs):
+        builds.append(1)
+        return build(self, model, inputs)
+
+    monkeypatch.setattr(RuntimeModuleGraphProvider, "build", spy)
+    seen = []
+
+    class ReadsGraph(GPTQEstimator):
+        requires_graph = reads_graph
+
+        def estimate(self, graph, registry, recipe):
+            seen.append(len(graph.nodes))
+            return super().estimate(graph, registry, recipe)
+
+    base = recipe().build()
+    member = ReadsGraph(nbits=4, group_size=32, symmetric=True, weight_transform="q4_0")
+    base.param_estimator = CompositeEstimator(estimators=[member])
+    model = nn.Sequential(nn.Linear(32, 16, bias=False)).eval()
+    QuantizationPipeline(base).run(model, [torch.randn(2, 32)])
+    # A composite reads the graph when any member does; otherwise no forward
+    # is spent tracing it and the members see an empty graph.
+    assert builds == ([1] if reads_graph else [])
+    assert seen == [1 if reads_graph else 0]
+    assert type(model[0].weight).__name__ != "Parameter"
+
+
+def test_teacher_recipe_without_reference_data_fails_before_collection(monkeypatch):
+    from neuropress.calibration.probe import StatisticsRegistry as Registry
+
+    def collect(*args, **kwargs):
+        raise AssertionError("collection must not start")
+
+    monkeypatch.setattr(Registry, "collect", collect)
+    estimator = recipe(teacher=True).build().param_estimator
+    filter_fn = estimator.filter_fn
+    config = recipe(teacher=True).build()
+    config.param_estimator = estimator
+    with pytest.raises(ValueError, match="BlockQuantizationPipeline"):
+        QuantizationPipeline(config).run(
+            nn.Sequential(nn.Linear(32, 16, bias=False)).eval(),
+            [torch.randn(2, 32)],
+            target_paths={"0"},
+        )
+    assert estimator.filter_fn is filter_fn
+
+
+def test_checkpoints_of_another_neuropress_version_are_recomputed(
+    tmp_path, monkeypatch
+):
+    import neuropress.block_pipeline as block_pipeline
+
+    torch.manual_seed(13)
+    block = nn.Sequential(nn.Linear(32, 32, bias=False)).eval()
+    data = [torch.randn(2, 32)]
+    runner = BlockQuantizationPipeline(recipe(), checkpoint_dir=tmp_path, run_id="v")
+    assert not runner.run_block("0", deepcopy(block), data, data).resumed
+    assert runner.run_block("0", deepcopy(block), data, data).resumed
+    monkeypatch.setattr(block_pipeline, "_package_version", lambda: "999.0")
+    assert not runner.run_block("0", deepcopy(block), data, data).resumed
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("staged", [False, True])
+def test_adapted_blocks_return_to_the_host_from_cuda(staged):
+    torch.manual_seed(14)
+    block = nn.Sequential(
+        nn.Linear(32, 32, bias=False), nn.ReLU(), nn.Linear(32, 32, bias=False)
+    ).eval()
+    data = [torch.randn(4, 32)]
+    BlockQuantizationPipeline(
+        recipe(teacher=staged),
+        forward_device="cuda",
+        estimation_device="cuda",
+        target_paths=("0", "2") if staged else None,
+    ).run_block("block", block, data, data)
+    for name in ("0", "2"):
+        weight = block.get_submodule(name).weight
+        assert type(weight).__name__ != "Parameter"
+        assert weight.device.type == "cpu"
+        assert weight.u8_blob.device.type == "cpu"
+
+
+def test_composite_does_not_report_a_quantized_target_as_float():
+    from neuropress.estimators import CompositeEstimator, VPTQGroupEstimator
+
+    torch.manual_seed(16)
+    model = nn.Sequential(
+        nn.Linear(32, 64, bias=False), nn.Linear(64, 32, bias=False)
+    ).eval()
+    config = recipe().build()
+    # Neither K (32, 64) is a multiple of 12, so VPTQ leaves both float and
+    # says so; GPTQ, which sees the same targets, quantizes both.
+    vptq = VPTQGroupEstimator(
+        vector_len=12, num_centroids=16, max_n_iter=5, use_hessian_weighting=False
+    )
+    config.param_estimator = CompositeEstimator([vptq, config.param_estimator])
+    pipeline = QuantizationPipeline(config)
+    pipeline.run(model, [torch.randn(64, 32)])
+    assert set(pipeline.last_plan.weight_assignments) == {"0", "1"}
+    assert pipeline.last_plan.kept_float == {}
