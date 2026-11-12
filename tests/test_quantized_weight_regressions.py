@@ -1190,3 +1190,20 @@ def test_vq_gptq_correction_leaves_the_callers_hessian_and_weight_untouched():
     )
     torch.testing.assert_close(full_h, saved, rtol=0, atol=0)
     torch.testing.assert_close(module.weight, weight, rtol=0, atol=0)
+
+
+def test_vq_gptq_correction_warns_once_when_it_cannot_run(caplog):
+    from neuropress.methods.vq_gptq import VQGPTQCorrector
+
+    corrector = VQGPTQCorrector(vector_len=4)
+    module = nn.Linear(16, 8, bias=False)
+    centroids = torch.randn(16, 4)
+    with caplog.at_level("WARNING", logger="neuropress.methods.vq_gptq"):
+        for _ in range(3):
+            assert (
+                corrector.correct(
+                    "layer", module, centroids, torch.eye(16), torch.device("cpu")
+                )
+                is None
+            )
+    assert sum("needs a CUDA" in r.getMessage() for r in caplog.records) == 1
