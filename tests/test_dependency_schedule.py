@@ -267,8 +267,8 @@ def test_pipeline_selections_are_scoped_and_preserve_original_filters(
 
     class FailsDuringCollection(nn.Sequential):
         def forward(self, x):
-            self.calls = getattr(self, "calls", 0) + 1
-            if self.calls == 2:
+            # Unpaired statistics are collected under inference mode.
+            if torch.is_inference_mode_enabled():
                 raise RuntimeError("collection failed")
             return super().forward(x)
 
