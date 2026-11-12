@@ -892,3 +892,21 @@ def test_tied_alias_of_a_failed_target_is_kept_float(monkeypatch):
     pipeline = QuantizationPipeline(recipe().build())
     pipeline.run(model, [torch.randn(4, 32)], target_paths={"0", "1"})
     assert set(pipeline.last_plan.kept_float) == {"0", "1"}
+
+
+def test_estimators_without_prepare_survive_the_move_to_the_estimation_device():
+    from neuropress.plan import QuantizationPlan
+
+    class Minimal:
+        # Only what the pipeline requires; prepare is optional.
+        def declare_statistics(self):
+            return []
+
+        def estimate(self, graph, registry, recipe):
+            return QuantizationPlan()
+
+    config = recipe().build()
+    config.param_estimator = Minimal()
+    QuantizationPipeline(config).run(
+        nn.Linear(4, 4).eval(), [torch.randn(2, 4)], estimation_device="meta"
+    )

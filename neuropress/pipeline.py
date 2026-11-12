@@ -177,7 +177,8 @@ class QuantizationPipeline:
                 # no-op move would only expose non-idempotent estimators.
                 if not _resides_on(model, estimation_device):
                     model.to(estimation_device)
-                    estimator.prepare(model)
+                    if hasattr(estimator, "prepare"):
+                        estimator.prepare(model)
 
             # -- Step 5: Estimate QSchemes -------------------------------------
             LOGGER.info("Step 5: Estimating QSchemes")
