@@ -133,6 +133,13 @@ stage's estimator requests paired statistics, and placed on the forward device
 only for those stages, so self-reconstruction recipes never hold a second block
 in host or device memory.
 
+Use `target_paths` with `reconstruction="teacher"` whenever a block holds
+dependent targets. Without stages, every target in the block is fitted to the
+teacher from inputs collected before any of them is adapted, so each one
+corrects the whole upstream error on its own; the corrections compound, and the
+block can end up further from the teacher than with `"self"`. Staged
+recollection lets each stage fit through the already adapted ones.
+
 ```python
 from neuropress import QuantizationSchedule
 
