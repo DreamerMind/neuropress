@@ -1012,3 +1012,23 @@ def test_adapted_blocks_return_to_the_host_from_cuda(staged):
         assert type(weight).__name__ != "Parameter"
         assert weight.device.type == "cpu"
         assert weight.u8_blob.device.type == "cpu"
+
+
+def test_composite_does_not_report_a_quantized_target_as_float():
+    from neuropress.estimators import CompositeEstimator, VPTQGroupEstimator
+
+    torch.manual_seed(16)
+    model = nn.Sequential(
+        nn.Linear(32, 64, bias=False), nn.Linear(64, 32, bias=False)
+    ).eval()
+    config = recipe().build()
+    # Neither K (32, 64) is a multiple of 12, so VPTQ leaves both float and
+    # says so; GPTQ, which sees the same targets, quantizes both.
+    vptq = VPTQGroupEstimator(
+        vector_len=12, num_centroids=16, max_n_iter=5, use_hessian_weighting=False
+    )
+    config.param_estimator = CompositeEstimator([vptq, config.param_estimator])
+    pipeline = QuantizationPipeline(config)
+    pipeline.run(model, [torch.randn(64, 32)])
+    assert set(pipeline.last_plan.weight_assignments) == {"0", "1"}
+    assert pipeline.last_plan.kept_float == {}

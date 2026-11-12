@@ -3179,6 +3179,10 @@ class CompositeEstimator(QuantizationParamEstimator):
             merged.weight_assignments.update(plan.weight_assignments)
             merged.kept_float.update(plan.kept_float)
             merged.activation_assignments.update(plan.activation_assignments)
+        # A target one member quantized is not float, whichever member also
+        # reported leaving it float (overlapping filters).
+        for name in merged.weight_assignments:
+            merged.kept_float.pop(name, None)
         return merged
 
 
