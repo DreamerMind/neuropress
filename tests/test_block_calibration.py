@@ -836,3 +836,17 @@ def test_block_runs_keep_teacher_snapshots_on_the_forward_device(monkeypatch):
         "b", nn.Sequential(nn.Linear(32, 16, bias=False)).eval(), [x * 1.1], [x]
     )
     assert devices == [None]
+
+
+def test_disk_cache_round_trips_scalars_and_rejects_other_values(tmp_path):
+    from neuropress.quantization.cache import DiskCacheManager
+
+    cache = DiskCacheManager(tmp_path, "cal", "rec", {"hessian": "calibration"})
+    cache.save("hessian", "a.b", {"hessian": torch.eye(3), "nsamples": 7})
+    loaded = cache.load("hessian", "a.b")
+    assert loaded is not None and loaded["nsamples"] == 7
+    assert isinstance(loaded["nsamples"], int)
+    torch.testing.assert_close(loaded["hessian"], torch.eye(3))
+    with pytest.raises(TypeError, match="not a tensor or a plain scalar"):
+        cache.save("hessian", "a.c", {"hessian": torch.eye(3), "name": "x"})
+    assert not cache.has("hessian", "a.c")
