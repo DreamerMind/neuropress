@@ -80,8 +80,7 @@ class QuantizationPipeline:
                 (see :meth:`StatisticsRegistry.collect`); ``None`` keeps them
                 on the teacher's device.
             estimation_device: Move the model and statistics here after collection.
-                The returned model remains on this device. The estimator is
-                prepared again only if this actually moves the model.
+                The returned model remains on this device.
             collection_model: Optional inference view used for graph/statistics forwards.
                 It must preserve target module paths and their unadapted weights.
             target_paths: Optional estimator selection and assignment boundary.

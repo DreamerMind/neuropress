@@ -36,11 +36,10 @@ class QuantizationParamEstimator(ABC):
 
     Subclasses that need to inspect the model before statistics collection
     (e.g. to discover target layers or record the compute device) should
-    override :meth:`prepare`.  The pipeline calls ``prepare(model)``
-    before :meth:`declare_statistics`, and again if an explicit estimation
-    device moves the model after collection. Implementations must tolerate
-    that second binding and refresh device-dependent state without modifying
-    the model weights.
+    override :meth:`prepare`.  The pipeline calls ``prepare(model)`` once,
+    before :meth:`declare_statistics`. An explicit estimation device moves
+    the model after collection, so :meth:`estimate` reads device placement
+    from the target modules instead of from state recorded in ``prepare``.
 
     The pipeline wires up :attr:`_cache` and :attr:`_spans` via
     :meth:`set_cache` / :meth:`set_span_collector` before calling
