@@ -161,6 +161,7 @@ def collect_tied_aliases(
 def _add_tied_aliases(
     assignments: dict[str, Any], aliases: dict[str, list[str]]
 ) -> dict[str, Any]:
+    """Give every tied alias its primary's entry (an assignment or a kept-float reason)."""
     for name, tied in aliases.items():
         if name in assignments:
             for alias in tied:
@@ -451,7 +452,7 @@ class GPTQEstimator(QuantizationParamEstimator):
 
         return QuantizationPlan(
             weight_assignments=_add_tied_aliases(assignments, self._tied_aliases),
-            kept_float=kept_float,
+            kept_float=_add_tied_aliases(kept_float, self._tied_aliases),
         )
 
 
@@ -608,7 +609,7 @@ class GPTQPanelEstimator(QuantizationParamEstimator):
                 assignments[name] = assignment
         return QuantizationPlan(
             weight_assignments=_add_tied_aliases(assignments, self._tied_aliases),
-            kept_float=kept_float,
+            kept_float=_add_tied_aliases(kept_float, self._tied_aliases),
         )
 
 
@@ -699,7 +700,7 @@ class MinMaxZpWeightEstimator(QuantizationParamEstimator):
             )
         return QuantizationPlan(
             weight_assignments=_add_tied_aliases(assignments, self._tied_aliases),
-            kept_float=kept_float,
+            kept_float=_add_tied_aliases(kept_float, self._tied_aliases),
         )
 
     def _grid(
@@ -3269,5 +3270,5 @@ class HQQEstimator(QuantizationParamEstimator):
 
         return QuantizationPlan(
             weight_assignments=_add_tied_aliases(assignments, self._tied_aliases),
-            kept_float=kept_float,
+            kept_float=_add_tied_aliases(kept_float, self._tied_aliases),
         )

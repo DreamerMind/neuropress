@@ -878,3 +878,17 @@ def test_disk_cache_round_trips_scalars_and_rejects_other_values(tmp_path):
     with pytest.raises(TypeError, match="not a tensor or a plain scalar"):
         cache.save("hessian", "a.c", {"hessian": torch.eye(3), "name": "x"})
     assert not cache.has("hessian", "a.c")
+
+
+def test_tied_alias_of_a_failed_target_is_kept_float(monkeypatch):
+    import neuropress.estimators as estimators
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("singular")
+
+    monkeypatch.setattr(estimators, "_gptq_layer", fail)
+    model = nn.Sequential(nn.Linear(32, 32, bias=False), nn.Linear(32, 32, bias=False))
+    model[1].weight = model[0].weight
+    pipeline = QuantizationPipeline(recipe().build())
+    pipeline.run(model, [torch.randn(4, 32)], target_paths={"0", "1"})
+    assert set(pipeline.last_plan.kept_float) == {"0", "1"}
