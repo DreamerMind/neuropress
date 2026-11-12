@@ -660,3 +660,26 @@ def test_trace_moves_only_the_batches_it_traces(monkeypatch):
     assert traced == QuantizationSchedule.trace(
         Branches().eval(), batches, ("q", "k", "out")
     )
+
+
+def test_copying_inference_view_matches_the_adapted_block():
+    # A deepcopy-based view of a partly adapted block used to give some
+    # layers another layer's VQ weights, so the student stream drifted.
+    for seed in range(4):
+        torch.manual_seed(seed)
+        block = nn.Sequential(
+            *(
+                module
+                for _ in range(3)
+                for module in (nn.Linear(32, 32, bias=False), nn.ReLU())
+            )
+        ).eval()
+        data = [torch.randn(64, 32)]
+        result = BlockQuantizationPipeline(
+            _vptq(),
+            target_paths=("0", "2", "4"),
+            inference_model=deepcopy,
+        ).run_block("block", block, data, data)
+        with torch.no_grad():
+            expected = block(data[0])
+        torch.testing.assert_close(result.student_outputs[0], expected, rtol=0, atol=0)
