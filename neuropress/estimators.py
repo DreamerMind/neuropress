@@ -322,26 +322,22 @@ class GPTQEstimator(QuantizationParamEstimator):
         )
 
     def cache_stages(self) -> list[CacheStageDescriptor]:
-        """Declare Hessian and optional teacher-residual cache stages."""
-        stages = [
+        """Declare the Hessian cache stage.
+
+        Teacher reconstruction products are not cached: they depend on the
+        reference stream and teacher the caller passes, which neither cache
+        fingerprint covers, so a cached entry could silently go stale.
+        """
+        return [
             CacheStageDescriptor(
                 "hessian",
                 "Full input Hessians (one per layer)",
                 scope="calibration",
             )
         ]
-        if self.reconstruction == "teacher":
-            stages.append(
-                CacheStageDescriptor(
-                    "linear_reconstruction",
-                    "Teacher residual/input products",
-                    scope="calibration",
-                )
-            )
-        return stages
 
     def _statistic_types(self) -> list[str]:
-        """Collected statistic types; each is cached under the stage of that name.
+        """Collected statistic types; a type with a cache stage of its name is cached.
 
         Listed on their own rather than derived from :meth:`cache_stages`, so
         a subclass can cache something that is not a statistic (packed codes,
@@ -355,11 +351,12 @@ class GPTQEstimator(QuantizationParamEstimator):
     def declare_statistics(self) -> list[StatisticRequest]:
         """Request uncached Hessians and, when selected, paired reconstruction stats."""
         types = self._statistic_types()
+        cached = {stage.name for stage in self.cache_stages()}
         return [
             StatisticRequest(target_key=name, stat_type=stat_type)
             for name in self._target_modules
             for stat_type in types
-            if not self._cache.has(stat_type, name)
+            if stat_type not in cached or not self._cache.has(stat_type, name)
         ]
 
     def estimate(
@@ -411,11 +408,6 @@ class GPTQEstimator(QuantizationParamEstimator):
                 if cached_h is not None:
                     registry.set_stat(name, "hessian", cached_h)
 
-                if self.reconstruction == "teacher":
-                    cached_cross = cache.load("linear_reconstruction", name)
-                    if cached_cross is not None:
-                        registry.set_stat(name, "linear_reconstruction", cached_cross)
-
                 try:
                     with timed_span(spans, "gptq.layer", layer=name):
                         assignment = _gptq_layer(
@@ -449,16 +441,6 @@ class GPTQEstimator(QuantizationParamEstimator):
                     )
                     if stat is not None:
                         cache.save("hessian", name, stat)
-
-                if self.reconstruction == "teacher" and cached_cross is None:
-                    stat = registry.get(
-                        StatisticRequest(
-                            target_key=name, stat_type="linear_reconstruction"
-                        ),
-                        relocate=False,
-                    )
-                    if stat is not None:
-                        cache.save("linear_reconstruction", name, stat)
 
                 if _RICH:
                     progress.advance(task_id)

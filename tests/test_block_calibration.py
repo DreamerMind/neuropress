@@ -838,6 +838,34 @@ def test_block_runs_keep_teacher_snapshots_on_the_forward_device(monkeypatch):
     assert devices == [None]
 
 
+@pytest.mark.parametrize("teacher", [False, True])
+def test_gptq_hessian_cache_is_written_and_reused(teacher, tmp_path):
+    from neuropress.quantization.cache import DiskCacheManager
+
+    torch.manual_seed(9)
+    original = nn.Sequential(nn.Linear(32, 16, bias=False)).eval()
+    x = torch.randn(4, 32)
+    codes = []
+    collected = []
+    for _ in range(2):
+        model = deepcopy(original)
+        config = recipe(teacher).build()
+        estimator = config.param_estimator
+        scopes = {stage.name: stage.scope for stage in estimator.cache_stages()}
+        estimator.set_cache(DiskCacheManager(tmp_path, "cal", "rec", scopes))
+        estimator.prepare(model)
+        collected.append({r.stat_type for r in estimator.declare_statistics()})
+        QuantizationPipeline(config).run(model, [x * 1.1], reference_data=[x])
+        codes.append(model[0].weight.decompress_to_u8())
+    # The Hessian comes from the cache the first run wrote; the teacher
+    # products depend on the reference stream, so they are always collected.
+    assert collected[0] == (
+        {"hessian", "linear_reconstruction"} if teacher else {"hessian"}
+    )
+    assert collected[1] == ({"linear_reconstruction"} if teacher else set())
+    torch.testing.assert_close(codes[0], codes[1], rtol=0, atol=0)
+
+
 def test_disk_cache_round_trips_scalars_and_rejects_other_values(tmp_path):
     from neuropress.quantization.cache import DiskCacheManager
 
