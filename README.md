@@ -440,6 +440,3 @@ Then run with `neuropress-cloud --job my-experiment`.
 | `--ssh-host HOST` | — | Hostname or IP of the target machine (required for `--cloud own`) |
 | `--ssh-port PORT` | `22` | SSH port on the target machine |
 | `--ssh-user USER` | `root` | SSH login user |
-
-See [block calibration and teacher reconstruction](docs/block-calibration.md)
-for sequential calibration, dependency stages and custom estimator composition.
