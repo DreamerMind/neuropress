@@ -1172,7 +1172,7 @@ def test_lowered_embedding_returns_the_replaced_dtype(format_name):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_vq_gptq_correction_leaves_the_callers_hessian_untouched():
+def test_vq_gptq_correction_leaves_the_callers_hessian_and_weight_untouched():
     from neuropress.methods.vq_gptq import VQGPTQCorrector
 
     torch.manual_seed(5)
@@ -1181,8 +1181,12 @@ def test_vq_gptq_correction_leaves_the_callers_hessian_untouched():
     x[:, :2] = 0  # dead columns: the corrector patches their diagonal
     full_h = x.t() @ x
     saved = full_h.clone()
+    # A float32 weight already on the device is reshaped without a copy.
+    module.to("cuda")
+    weight = module.weight.detach().clone()
     centroids = torch.randn(16, 4, device="cuda")
     VQGPTQCorrector(vector_len=4).correct(
         "layer", module, centroids, full_h, torch.device("cuda")
     )
     torch.testing.assert_close(full_h, saved, rtol=0, atol=0)
+    torch.testing.assert_close(module.weight, weight, rtol=0, atol=0)

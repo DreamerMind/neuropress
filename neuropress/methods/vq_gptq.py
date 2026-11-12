@@ -120,6 +120,10 @@ class VQGPTQCorrector:
             perm = column_perm.to(device)
             w2d = w2d[:, perm]
             H = H[perm][:, perm]
+        # Without a permutation, w2d is the module weight itself when that is
+        # already float32 on the device; every write below goes to this copy.
+        w_corr = w2d.clone()
+        del w2d
 
         dead = H.diagonal() == 0
         if dead.any():
@@ -128,7 +132,7 @@ class VQGPTQCorrector:
                 # a registry statistic); patch a copy instead.
                 H = H.clone()
             H.diagonal()[dead] = 1.0
-            w2d[:, dead] = 0.0
+            w_corr[:, dead] = 0.0
 
         try:
             U = self.cholesky_inv_upper(H)
@@ -151,7 +155,6 @@ class VQGPTQCorrector:
         G = K // VL
         U_diag = U.diagonal()
 
-        w_corr = w2d.clone()
         all_indices: list[torch.Tensor] = []
 
         do_attraction = self.centroid_attraction > 0.0
