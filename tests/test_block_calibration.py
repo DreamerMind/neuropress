@@ -956,3 +956,23 @@ def test_graph_is_built_only_for_estimators_that_read_it(reads_graph, monkeypatc
     assert builds == ([1] if reads_graph else [])
     assert seen == [1 if reads_graph else 0]
     assert type(model[0].weight).__name__ != "Parameter"
+
+
+def test_teacher_recipe_without_reference_data_fails_before_collection(monkeypatch):
+    from neuropress.calibration.probe import StatisticsRegistry as Registry
+
+    def collect(*args, **kwargs):
+        raise AssertionError("collection must not start")
+
+    monkeypatch.setattr(Registry, "collect", collect)
+    estimator = recipe(teacher=True).build().param_estimator
+    filter_fn = estimator.filter_fn
+    config = recipe(teacher=True).build()
+    config.param_estimator = estimator
+    with pytest.raises(ValueError, match="BlockQuantizationPipeline"):
+        QuantizationPipeline(config).run(
+            nn.Sequential(nn.Linear(32, 16, bias=False)).eval(),
+            [torch.randn(2, 32)],
+            target_paths={"0"},
+        )
+    assert estimator.filter_fn is filter_fn

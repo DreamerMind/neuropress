@@ -138,6 +138,16 @@ class QuantizationPipeline:
             requests = estimator.declare_statistics()
             registry = StatisticsRegistry()
             registry.register_requests(requests)
+            if reference_data is None and registry.requires_pairing():
+                # Fail before the calibration pass, naming the fix rather than
+                # the collector-level symptom.
+                raise ValueError(
+                    "The estimator requests paired statistics (for example GPTQ "
+                    "reconstruction='teacher'), which need reference_data: the "
+                    "teacher's input stream aligned with calibration_data. Pass "
+                    "it to QuantizationPipeline.run, or calibrate with "
+                    "BlockQuantizationPipeline, which supplies it per block."
+                )
             teacher = reference_model
             if teacher is not None and not isinstance(teacher, nn.Module):
                 teacher = teacher() if registry.requires_pairing() else None
