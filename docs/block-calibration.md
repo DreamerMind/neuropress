@@ -81,7 +81,9 @@ of bf16 weights, say) gives the first stage a slightly different teacher.
 
 Checkpoints store the adapted model and both propagated streams. A completed
 checkpoint is reused only when the float weights, incoming streams, recipe,
-device types and run identity match (`cuda` and `cuda:0` count as the same).
+device types, torch and neuropress versions and run identity match (`cuda` and
+`cuda:0` count as the same). The package version changes only at release, so
+when running from a development checkout put the code revision in `run_id`.
 Each block keeps one checkpoint slot per fingerprint, so a run that changes any
 of these computes into a new slot and never reuses stale data, while the earlier
 slot stays valid for its own run. Missing completion metadata triggers

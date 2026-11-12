@@ -976,3 +976,18 @@ def test_teacher_recipe_without_reference_data_fails_before_collection(monkeypat
             target_paths={"0"},
         )
     assert estimator.filter_fn is filter_fn
+
+
+def test_checkpoints_of_another_neuropress_version_are_recomputed(
+    tmp_path, monkeypatch
+):
+    import neuropress.block_pipeline as block_pipeline
+
+    torch.manual_seed(13)
+    block = nn.Sequential(nn.Linear(32, 32, bias=False)).eval()
+    data = [torch.randn(2, 32)]
+    runner = BlockQuantizationPipeline(recipe(), checkpoint_dir=tmp_path, run_id="v")
+    assert not runner.run_block("0", deepcopy(block), data, data).resumed
+    assert runner.run_block("0", deepcopy(block), data, data).resumed
+    monkeypatch.setattr(block_pipeline, "_package_version", lambda: "999.0")
+    assert not runner.run_block("0", deepcopy(block), data, data).resumed

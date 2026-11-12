@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import importlib.metadata
 import json
 import weakref
 from collections.abc import Callable, Iterable, Iterator
@@ -66,6 +67,14 @@ def _fingerprint(value: Any, digest: Any) -> None:
             "checkpointed batches and outputs must be tensor trees of dicts, "
             "lists and tuples with plain scalar leaves"
         )
+
+
+def _package_version() -> str:
+    """Installed neuropress version, so a release with other numerics recomputes."""
+    try:
+        return importlib.metadata.version("neuropress")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
 
 
 def _device_kind(device: torch.device) -> str:
@@ -171,7 +180,7 @@ class BlockQuantizationPipeline:
         digest = hashlib.sha256()
         _fingerprint(
             {
-                "schema": 2,
+                "schema": 3,
                 **(
                     {"target_paths": self.target_paths}
                     if self.target_paths is not None
@@ -184,6 +193,7 @@ class BlockQuantizationPipeline:
                 "forward_device": _device_kind(self.forward_device),
                 "estimation_device": _device_kind(self.estimation_device),
                 "torch": torch.__version__,
+                "neuropress": _package_version(),
                 "model": model.state_dict(),
                 "student": student,
                 "reference": reference,
