@@ -3,9 +3,12 @@
 `BlockQuantizationPipeline` runs existing recipes on a lazy sequence of independent
 float blocks. It carries aligned reference and quantized-upstream activation
 streams, collects statistics on a forward device, and estimates/packs weights on
-an independently selected device. A block moves to the forward device once and
-stays there (or on the estimation device) until its student stream is computed,
-then returns to the host, also when a stage fails. The caller supplies block
+an independently selected device. A block stays on the forward device from its
+reference forward to its student forward, except where a stage needs it
+elsewhere: estimation moves it to the estimation device, and an
+`inference_model` view is built from a host copy. With distinct forward and
+estimation devices, or with a view, it therefore crosses devices once per stage.
+It returns to the host at the end, also when a stage fails. The caller supplies block
 boundaries and any batch propagation convention; the runner has no GPTQ or
 model-family dispatch.
 
@@ -30,6 +33,9 @@ of each linear invocation, not optimization of a whole nonlinear decoder block.
 All statistics within a block are collected before its weights are adapted.
 Quality relative to float-input or sequential GPTQ must be measured on held-out
 samples; the teacher objective does not guarantee a better final model.
+`"teacher"` needs `reference_data`, the teacher's input stream: the block runner
+supplies it, a whole-model `QuantizationPipeline.run` must be given it and
+otherwise fails before calibration.
 
 ```python
 from neuropress import BlockQuantizationPipeline, QuantizationRecipeConfig
@@ -67,7 +73,11 @@ and kernel lowering after calibration. An optional `inference_model` callback ca
 provide a non-mutating inference view, for example f32 materialization of packed
 weights for GPU calibration; include that contract in `run_id`. The view serves
 every statistics collection and the propagated student stream, with or without
-`target_paths`, so it must also accept the untouched float block.
+`target_paths`, so it must also accept the untouched float block. With
+`target_paths`, the first stage pairs against that view of the still-float
+block, while later stages pair against a frozen copy of the float block that
+does not go through the view; a view that changes numerics (f32 materialization
+of bf16 weights, say) gives the first stage a slightly different teacher.
 
 Checkpoints store the adapted model and both propagated streams. A completed
 checkpoint is reused only when the float weights, incoming streams, recipe,
