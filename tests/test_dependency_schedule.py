@@ -87,8 +87,8 @@ def test_stages_match_explicit_recollection_and_resume(teacher, tmp_path):
     changed = BlockQuantizationPipeline(
         cfg, target_paths=("q",), checkpoint_dir=tmp_path, run_id="stages-v1"
     )
-    with pytest.raises(ValueError, match="Checkpoint mismatch"):
-        changed.run_block("block", deepcopy(original), data, reference)
+    assert not changed.run_block("block", deepcopy(original), data, reference).resumed
+    assert runner.run_block("block", deepcopy(original), data, reference).resumed
 
 
 def test_recollection_avoids_independent_teacher_overcorrection():

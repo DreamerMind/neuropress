@@ -190,8 +190,11 @@ class BlockQuantizationPipeline:
             },
             digest,
         )
-        path = self.checkpoint_dir / hashlib.sha256(name.encode()).hexdigest()[:20]
-        return path, digest.hexdigest()
+        # One slot per fingerprint: a run with another recipe, run_id or input
+        # stream computes into its own slot instead of colliding with this one.
+        fingerprint = digest.hexdigest()
+        block = hashlib.sha256(name.encode()).hexdigest()[:20]
+        return self.checkpoint_dir / block / fingerprint[:20], fingerprint
 
     def _later_stages_pair(
         self, model: nn.Module, stages: tuple[tuple[str, ...] | None, ...]
@@ -247,6 +250,7 @@ class BlockQuantizationPipeline:
         if path is not None and (path / "complete.json").exists():
             metadata = json.loads((path / "complete.json").read_text())
             if metadata["fingerprint"] != fingerprint:
+                # Only a truncated-fingerprint collision lands here.
                 raise ValueError(
                     f"Checkpoint mismatch for block {name}; use a fresh checkpoint directory"
                 )

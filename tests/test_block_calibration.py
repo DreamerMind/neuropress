@@ -139,13 +139,28 @@ def test_block_execution_matches_explicit_schedule_and_resume(source, tmp_path):
             rtol=0,
             atol=0,
         )
-    with pytest.raises(ValueError, match="Checkpoint mismatch"):
-        runner.run_block(
-            "0",
-            nn.Sequential(nn.Linear(32, 32, bias=False), nn.ReLU()).eval(),
-            inputs,
+    # Other float weights compute into a slot of their own, and the original
+    # slot still resumes afterwards.
+    other = runner.run_block(
+        "0",
+        nn.Sequential(nn.Linear(32, 32, bias=False), nn.ReLU()).eval(),
+        inputs,
+        inputs,
+    )
+    assert not other.resumed
+    torch.manual_seed(11)
+    again = list(
+        runner.run(
+            enumerate_names(
+                [
+                    nn.Sequential(nn.Linear(32, 32, bias=False), nn.ReLU()).eval()
+                    for _ in range(2)
+                ]
+            ),
             inputs,
         )
+    )
+    assert all(result.resumed for result in again)
 
 
 def enumerate_names(blocks):
