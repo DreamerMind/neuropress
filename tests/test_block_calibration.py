@@ -991,3 +991,24 @@ def test_checkpoints_of_another_neuropress_version_are_recomputed(
     assert runner.run_block("0", deepcopy(block), data, data).resumed
     monkeypatch.setattr(block_pipeline, "_package_version", lambda: "999.0")
     assert not runner.run_block("0", deepcopy(block), data, data).resumed
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("staged", [False, True])
+def test_adapted_blocks_return_to_the_host_from_cuda(staged):
+    torch.manual_seed(14)
+    block = nn.Sequential(
+        nn.Linear(32, 32, bias=False), nn.ReLU(), nn.Linear(32, 32, bias=False)
+    ).eval()
+    data = [torch.randn(4, 32)]
+    BlockQuantizationPipeline(
+        recipe(teacher=staged),
+        forward_device="cuda",
+        estimation_device="cuda",
+        target_paths=("0", "2") if staged else None,
+    ).run_block("block", block, data, data)
+    for name in ("0", "2"):
+        weight = block.get_submodule(name).weight
+        assert type(weight).__name__ != "Parameter"
+        assert weight.device.type == "cpu"
+        assert weight.u8_blob.device.type == "cpu"

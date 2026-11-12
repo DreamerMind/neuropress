@@ -209,3 +209,37 @@ def test_register_custom_serde():
 
     # Cleanup to avoid polluting other tests.
     del _SERDE_REGISTRY["_FakeQ"]
+
+
+def _q4_linear(device="cpu"):
+    linear = torch.nn.Linear(64, 64, bias=False)
+    weight = fp_to_tract_q4_0_with_min_max_calibration(
+        linear.weight.detach().to(device)
+    )
+    linear.weight = torch.nn.Parameter(weight, requires_grad=False)
+    return linear
+
+
+def test_qtensor_cpu_stays_quantized():
+    from torch_to_nnef.tensor.quant import QTensor
+
+    linear = _q4_linear()
+    expected = linear.weight.decompress().clone()
+    assert isinstance(linear.weight.cpu(), QTensor)
+    linear.cpu()
+    assert isinstance(linear.weight, QTensor)
+    torch.testing.assert_close(linear.weight.decompress(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_module_cpu_and_cuda_move_quantized_weights():
+    linear = _q4_linear("cuda")
+    expected = linear.weight.decompress().cpu()
+    linear.cpu()
+    assert linear.weight.device.type == "cpu"
+    assert linear.weight.u8_blob.device.type == "cpu"
+    torch.testing.assert_close(linear.weight.decompress(), expected, rtol=0, atol=0)
+    linear.cuda()
+    assert linear.weight.u8_blob.device.type == "cuda"
+    linear.cuda(0)
+    assert linear.weight.u8_blob.device == torch.device("cuda", 0)

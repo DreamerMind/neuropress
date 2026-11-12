@@ -9,6 +9,10 @@ Importing this module patches two upstream issues in ``torch_to_nnef``:
 2. ``QTensor.to()`` — performs an expensive dequant/requant round-trip
    even for device-only moves.
 
+3. ``QTensor.cpu()`` / ``QTensor.cuda()`` — fall through to
+   ``__torch_function__``, which returns a dequantized plain tensor, so
+   ``nn.Module.cpu()`` silently left every quantized weight on its device.
+
 These patches are intended as prototypes for eventual upstream fixes.
 """
 
@@ -100,4 +104,31 @@ def _qtensor_to(self: QTensor, *args: object, **kwargs: object) -> QTensor:
 
 QTensor.to = _qtensor_to  # type: ignore[assignment]
 
-logger.debug("Patched OpaqueTensor.data and QTensor.to for device handling")
+# ---------------------------------------------------------------------------
+# 3. QTensor.cpu() / QTensor.cuda() — device moves that stay quantized
+# ---------------------------------------------------------------------------
+
+
+def _qtensor_cpu(self: QTensor, memory_format: object = None) -> QTensor:
+    """Move to the host like ``to("cpu")``, keeping the packed form."""
+    return self.to("cpu")
+
+
+def _qtensor_cuda(
+    self: QTensor,
+    device: int | str | torch.device | None = None,
+    non_blocking: bool = False,
+    memory_format: object = None,
+) -> QTensor:
+    """Move to a CUDA device like ``to(device)``, keeping the packed form."""
+    if device is None:
+        device = "cuda"
+    elif isinstance(device, int):
+        device = torch.device("cuda", device)
+    return self.to(device)
+
+
+QTensor.cpu = _qtensor_cpu  # type: ignore[assignment]
+QTensor.cuda = _qtensor_cuda  # type: ignore[assignment]
+
+logger.debug("Patched OpaqueTensor.data and QTensor.to/cpu/cuda for device handling")
