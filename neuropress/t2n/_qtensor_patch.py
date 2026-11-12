@@ -9,7 +9,7 @@ Importing this module patches two upstream issues in ``torch_to_nnef``:
 2. ``QTensor.to()`` — performs an expensive dequant/requant round-trip
    even for device-only moves.
 
-3. ``QTensor.cpu()`` / ``QTensor.cuda()`` — fall through to
+3. ``QTensor.cpu()`` / ``QTensor.cuda()`` - fall through to
    ``__torch_function__``, which returns a dequantized plain tensor, so
    ``nn.Module.cpu()`` silently left every quantized weight on its device.
 
@@ -105,7 +105,7 @@ def _qtensor_to(self: QTensor, *args: object, **kwargs: object) -> QTensor:
 QTensor.to = _qtensor_to  # type: ignore[assignment]
 
 # ---------------------------------------------------------------------------
-# 3. QTensor.cpu() / QTensor.cuda() — device moves that stay quantized
+# 3. QTensor.cpu() / QTensor.cuda() - device moves that stay quantized
 # ---------------------------------------------------------------------------
 
 
