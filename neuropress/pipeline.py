@@ -28,18 +28,6 @@ from .recipe import QuantizationRecipe
 LOGGER = logging.getLogger(__name__)
 
 
-def _resides_on(model: nn.Module, device: str | torch.device) -> bool:
-    """True if every parameter and buffer of *model* is already on *device*."""
-    device = torch.device(device)
-    if device.index is None and device.type != "cpu":
-        # "cuda" means the current device; compare against what .to() picks.
-        device = torch.empty(0, device=device).device
-    return all(
-        tensor.device == device
-        for tensor in itertools.chain(model.parameters(), model.buffers())
-    )
-
-
 class QuantizationPipeline:
     """Orchestrates the full quantization flow.
 
@@ -172,13 +160,9 @@ class QuantizationPipeline:
             )
             if estimation_device is not None:
                 registry.to(estimation_device)
-                # Rebind only when the move relocates something: prepare()
-                # records device-dependent state, and calling it again for a
-                # no-op move would only expose non-idempotent estimators.
-                if not _resides_on(model, estimation_device):
-                    model.to(estimation_device)
-                    if hasattr(estimator, "prepare"):
-                        estimator.prepare(model)
+                # Estimators read the device of their targets when estimation
+                # starts, so moving the model needs no second prepare().
+                model.to(estimation_device)
 
             # -- Step 5: Estimate QSchemes -------------------------------------
             LOGGER.info("Step 5: Estimating QSchemes")

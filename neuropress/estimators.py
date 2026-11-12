@@ -82,6 +82,21 @@ def _weight_identity(weight: torch.Tensor) -> tuple[str, int]:
     return "object", id(weight)
 
 
+def _targets_device(
+    targets: dict[str, nn.Module], fallback: torch.device | None
+) -> torch.device | None:
+    """Return where the target weights live now, or *fallback* without any.
+
+    Estimators read this when estimation starts rather than trusting the
+    device seen by ``prepare``: the pipeline may move the model in between.
+    """
+    for module in targets.values():
+        weight = getattr(module, "weight", None)
+        if isinstance(weight, torch.Tensor):
+            return weight.device
+    return fallback
+
+
 def _walk_targets(
     model: nn.Module,
     module_classes: tuple[type, ...],
@@ -370,6 +385,7 @@ class GPTQEstimator(QuantizationParamEstimator):
 
         Packing and parameter replacement are deferred to the model adapter.
         """
+        self._device = _targets_device(self._target_modules, self._device)
         ids_seen: set[int] = set()
         assignments: dict[str, Any] = {}
         kept_float: dict[str, str] = {}
@@ -585,6 +601,7 @@ class GPTQPanelEstimator(QuantizationParamEstimator):
         recipe: QuantizationRecipe,
     ) -> QuantizationPlan:
         """Return mixed weight assignments; defer layer splitting to the adapter."""
+        self._device = _targets_device(self._target_modules, self._device)
         assignments = {}
         kept_float: dict[str, str] = {}
         for name, mod in self._target_modules.items():
@@ -2447,6 +2464,8 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
 
         from .transforms.vq import QTensorTractVQ, VQScheme
         from .transforms.vq_packing import IndexPacking
+
+        self._device = _targets_device(self._target_modules, self._device)
 
         assignments: dict[str, Any] = {}
         cache = self._cache

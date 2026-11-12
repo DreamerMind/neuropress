@@ -85,10 +85,10 @@ class QuantizationParamEstimator(ABC):
         """Bind this estimator to *model* before statistics collection.
 
         The default implementation is a no-op.  Subclasses override this to
-        discover target layers and refresh device-dependent state. It runs
-        again after statistics collection only when an explicit estimation
-        device moves the model; it must tolerate that repeated call and must
-        not modify model weights.
+        discover target layers. It runs once, before statistics collection, and
+        must not modify model weights. An explicit estimation device moves the
+        model after it runs, so :meth:`estimate` must read device placement
+        from the target modules rather than from state recorded here.
 
         Args:
             model: The model that will be passed through the pipeline.

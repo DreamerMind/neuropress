@@ -574,35 +574,32 @@ def test_block_streams_are_plain_trees_whether_fresh_or_resumed(tmp_path):
         torch.testing.assert_close(a.student_outputs, b.student_outputs)
 
 
-@pytest.mark.parametrize(("device", "prepares"), [("cpu", 1), ("meta", 2)])
-def test_estimator_is_rebound_only_when_the_model_moves(device, prepares):
-    from neuropress.estimator import QuantizationParamEstimator
-    from neuropress.estimator_configs import EstimatorConfig
-    from neuropress.plan import QuantizationPlan
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+def test_estimation_follows_the_model_to_the_estimation_device(device):
+    import neuropress.estimators as estimators
 
-    bound = []
+    devices = []
 
-    class Counting(QuantizationParamEstimator):
-        def prepare(self, model):
-            bound.append(next(model.parameters()).device.type)
+    def record(name, mod, registry, device, **kwargs):
+        devices.append((device.type, mod.weight.device.type))
+        raise RuntimeError("recorded")
 
-        def declare_statistics(self):
-            return []
-
-        def estimate(self, graph, registry, recipe):
-            return QuantizationPlan()
-
-    class CountingConfig(EstimatorConfig):
-        type: str = "test_counting"
-
-        def build(self):
-            return Counting()
-
-    config = QuantizationRecipeConfig(estimator=CountingConfig(), kernel_lowering=None)
-    QuantizationPipeline(config.build()).run(
-        nn.Linear(4, 4).eval(), [torch.randn(2, 4)], estimation_device=device
-    )
-    assert bound == ["cpu", device][:prepares]
+    config = recipe().build()
+    estimator = config.param_estimator
+    prepares = []
+    prepare = estimator.prepare
+    estimator.prepare = lambda model: (prepares.append(1), prepare(model))
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(estimators, "_gptq_layer", record)
+        QuantizationPipeline(config).run(
+            nn.Sequential(nn.Linear(32, 16, bias=False)).eval(),
+            [torch.randn(2, 32)],
+            estimation_device=device,
+        )
+    # prepare() binds once, on the host; estimation still runs where the
+    # pipeline moved the model.
+    assert prepares == [1]
+    assert devices == [(device, device)]
 
 
 @pytest.mark.parametrize("alias", [False, True])
