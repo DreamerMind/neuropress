@@ -305,10 +305,10 @@ class BlockQuantizationPipeline:
             # every estimator target, exactly like a whole-model pipeline run.
             stages: tuple[tuple[str, ...] | None, ...] = (None,)
             if self.target_paths is not None:
+                # Batches are compared on the host and only the traced ones
+                # cross to the forward device.
                 schedule = QuantizationSchedule.trace(
-                    model,
-                    (move_batch(batch, self.forward_device) for batch in source),
-                    self.target_paths,
+                    model, source, self.target_paths, device=self.forward_device
                 )
                 stages = schedule.stages
             # The first stage collects before any adaptation, so the observed

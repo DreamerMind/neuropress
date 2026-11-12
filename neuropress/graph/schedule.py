@@ -10,7 +10,7 @@ from torch import nn
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_flatten
 
-from ..calibration.batches import call_batch
+from ..calibration.batches import call_batch, move_batch
 
 
 def _tensors(tree):
@@ -112,7 +112,14 @@ class QuantizationSchedule:
         return " → ".join("[" + " | ".join(stage) + "]" for stage in self.stages)
 
     @classmethod
-    def trace(cls, model: nn.Module, batches, targets) -> QuantizationSchedule:
+    def trace(
+        cls,
+        model: nn.Module,
+        batches,
+        targets,
+        *,
+        device: str | torch.device | None = None,
+    ) -> QuantizationSchedule:
         """Rank explicit module paths using dependencies through tensor operations.
 
         Functional attention, activations, reshapes and residual additions retain
@@ -122,7 +129,8 @@ class QuantizationSchedule:
         replay the same operations; this keeps a fixed-length calibration set
         at one traced forward per block. Batches are always traced when a
         prior trace of the same structure produced value-dependent shapes
-        (nonzero, boolean masks), as in token routing.
+        (nonzero, boolean masks), as in token routing. With *device*, each
+        batch is compared where it is and moved there only if it is traced.
         """
         targets = tuple(targets)
         if not targets or len(set(targets)) != len(targets):
@@ -155,6 +163,8 @@ class QuantizationSchedule:
             structure = _structure(batch)
             if structure is not None and structure in traced:
                 continue
+            if device is not None:
+                batch = move_batch(batch, device)
             tracker = _Dependencies()
             for name, module in modules.items():
                 tracker.tag(tuple(module.parameters()), {name})

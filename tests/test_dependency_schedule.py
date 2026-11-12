@@ -638,3 +638,25 @@ def test_vptq_staged_block_runs_and_ties_aliases():
     pipeline = QuantizationPipeline(_vptq().build())
     pipeline.run(tied, [torch.randn(64, 32)], target_paths={"0", "2"})
     assert set(pipeline.last_plan.weight_assignments) == {"0", "2"}
+
+
+def test_trace_moves_only_the_batches_it_traces(monkeypatch):
+    import neuropress.graph.schedule as schedule
+
+    moved = []
+    move = schedule.move_batch
+
+    def spy(batch, device, **kwargs):
+        moved.append(batch)
+        return move(batch, device, **kwargs)
+
+    monkeypatch.setattr(schedule, "move_batch", spy)
+    batches = [torch.randn(4, 32) for _ in range(3)] + [torch.randn(2, 32)]
+    traced = QuantizationSchedule.trace(
+        Branches().eval(), batches, ("q", "k", "out"), device="cpu"
+    )
+    # One batch per distinct structure crosses to the device.
+    assert [batch.shape[0] for batch in moved] == [4, 2]
+    assert traced == QuantizationSchedule.trace(
+        Branches().eval(), batches, ("q", "k", "out")
+    )
