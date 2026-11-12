@@ -582,3 +582,59 @@ def test_failed_stage_returns_every_placed_module_to_the_host(monkeypatch):
     assert len(views) == 2 and len(teachers) == 1
     # Earlier views are released rather than moved; only this test holds them.
     assert [m.location for m in (model, views[-1], *teachers)] == ["cpu"] * 3
+
+
+def _vptq(**extra):
+    return QuantizationRecipeConfig.model_validate(
+        {
+            "estimator": {
+                "type": "vptq",
+                "vector_len": 4,
+                "num_centroids": 16,
+                "use_hessian_weighting": False,
+                "max_n_iter": 5,
+                "cluster_backend_name": "torch",
+                **extra,
+            },
+            "kernel_lowering": None,
+        }
+    )
+
+
+class _Narrow(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.a = nn.Linear(32, 30, bias=False)
+        self.b = nn.Linear(30, 32, bias=False)  # K=30 is not a multiple of 4
+
+    def forward(self, x):
+        return self.b(torch.relu(self.a(x)))
+
+
+@pytest.mark.parametrize("target_paths", [None, {"b"}, {"a", "b"}])
+def test_vptq_reports_targets_it_cannot_quantize(target_paths):
+    torch.manual_seed(91)
+    pipeline = QuantizationPipeline(_vptq().build())
+    pipeline.run(_Narrow().eval(), [torch.randn(64, 32)], target_paths=target_paths)
+    plan = pipeline.last_plan
+    assert set(plan.kept_float) == {"b"}
+    assert "not divisible by vector_len=4" in plan.kept_float["b"]
+    expected = {"a"} if target_paths is None or "a" in target_paths else set()
+    assert set(plan.weight_assignments) == expected
+
+
+def test_vptq_staged_block_runs_and_ties_aliases():
+    torch.manual_seed(92)
+    block = _Narrow().eval()
+    result = BlockQuantizationPipeline(_vptq(), target_paths=("a", "b")).run_block(
+        "block", block, [torch.randn(64, 32)], [torch.randn(64, 32)]
+    )
+    assert set(result.kept_float) == {"b"}
+
+    tied = nn.Sequential(
+        nn.Linear(32, 32, bias=False), nn.ReLU(), nn.Linear(32, 32, bias=False)
+    ).eval()
+    tied[2].weight = tied[0].weight
+    pipeline = QuantizationPipeline(_vptq().build())
+    pipeline.run(tied, [torch.randn(64, 32)], target_paths={"0", "2"})
+    assert set(pipeline.last_plan.weight_assignments) == {"0", "2"}

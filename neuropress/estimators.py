@@ -890,6 +890,9 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
     _target_modules: dict[str, nn.Module] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
+    _tied_aliases: dict[str, list[str]] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
     _device: torch.device | None = field(
         default=None, init=False, repr=False, compare=False
     )
@@ -991,6 +994,9 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
         """
         self._device = next(model.parameters()).device
         self._target_modules = collect_target_modules(
+            model, self.module_classes, self.filter_fn
+        )
+        self._tied_aliases = collect_tied_aliases(
             model, self.module_classes, self.filter_fn
         )
         LOGGER.info(
@@ -3071,7 +3077,28 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
                     indices_flat, vq, dequant_to_dtype=target_dtype
                 )
 
-        return QuantizationPlan(weight_assignments=assignments)
+        # Every target the loops above skipped (incompatible shape, a group
+        # with no compatible layer, a failed assignment) stays float and is
+        # reported, so a staged run sees it as handled.
+        kept_float = {
+            name: self._skip_reason(mod)
+            for name, mod in self._target_modules.items()
+            if name not in assignments
+        }
+        return QuantizationPlan(
+            weight_assignments=_add_tied_aliases(assignments, self._tied_aliases),
+            kept_float=_add_tied_aliases(kept_float, self._tied_aliases),
+        )
+
+    def _skip_reason(self, mod: nn.Module) -> str:
+        """Explain why VPTQ left *mod* float, as precisely as its shape allows."""
+        w = mod.weight
+        if w.ndim < 2:
+            return f"weight is {w.ndim}D"
+        K = int(w.shape[1]) if w.ndim == 2 else int(w.numel() // w.shape[0])
+        if K % self.vector_len:
+            return f"K={K} not divisible by vector_len={self.vector_len}"
+        return "not quantized by VPTQ; see the log for the cause"
 
 
 # ---------------------------------------------------------------------------
