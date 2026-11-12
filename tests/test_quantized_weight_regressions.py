@@ -1192,16 +1192,18 @@ def test_vq_gptq_correction_leaves_the_callers_hessian_and_weight_untouched():
     torch.testing.assert_close(module.weight, weight, rtol=0, atol=0)
 
 
-def test_vq_gptq_correction_warns_once_when_it_cannot_run(caplog):
+def test_vq_gptq_correction_warns_once_when_it_cannot_run(caplog, monkeypatch):
+    from neuropress.methods import vq_gptq
     from neuropress.methods.vq_gptq import VQGPTQCorrector
 
-    corrector = VQGPTQCorrector(vector_len=4)
+    monkeypatch.setattr(vq_gptq, "_WARNED_DEVICE_TYPES", set())
     module = nn.Linear(16, 8, bias=False)
     centroids = torch.randn(16, 4)
     with caplog.at_level("WARNING", logger="neuropress.methods.vq_gptq"):
+        # Block calibration builds a fresh corrector for every stage.
         for _ in range(3):
             assert (
-                corrector.correct(
+                VQGPTQCorrector(vector_len=4).correct(
                     "layer", module, centroids, torch.eye(16), torch.device("cpu")
                 )
                 is None

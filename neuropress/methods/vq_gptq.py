@@ -21,12 +21,16 @@ before calling :meth:`VQGPTQCorrector.correct`.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 from torch import nn
 
 LOGGER = logging.getLogger(__name__)
+
+# Device types already warned about. Process-wide, because block calibration
+# builds a fresh estimator, and so a fresh corrector, for every stage.
+_WARNED_DEVICE_TYPES: set[str] = set()
 
 
 @dataclass
@@ -57,7 +61,6 @@ class VQGPTQCorrector:
     gptq_damp_auto_increment: float = 0.0025
     centroid_attraction: float = 0.0
     centroid_attraction_window: int = 4
-    _warned_off_cuda: bool = field(default=False, init=False, repr=False, compare=False)
 
     def correct(
         self,
@@ -102,14 +105,13 @@ class VQGPTQCorrector:
         bits = IndexPacking.bits_for(centroids.shape[0])
 
         if device.type != "cuda":
-            if not self._warned_off_cuda:
-                # Once per corrector: otherwise every layer would repeat it.
+            if device.type not in _WARNED_DEVICE_TYPES:
+                _WARNED_DEVICE_TYPES.add(device.type)
                 LOGGER.warning(
                     "VQGPTQCorrector: GPTQ correction needs a CUDA estimation "
                     "device, got %s; keeping plain VQ assignments.",
                     device,
                 )
-                self._warned_off_cuda = True
             return None
         w_fp32_bytes = w.numel() * 4
         free_bytes, _ = torch.cuda.mem_get_info(device)
