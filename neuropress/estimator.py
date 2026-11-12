@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from torch import nn
 
@@ -51,6 +51,12 @@ class QuantizationParamEstimator(ABC):
     # can always call self._cache / self._spans unconditionally.
     _cache: CacheManager = _NULL_CACHE
     _spans: SpanCollector = _DEFAULT_SPANS
+
+    #: Whether :meth:`estimate` reads its ``graph`` argument. Building the
+    #: graph costs one extra forward pass, so the pipeline passes an empty
+    #: :class:`QGraph` to estimators that set this to ``False``. A block
+    #: pipeline traces one block at a time, so the graph never spans more.
+    requires_graph: ClassVar[bool] = True
 
     # ------------------------------------------------------------------
     # Cache stages

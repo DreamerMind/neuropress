@@ -9,7 +9,7 @@ import operator
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from functools import reduce
-from typing import Any
+from typing import Any, ClassVar
 
 try:
     from rich.markup import escape as _re
@@ -276,6 +276,8 @@ class GPTQEstimator(QuantizationParamEstimator):
     not replace model parameters. weight_transform names a destination format
     for the adapter; legacy Python callbacks receive dequantized values there.
     """
+
+    requires_graph: ClassVar[bool] = False
 
     module_classes: tuple[type[nn.Module], ...] = field(default=(nn.Linear,))
     filter_fn: Callable[[str, nn.Module], bool] | None = None
@@ -549,6 +551,8 @@ class GPTQPanelEstimator(QuantizationParamEstimator):
     Other module types receive the selected dequantized weight values.
     """
 
+    requires_graph: ClassVar[bool] = False
+
     module_classes: tuple[type[nn.Module], ...] = field(default=(nn.Conv2d,))
     filter_fn: Callable[[str, nn.Module], bool] | None = None
     group_size: int = 32
@@ -643,6 +647,8 @@ class MinMaxZpWeightEstimator(QuantizationParamEstimator):
     quantization is per-tensor. The plan carries codes and scales; the adapter
     performs storage conversion and parameter replacement.
     """
+
+    requires_graph: ClassVar[bool] = False
 
     module_classes: tuple[type[nn.Module], ...] = field(default=(nn.Embedding,))
     filter_fn: Callable[[str, nn.Module], bool] | None = None
@@ -840,6 +846,8 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
             :class:`~neuropress.transforms.vq_packing.ZeroEscapePacking`.
             Overrides *use_tiered*.
     """
+
+    requires_graph: ClassVar[bool] = False
 
     module_classes: tuple[type[nn.Module], ...] = field(default=(nn.Linear,))
     filter_fn: Callable[[str, nn.Module], bool] | None = None
@@ -3086,6 +3094,11 @@ class CompositeEstimator(QuantizationParamEstimator):
 
     estimators: list[QuantizationParamEstimator] = field(default_factory=list)
 
+    @property
+    def requires_graph(self) -> bool:  # type: ignore[override]
+        """Whether any member reads the graph."""
+        return any(estimator.requires_graph for estimator in self.estimators)
+
     @contextlib.contextmanager
     def select_targets(self, paths: set[str]) -> Iterator[None]:
         """Scope every member to one stage, unwinding partial entry on failure."""
@@ -3204,6 +3217,8 @@ class HQQEstimator(QuantizationParamEstimator):
     Selected codes and affine schemes are retained in the plan. Named formats
     and legacy Python weight transforms are applied by the model adapter.
     """
+
+    requires_graph: ClassVar[bool] = False
 
     module_classes: tuple[type[nn.Module], ...] = field(default=(nn.Linear,))
     filter_fn: Callable[[str, nn.Module], bool] | None = None

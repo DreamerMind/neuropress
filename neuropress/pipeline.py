@@ -32,7 +32,7 @@ class QuantizationPipeline:
     """Orchestrates the full quantization flow.
 
     Steps (from PLAN.md §12):
-    1. Build QGraph via RuntimeModuleGraphProvider.
+    1. Build QGraph via RuntimeModuleGraphProvider, if the estimator reads it.
     2. Define subgraphs (estimator declares what it needs).
     3. Aggregate statistic requests.
     4. Run global calibration (single forward pass).
@@ -86,7 +86,8 @@ class QuantizationPipeline:
             target_paths: Optional estimator selection and assignment boundary.
             example_inputs: Optional single batch for graph building.
                 If *None*, the first element of *calibration_data* is used
-                and then replayed at the start of the collection pass.
+                and then replayed at the start of the collection pass. Unused
+                when the estimator sets ``requires_graph = False``.
         """
         if collection_model is not None and self.recipe.preprocessing:
             raise ValueError("Apply preprocessing before supplying a collection model")
@@ -105,22 +106,26 @@ class QuantizationPipeline:
         else:
             calibration_iter = iter(calibration_data)
 
-        # -- Step 1: Build QGraph ------------------------------------------
-        LOGGER.info("Step 1: Building QGraph")
-        if example_inputs is not None:
-            inputs_for_graph = example_inputs
-        else:
-            # Peek the first batch so it is not lost from the collection pass.
-            inputs_for_graph = next(calibration_iter)
-            calibration_iter = itertools.chain([inputs_for_graph], calibration_iter)
-
+        # -- Step 1: Build QGraph (only for estimators that read it) --------
+        estimator = self.recipe.param_estimator
         observed_model = collection_model if collection_model is not None else model
-        graph: QGraph = self._graph_provider.build(observed_model, inputs_for_graph)
-        LOGGER.info("QGraph: %d nodes, %d values", len(graph.nodes), len(graph.values))
+        graph = QGraph()
+        # Duck-typed estimators without the flag get the graph, as before.
+        if getattr(estimator, "requires_graph", True):
+            LOGGER.info("Step 1: Building QGraph")
+            if example_inputs is not None:
+                inputs_for_graph = example_inputs
+            else:
+                # Peek the first batch so it is not lost from the collection pass.
+                inputs_for_graph = next(calibration_iter)
+                calibration_iter = itertools.chain([inputs_for_graph], calibration_iter)
+            graph = self._graph_provider.build(observed_model, inputs_for_graph)
+            LOGGER.info(
+                "QGraph: %d nodes, %d values", len(graph.nodes), len(graph.values)
+            )
 
         # -- Step 2 & 3: Declare + aggregate statistics --------------------
         LOGGER.info("Step 2/3: Aggregating statistic requests")
-        estimator = self.recipe.param_estimator
         with (
             estimator.select_targets(target_paths)
             if target_paths is not None

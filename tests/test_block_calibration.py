@@ -922,3 +922,37 @@ def test_estimators_without_prepare_survive_the_move_to_the_estimation_device():
     QuantizationPipeline(config).run(
         nn.Linear(4, 4).eval(), [torch.randn(2, 4)], estimation_device="meta"
     )
+
+
+@pytest.mark.parametrize("reads_graph", [False, True])
+def test_graph_is_built_only_for_estimators_that_read_it(reads_graph, monkeypatch):
+    from neuropress.estimators import CompositeEstimator, GPTQEstimator
+    from neuropress.graph.builder import RuntimeModuleGraphProvider
+
+    builds = []
+    build = RuntimeModuleGraphProvider.build
+
+    def spy(self, model, inputs):
+        builds.append(1)
+        return build(self, model, inputs)
+
+    monkeypatch.setattr(RuntimeModuleGraphProvider, "build", spy)
+    seen = []
+
+    class ReadsGraph(GPTQEstimator):
+        requires_graph = reads_graph
+
+        def estimate(self, graph, registry, recipe):
+            seen.append(len(graph.nodes))
+            return super().estimate(graph, registry, recipe)
+
+    base = recipe().build()
+    member = ReadsGraph(nbits=4, group_size=32, symmetric=True, weight_transform="q4_0")
+    base.param_estimator = CompositeEstimator(estimators=[member])
+    model = nn.Sequential(nn.Linear(32, 16, bias=False)).eval()
+    QuantizationPipeline(base).run(model, [torch.randn(2, 32)])
+    # A composite reads the graph when any member does; otherwise no forward
+    # is spent tracing it and the members see an empty graph.
+    assert builds == ([1] if reads_graph else [])
+    assert seen == [1 if reads_graph else 0]
+    assert type(model[0].weight).__name__ != "Parameter"
