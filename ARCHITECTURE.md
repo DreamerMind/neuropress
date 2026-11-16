@@ -121,7 +121,17 @@ Recipes can also be built from JSON via `QuantizationRecipeConfig.from_json(...)
 
 Layers whose `in_features` is not a multiple of the group size are skipped (Q4_0 group size = 32). Config `build()` rejects a `weight_transform` that cannot store the configured `nbits`, `symmetric` or `group_size`, before any estimation runs. GPTQ on a transformers `Conv1D` supports no named storage format: its scale groups run along the first weight dimension, which flat per-block storage cannot express without recalibrating.
 
-Registry entries: `"open_text_c4_gptq_q4_0"` (128 samples), `"open_text_c4_gptq_q4_0_32samples"`, `"open_text_c4_gptq_q4_0_256samples"`.
+Registry entries: `"open_text_c4_gptq_q4_0"` (128 samples), `"open_text_c4_gptq_q4_0_32samples"`, `"open_text_c4_gptq_q4_0_256samples"`, `"open_text_c4_gptq_q4_0_moe"` (also quantizes fused MoE experts, see below).
+
+### Fused MoE experts (`moe_experts.py`, `calibration/probe/moe_experts.py`)
+
+Transformers stores the routed experts of most MoE models as one module with 3-D `gate_up_proj [E, 2I, D]` and `down_proj [E, D, I]` parameters, which `GPTQEstimator` (`nn.Linear` only) does not see. Estimator type `gptq_moe_experts` covers them:
+
+- `MoEExpertHessianCollector` (stat type `moe_expert_hessian`) is an `InvocationCollector`: the registry hands it the whole invocation `(hidden_states, top_k_index, top_k_weights)` rather than the first input. Per expert it accumulates the Hessian of the tokens routed to it and of `act(gate) * up`, recomputed from the float `gate_up_proj`.
+- `GPTQMoEExpertsEstimator` runs GPTQ per expert (Q4_0, blocks of 32 along the reduction dimension; an expert no token reached is rounded to nearest) and plans one `QTensorTractScaleOnly` per fused parameter under `"<experts path>/gate_up_proj"` and `"<experts path>/down_proj"`. `WeightAssignmentAdapter` ignores these keys.
+- `MoEExpertsQ40Adapter` (adapter type `moe_experts_q4_0`) writes the dequantized values into the float parameters and marks the parent MoE block for the torch_to_nnef `tract_moe_ffn` extractor: `_t2n_quantize_moe_experts_q40`, `_t2n_moe_expert_layout = "linear"` and a quantizer (`expert_q40_from_gptq_codes`) that returns the GPTQ codes instead of recalibrating with min-max. The quantizer matches each extracted `w1`/`w3`/`w2` to its codes by value and fails the export when none match.
+
+The layout follows from the grouping: a Q4_0 block covers 32 consecutive values of the stored last dimension, and only the `linear` layout (`w1`/`w3 [E, I, D]`, `w2 [E, D, I]`) keeps each expert's input dimension last. `"open_text_c4_gptq_q4_0_moe"` chains this estimator with the Q4_0 linear GPTQ, so an export through the compression registry needs no MoE-specific flag. A whole-model run holds `E * (D^2 + I^2)` float32 Hessian entries for every MoE layer at once (about 2.4 GB per layer for E=128, D=2048, I=768); running this estimator under `BlockQuantizationPipeline` is untested.
 
 ### LLM calibration data
 

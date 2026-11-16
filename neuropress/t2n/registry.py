@@ -61,6 +61,7 @@ from ..estimator_configs import (
     MinMaxZpWeightEstimatorConfig,
     VptqGroupEstimatorConfig,
 )
+from ..moe_experts import GptqMoeExpertsEstimatorConfig, MoEExpertsQ40AdapterConfig
 from ..pipeline import QuantizationPipeline
 from ..quantization.cache import DiskCacheManager, _cal_fingerprint, _recipe_fingerprint
 from ..quantization.spans import (
@@ -68,7 +69,12 @@ from ..quantization.spans import (
     SpanCollector,
 )
 from ..recipe import CalibrationConfig, QuantizationRecipe
-from ..recipe_config import CompositeEstimatorConfig, QuantizationRecipeConfig
+from ..recipe_config import (
+    CompositeAdapterConfig,
+    CompositeEstimatorConfig,
+    QuantizationRecipeConfig,
+    WeightAssignmentAdapterConfig,
+)
 from ..transforms import Q4_X_GROUP_SIZE
 from .model_io import attach_manifest
 
@@ -347,6 +353,27 @@ NEUROPRESS_COMPRESSION: dict[str, Any] = {
                 group_size=Q4_X_GROUP_SIZE,
                 nbits=4,
                 weight_transform="q4_0_packed_no_lm_head",
+            ),
+        )
+    ),
+    # Q4_0 linears plus GPTQ Q4_0 fused MoE experts (one Hessian per expert,
+    # from the tokens routed to it). The adapter marks each MoE block for the
+    # torch_to_nnef tract_moe_ffn extractor with the linear expert layout and
+    # a quantizer returning these codes, so no export flag is needed.
+    "open_text_c4_gptq_q4_0_moe": _make_entry(
+        QuantizationRecipeConfig(
+            estimator=CompositeEstimatorConfig(
+                methods=[
+                    GptqEstimatorConfig(
+                        group_size=Q4_X_GROUP_SIZE,
+                        nbits=4,
+                        weight_transform="q4_0_packed",
+                    ),
+                    GptqMoeExpertsEstimatorConfig(group_size=Q4_X_GROUP_SIZE),
+                ]
+            ),
+            adapter=CompositeAdapterConfig(
+                adapters=[WeightAssignmentAdapterConfig(), MoEExpertsQ40AdapterConfig()]
             ),
         )
     ),

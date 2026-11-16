@@ -19,6 +19,7 @@ from ..batches import call_batch, move_batch
 from .collectors import (
     COLLECTOR_REGISTRY,
     Collector,
+    InvocationCollector,
     PairedCollector,
     StatField,
     StatisticRequest,
@@ -311,6 +312,9 @@ class StatisticsRegistry:
                                 f"No matching teacher invocation for {_key}"
                             )
                         _col.update_pair(inputs, outputs, observations[_key].popleft())
+                        return
+                    if isinstance(_col, InvocationCollector):
+                        _col.update_call(module, inputs, outputs)
                         return
                     data = inputs[0] if inputs else outputs
                     if isinstance(data, torch.Tensor):

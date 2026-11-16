@@ -36,6 +36,22 @@ class PairedCollector(Collector):
         """Accumulate a matched module invocation from the two forward streams."""
 
 
+class InvocationCollector(Collector):
+    """Collector fed the whole module invocation rather than its first input.
+
+    For modules whose statistics depend on more than one input, such as fused
+    MoE experts that take hidden states together with their routing.
+    """
+
+    def update(self, data: torch.Tensor) -> None:
+        """Reject a bare tensor: this collector needs the full invocation."""
+        raise ValueError(f"{type(self).__name__} needs the full module invocation")
+
+    @abstractmethod
+    def update_call(self, module: Any, inputs: tuple, output: Any) -> None:
+        """Accumulate one invocation of *module* with positional *inputs*."""
+
+
 COLLECTOR_REGISTRY: dict[str, type[Collector]] = {}
 
 
