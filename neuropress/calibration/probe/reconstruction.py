@@ -20,6 +20,9 @@ class LinearReconstructionCollector(PairedCollector):
     module: nn.Module | None = None
     cross: torch.Tensor | None = None
     nsamples: int = 0
+    # Leading sequence positions whose residual is zeroed, so the fit keeps
+    # the student's own output there (the attention-sink token at position 0).
+    protected_positions: int = 0
 
     def update_pair(self, inputs: tuple, output: Any, reference: Any) -> None:
         """Accumulate aligned linear input and teacher residual products."""
@@ -34,9 +37,14 @@ class LinearReconstructionCollector(PairedCollector):
             raise ValueError("Teacher and student observations must be aligned")
         batch_size = x.shape[0] if x.ndim > 2 else 1
         total = self.nsamples + batch_size
-        residual = (reference.to(output.device).float() - output.float()).reshape(
-            -1, output.shape[-1]
-        )
+        residual = reference.to(output.device).float() - output.float()
+        if self.protected_positions:
+            if residual.ndim < 3:
+                raise ValueError(
+                    "Protecting sequence positions needs [batch, seq, features] outputs"
+                )
+            residual[:, : self.protected_positions] = 0
+        residual = residual.reshape(-1, output.shape[-1])
         contribution = residual.t() @ x.float().reshape(-1, x.shape[-1])
         if self.cross is None:
             self.cross = torch.zeros_like(contribution)
@@ -48,6 +56,17 @@ class LinearReconstructionCollector(PairedCollector):
     def result(self) -> dict[str, Any]:
         """Return residual products and the normalization sample count."""
         return {"cross": self.cross, "nsamples": self.nsamples}
+
+
+@dataclass
+class SinkProtectedReconstructionCollector(LinearReconstructionCollector):
+    """Teacher residual products with position 0 kept on the self objective.
+
+    The teacher fit can trade the attention-sink token for the other tokens;
+    every token attends to it, so a sink broken early breaks every later layer.
+    """
+
+    protected_positions: int = 1
 
 
 @torch.no_grad()

@@ -385,7 +385,7 @@ class HqqEstimatorConfig(EstimatorConfig):
         )
 
 
-def _resolve_cluster_backend(name: str, n_iter: int):
+def _resolve_cluster_backend(name: str, n_iter: int, seed: int | None = None):
     """Resolve a backend name to an instance, deferring the import.
 
     ``neuropress.transforms`` pulls in ``weight_only``, which imports back into
@@ -393,7 +393,7 @@ def _resolve_cluster_backend(name: str, n_iter: int):
     """
     from .transforms.cluster_backends import backend_by_name
 
-    return backend_by_name(name, n_iter=n_iter)
+    return backend_by_name(name, seed=seed, n_iter=n_iter)
 
 
 @estimator_config("vptq")
@@ -442,6 +442,18 @@ class VptqGroupEstimatorConfig(EstimatorConfig):
             measured index entropy, which ranges 7.85-13.69 bits: a uniform NC
             spends 14 bits addressing ~230 effective centroids on ``down_proj``
             (22% of the model) while ``in_proj_qkv`` needs all 16384.
+        own_codebook_modules: Full names of target modules that get a codebook
+            of their own (keyed by that name) outside their group, e.g. the
+            massive-activation ``down_proj`` layers of Llama.
+        residual_num_centroids: Size of the per-group residual codebook of
+            selective-depth residual VQ (:mod:`~neuropress.methods.residual_vq`);
+            ``None`` disables it.
+        residual_fraction: Fraction of each layer's column groups, the most
+            important first (Hessian-sorted order), that get a residual index.
+        residual_num_centroids_per_group: Per-group residual codebook sizes,
+            keyed like ``num_centroids_per_group``; override the global size.
+        residual_fraction_per_group: Per-group residual fractions; a group
+            without a residual stage resolves to fraction 0 or no size.
         cluster_backend_name: Clustering backend: ``"auto"`` (default),
             ``"torch"``, ``"ivf"``, ``"cuda"`` or ``"sklearn"``.  Pin
             ``"torch"`` for large codebooks on constrained VRAM: the auto
@@ -460,6 +472,9 @@ class VptqGroupEstimatorConfig(EstimatorConfig):
         max_n_iter: Maximum number of Lloyd's refinement iterations; the loop
             exits early when centroid shift falls below *tol*.  ``0`` disables
             refinement entirely.
+        seed: Optional seed for k-means initialization and vector
+            subsampling.  Reproducible runs also need deterministic
+            algorithms (``neuropress-eval --deterministic``).
         tol: Convergence threshold — stop when the mean centroid shift falls
             below this value.
         centroid_weighting: Strategy for weighting vectors during centroid
@@ -530,6 +545,8 @@ class VptqGroupEstimatorConfig(EstimatorConfig):
         centroid_attraction_window: Number of future column groups to nudge
             per GPTQ step.  Larger windows capture more cascading benefit
             at proportional compute cost.
+        gptq_block_ldlq: Exact block LDLQ in the GPTQ passes, and an M-step
+            between passes that re-fits the codebook to the full-Hessian loss.
     """
 
     type: Literal["vptq", "vptq_group"] = "vptq"
@@ -545,9 +562,19 @@ class VptqGroupEstimatorConfig(EstimatorConfig):
     use_tiered: bool = _vd("use_tiered")
     zero_escape: bool = _vd("zero_escape")
     max_n_iter: int = _vd("max_n_iter")
+    seed: int | None = _vd("seed")
     max_train_vectors: int = _vd("max_train_vectors")
     cluster_backend_name: str = "auto"
     num_centroids_per_group: dict[str, int] | None = None
+    own_codebook_modules: tuple[str, ...] = ()
+    residual_num_centroids: int | None = _vd("residual_num_centroids")
+    residual_fraction: float = Field(default=_vd("residual_fraction"), ge=0, le=1)
+    residual_num_centroids_per_group: dict[str, int] | None = _vd(
+        "residual_num_centroids_per_group"
+    )
+    residual_fraction_per_group: dict[str, float] | None = _vd(
+        "residual_fraction_per_group"
+    )
     tol: float = _vd("tol")
     centroid_weighting: str = _vd("centroid_weighting")
     weighting_alpha: float = _vd("weighting_alpha")
@@ -561,11 +588,21 @@ class VptqGroupEstimatorConfig(EstimatorConfig):
     gptq_damp_percent: float = _vd("gptq_damp_percent")
     centroid_attraction: float = _vd("centroid_attraction")
     centroid_attraction_window: int = _vd("centroid_attraction_window")
+    gptq_block_ldlq: bool = _vd("gptq_block_ldlq")
     correction_mode: str = _vd("correction_mode")
     ecvq_beta_schedule: tuple[float, ...] = _vd("ecvq_beta_schedule")
     ecvq_iters_per_step: int = _vd("ecvq_iters_per_step")
     ecvq_beta_in_loop: float = _vd("ecvq_beta_in_loop")
     ecvq_warmup_iters: int = _vd("ecvq_warmup_iters")
+    frozen_centroids_path: str | None = _vd("frozen_centroids_path")
+    reconstruction: Literal["self", "teacher"] = _vd("reconstruction")
+    reconstruction_damp_percent: float = Field(
+        default=_vd("reconstruction_damp_percent"), gt=0
+    )
+    reconstruction_max_output_ratio: float | None = Field(
+        default=_vd("reconstruction_max_output_ratio"), gt=0
+    )
+    reconstruction_protect_sink: bool = _vd("reconstruction_protect_sink")
 
     def build(self) -> VPTQGroupEstimator:
         """Build a :class:`.VPTQGroupEstimator` for the configured target class(es).
@@ -616,9 +653,15 @@ class VptqGroupEstimatorConfig(EstimatorConfig):
             max_n_iter=self.max_n_iter,
             max_train_vectors=self.max_train_vectors,
             num_centroids_per_group=self.num_centroids_per_group,
+            own_codebook_modules=tuple(self.own_codebook_modules),
+            residual_num_centroids=self.residual_num_centroids,
+            residual_fraction=self.residual_fraction,
+            residual_num_centroids_per_group=self.residual_num_centroids_per_group,
+            residual_fraction_per_group=self.residual_fraction_per_group,
             cluster_backend=_resolve_cluster_backend(
-                self.cluster_backend_name, self.max_n_iter
+                self.cluster_backend_name, self.max_n_iter, self.seed
             ),
+            seed=self.seed,
             tol=self.tol,
             centroid_weighting=self.centroid_weighting,
             weighting_alpha=self.weighting_alpha,
@@ -632,10 +675,16 @@ class VptqGroupEstimatorConfig(EstimatorConfig):
             gptq_damp_percent=self.gptq_damp_percent,
             centroid_attraction=self.centroid_attraction,
             centroid_attraction_window=self.centroid_attraction_window,
+            gptq_block_ldlq=self.gptq_block_ldlq,
             correction_mode=CorrectionMode(self.correction_mode),
             ecvq_beta_schedule=tuple(self.ecvq_beta_schedule),
             ecvq_iters_per_step=self.ecvq_iters_per_step,
             ecvq_beta_in_loop=self.ecvq_beta_in_loop,
             ecvq_warmup_iters=self.ecvq_warmup_iters,
+            frozen_centroids_path=self.frozen_centroids_path,
+            reconstruction=self.reconstruction,
+            reconstruction_damp_percent=self.reconstruction_damp_percent,
+            reconstruction_max_output_ratio=self.reconstruction_max_output_ratio,
+            reconstruction_protect_sink=self.reconstruction_protect_sink,
             filter_fn=filter_fn,
         )

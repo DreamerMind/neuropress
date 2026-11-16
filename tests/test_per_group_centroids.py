@@ -35,3 +35,27 @@ def test_rejects_non_positive_override():
     est = _est(num_centroids=16384, num_centroids_per_group={"down_proj": 0})
     with pytest.raises(ValueError, match="down_proj"):
         est.centroids_for_group("down_proj")
+
+
+def test_per_layer_groups_fall_back_to_leaf_name():
+    """grouping="per_layer" keys groups by full name; the table is keyed by leaf."""
+    est = VPTQGroupEstimator(
+        grouping="per_layer",
+        num_centroids=16384,
+        num_centroids_per_group={"down_proj": 256},
+    )
+    assert est.centroids_for_group("model.layers.3.mlp.down_proj") == 256
+    assert est.centroids_for_group("model.layers.3.self_attn.q_proj") == 16384
+
+
+def test_exact_key_wins_over_leaf_name():
+    est = VPTQGroupEstimator(
+        grouping="per_layer",
+        num_centroids=16384,
+        num_centroids_per_group={
+            "down_proj": 256,
+            "model.layers.0.mlp.down_proj": 1024,
+        },
+    )
+    assert est.centroids_for_group("model.layers.0.mlp.down_proj") == 1024
+    assert est.centroids_for_group("model.layers.1.mlp.down_proj") == 256

@@ -113,8 +113,8 @@ class TorchKMeansBackend(ClusterBackend):
             the centroid shift falls below *tol*.
         chunk_mb: Memory budget in MiB for the ``[chunk_rows, k]`` distance
             slab.  Larger values use more VRAM but reduce kernel-launch
-            overhead.  ``None`` auto-selects based on free VRAM (GPU) or
-            defaults to 256 MiB (CPU).
+            overhead.  ``None`` uses 1 GiB on GPU and 256 MiB on CPU (fixed,
+            so results do not depend on other GPU users).
         kmeans_pp_max: Use k-means++ initialisation only when
             ``n_clusters <= kmeans_pp_max``; above this threshold random
             initialisation is used instead.
@@ -153,8 +153,10 @@ class TorchKMeansBackend(ClusterBackend):
         if self.chunk_mb is not None:
             budget = int(self.chunk_mb * 2**20)
         elif torch.cuda.is_available():
-            free, _ = torch.cuda.mem_get_info()
-            budget = max(int(free * 0.10), 64 * 2**20)  # 10 % free VRAM, min 64 MiB
+            # Fixed, not a fraction of free VRAM: the slab shape changes how
+            # cuBLAS rounds the distances, so a free-memory-dependent chunk made
+            # assignments (and the codebook) depend on other GPU users.
+            budget = 1024 * 2**20  # 1 GiB
         else:
             budget = 256 * 2**20  # 256 MiB on CPU
         return max(256, budget // (n_clusters * elem_size))

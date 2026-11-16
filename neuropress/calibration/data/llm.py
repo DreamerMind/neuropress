@@ -413,3 +413,46 @@ def load_eval_targeted_calibration(
 
     for i in range(0, len(all_samples) - batch_size + 1, batch_size):
         yield {"input_ids": torch.stack(all_samples[i : i + batch_size])}
+
+
+def load_token_file_calibration(
+    tokenizer: Any,
+    *,
+    path: str,
+    seq_len: int = 512,
+    n_samples: int = 128,
+    batch_size: int = 1,
+    seed: int = 42,
+) -> Iterator[dict[str, torch.Tensor]]:
+    """Load calibration batches from a pre-tokenized safetensors file.
+
+    The file holds an ``"input_ids"`` tensor ``[rows, cols]`` (the packed
+    format exllamav3's ``--cal_data`` reads), so one token set can calibrate
+    different quantizers exactly.  Rows are used in file order, cropped to
+    *seq_len*.  Select it with ``dataset="tokens:<path>"``.
+
+    Args:
+        tokenizer: Unused; the file is already tokenized for the target model.
+        path: Path to the safetensors file.
+        seq_len: Tokens per sample; at most the file's column count.
+        n_samples: Rows to use; at most the file's row count.
+        batch_size: Samples per yielded dict.
+        seed: Unused; rows are taken in file order.
+
+    Yields:
+        ``{"input_ids": Tensor[batch, seq_len]}`` dicts.
+
+    Raises:
+        ValueError: If the file has fewer rows or columns than requested.
+    """
+    from safetensors.torch import load_file
+
+    ids = load_file(path)["input_ids"]
+    rows, cols = ids.shape
+    if n_samples > rows:
+        raise ValueError(f"{path}: {rows} rows, {n_samples} samples requested")
+    if seq_len > cols:
+        raise ValueError(f"{path}: {cols} columns, seq_len {seq_len} requested")
+    ids = ids[:n_samples, :seq_len].to(torch.long)
+    for i in range(0, n_samples, batch_size):
+        yield {"input_ids": ids[i : i + batch_size]}

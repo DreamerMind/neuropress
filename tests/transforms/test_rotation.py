@@ -69,6 +69,32 @@ def test_fwht_preserves_norm_at_gemma_hidden_size():
     assert torch.allclose(x.norm(dim=-1), y.norm(dim=-1), atol=1e-10)
 
 
+@pytest.mark.parametrize("m", [20, 28])
+def test_hadamard_matrix_orders_20_and_28_are_hadamard(m):
+    """20 (Paley I, q=19) and 28 (Paley II, q=13): Llama's 14336 = 28 x 512."""
+    h = hadamard_matrix(m)
+    assert h.shape == (m, m)
+    assert set(h.unique().tolist()) == {-1.0, 1.0}
+    assert torch.allclose(h @ h.T, m * torch.eye(m, dtype=h.dtype), atol=1e-10)
+
+
+@pytest.mark.parametrize("n", [40, 112])
+def test_fwht_matches_dense_matmul_for_20_and_28_times_power_of_two(n):
+    dense = hadamard_matrix(n) / n**0.5
+    x = torch.randn(3, n, dtype=torch.float64)
+    assert torch.allclose(fast_hadamard_transform(x), x @ dense.T, atol=1e-10)
+
+
+def test_online_hadamard_preserves_output_at_llama_intermediate_size():
+    """14336 = 28 x 512, Llama-3.1-8B's MLP width."""
+    torch.manual_seed(0)
+    lin = nn.Linear(14336, 8, bias=False).double()
+    z = torch.randn(2, 14336, dtype=torch.float64)
+    before = lin(z)
+    after = wrap_linear_with_online_hadamard(lin, seed=5)(z)
+    assert torch.allclose(before, after, atol=1e-8)
+
+
 def test_fwht_rejects_unsupported_size():
     with pytest.raises(ValueError):
         fast_hadamard_transform(torch.randn(1, 7))

@@ -134,6 +134,54 @@ def test_rotation_surgery_with_online_down_proj_preserves_output():
     assert torch.allclose(before, model(ids), atol=1e-9)
 
 
+class _PlainRMSNorm(_RMSNorm):
+    """Llama semantics: scale is ``weight``."""
+
+    def __init__(self, n):
+        super().__init__(n)
+        with torch.no_grad():
+            self.weight.add_(1.0)
+
+    def forward(self, x):
+        var = x.pow(2).mean(-1, keepdim=True)
+        return x * torch.rsqrt(var + 1e-6) * self.weight
+
+
+def _plain_norm_toy(seed=0):
+    model = _toy(seed)
+    d = model.model.norm.weight.numel()
+    for layer in model.model.layers:
+        layer.input_layernorm = _PlainRMSNorm(d)
+        layer.post_attention_layernorm = _PlainRMSNorm(d)
+    model.model.norm = _PlainRMSNorm(d)
+    return model
+
+
+@pytest.mark.parametrize("rotate_down_proj", [False, True])
+def test_rotation_surgery_with_plain_norms_preserves_output(rotate_down_proj):
+    """``plus_one_norms=False`` folds a plain ``weight * x`` norm (Llama)."""
+    model = _plain_norm_toy()
+    ids = torch.tensor([[1, 5, 9, 2]])
+    before = model(ids)
+
+    apply_hadamard_rotation(
+        model, seed=17, rotate_down_proj=rotate_down_proj, plus_one_norms=False
+    )
+
+    assert torch.allclose(before, model(ids), atol=1e-9)
+
+
+def test_rotation_surgery_plain_norms_need_the_flag():
+    """Folding plain norms as ``1 + weight`` changes the output."""
+    model = _plain_norm_toy()
+    ids = torch.tensor([[1, 5, 9, 2]])
+    before = model(ids)
+
+    apply_hadamard_rotation(model, seed=17, plus_one_norms=True)
+
+    assert not torch.allclose(before, model(ids), atol=1e-6)
+
+
 def test_rotation_surgery_reports_what_it_touched():
     model = _toy()
     summary = apply_hadamard_rotation(model, seed=17, rotate_down_proj=True)
@@ -228,3 +276,35 @@ def _find_final_norm(model):
         if isinstance(mod, _RMSNorm) and name.startswith("model.norm"):
             return name, mod
     raise AssertionError("final norm not found")
+
+
+def test_rotation_preserves_tiny_llama_logits():
+    """Llama: plain ``weight * x`` RMSNorm (plus_one_norms=False), untied head,
+    MLP width 112 = 28 x 4 like Llama-3's 14336 = 28 x 512 (online down_proj
+    rotation)."""
+    pytest.importorskip("transformers")
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    torch.manual_seed(0)
+    cfg = LlamaConfig(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=112,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        tie_word_embeddings=False,
+    )
+    model = LlamaForCausalLM(cfg).double().eval()
+    with torch.no_grad():
+        for mod in model.modules():
+            if type(mod).__name__ == "LlamaRMSNorm":
+                mod.weight.add_(torch.randn_like(mod.weight) * 0.3)
+    ids = torch.randint(0, 64, (2, 12))
+    with torch.no_grad():
+        ref = model(input_ids=ids).logits
+        apply_hadamard_rotation(
+            model, seed=1, rotate_down_proj=True, plus_one_norms=False
+        )
+        out = model(input_ids=ids).logits
+    torch.testing.assert_close(out, ref, rtol=1e-6, atol=1e-6)

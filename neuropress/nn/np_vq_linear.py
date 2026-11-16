@@ -866,6 +866,10 @@ class NPVQLinear(nn.Module):
             if qscheme.column_permutation is not None
             else None
         )
+        if weight_q.qscheme.has_residual:
+            raise ValueError(
+                "residual VQ has no fused kernel yet; keeping the dequantize path"
+            )
         use_tiered = qscheme.use_tiered
         cold_bits = qscheme.is_packed_indices
         tier_bits = getattr(qscheme, "tier_bits", None)

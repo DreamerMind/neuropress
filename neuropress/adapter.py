@@ -108,7 +108,9 @@ class WeightAssignmentAdapter(ModuleQuantizationAdapter):
                 q_weight = self._convert(q_weight, name, mod.weight, plan.kept_float)
                 if q_weight is None:
                     continue
-            if isinstance(q_weight, QTensorTractVQ):
+            if isinstance(q_weight, QTensorTractVQ) or getattr(
+                q_weight, "assign_as_parameter", False
+            ):
                 # ModTensorUpdater calls new.dtype in both check_same_dtype and
                 # _set_tensor's fast-path check, triggering __torch_function__ →
                 # decompress() → OOM for large VQ tensors (e.g. embed_tokens,

@@ -53,7 +53,7 @@ import torch
 from torch import nn
 
 from .. import transforms as _transforms  # noqa: F401  (registers weight transforms)
-from ..calibration import DATASET_REGISTRY
+from ..calibration.data.registry import resolve_calibration_loader
 from ..estimator_configs import (
     GptqEstimatorConfig,
     GptqPanelEstimatorConfig,
@@ -151,7 +151,7 @@ def run_quantization_pipeline(
     model = _calibration_target(model)
     device = next(model.parameters()).device
     cal = recipe.calibration
-    loader = DATASET_REGISTRY[cal.dataset]
+    loader = resolve_calibration_loader(cal.dataset)
     loader_kwargs = (
         {"_load_dataset": _load_dataset} if _load_dataset is not None else {}
     )

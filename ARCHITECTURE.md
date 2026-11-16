@@ -80,6 +80,19 @@ Flow: `StatisticsRegistry.register_method(method, target_key)` scans `Annotated`
 
 `BlockQuantizationPipeline` drives `QuantizationPipeline` per block instead of per model, so only one block's activations and statistics are live. It keeps two streams: the float reference (original block on float inputs) and the student (adapted block on adapted inputs), passed between blocks as plain CPU tensor trees (`calibration/batches.py`). With `target_paths`, `QuantizationSchedule.trace` ranks targets by observed tensor dependencies, and each stage runs a fresh recipe restricted to that stage, so later stages collect through already adapted weights. The first stage pairs against the still-float block; a frozen float copy is made only when a later stage requests paired statistics. Teacher reconstruction (`GPTQEstimator(reconstruction="teacher")`) fits a ridge correction toward the teacher output before GPTQ and falls back to plain GPTQ if the fit fails. Usage and the trace contract are in `docs/block-calibration.md`.
 
+### Trellis quantization (`trellis_estimator.py`, `methods/trellis*.py`, `methods/block_ldlq.py`)
+
+Bitshift-trellis coding in the style of QTIP / EXL3, in layers that can be reused separately:
+
+- `kernels/trellis_viterbi.cu` + `kernels/trellis.py`: CUDA Viterbi encoder, decoder and unpacker, JIT-built on first use (needs `nvcc` and `ninja` on PATH). The encoder started from exllamav3's (MIT, Copyright (c) 2025 Turboderp; the notice is in the `.cu` header) and picks the same states for the rates both support.
+- `methods/trellis_code.py`: `TrellisCode(bits, codebook, tile_len, lut)` codes `[n, tile_len]` value sequences at any rate from 1 to 8 bits in 1/16 steps; codebooks `mul1`, `mcg`, `3inst` (hash, no table) or `lut` (a 65536-entry fp16 table). Encoding needs CUDA; decode, pack and unpack also run in plain torch.
+- `methods/block_ldlq.py`: LDLQ error feedback over blocks of columns with a pluggable block quantizer (`quantize_block(z, j)`), plus block act-order. Any quantizer that codes several columns jointly can use it.
+- `methods/trellis.py`: the weight quantizer (random signs + 128-block Hadamard on both sides, fp16 row/column scales, global scale search, block LDLQ over 16x16 tiles) returning a `TrellisWeight`.
+- `transforms/trellis.py`: `QTensorTrellis` (packed tiles + `TrellisScheme`), saved packed by `save_quantized_model` through its serde. `assign_as_parameter = True` makes the adapter assign it as the weight as is.
+- `trellis_estimator.py`: estimator type `trellis`; per-module or per-type bits via `bits_per_group` (full name first, then leaf name), `store="packed"` (default) or `"dense"`. Sign seeds are `seed` plus the module's position among all linears of the model, so a staged `BlockQuantizationPipeline` run seeds every linear as a whole-model run does.
+
+A packed weight is dequantized on every forward; for evaluation, dequantize the weights once (or use `store="dense"`).
+
 ### Pipeline wiring: `_cache` and `_spans`
 
 `QuantizationParamEstimator` declares `_cache: CacheManager` and `_spans: SpanCollector` as class attributes with no-op defaults. The pipeline calls `set_cache()` and `set_span_collector()` before `prepare()`. Subclasses use `self._cache` / `self._spans` directly — no `getattr` fallback needed.

@@ -552,6 +552,20 @@ def _evaluate_per_task(
     return _merge_results(per_task), total_time, per_task_timing
 
 
+def _enable_deterministic() -> None:
+    """Make quantization reproducible run to run.
+
+    The VPTQ M-step accumulates with float atomics (``scatter_add_`` /
+    ``index_add_``), whose summation order changes per run; k-means amplifies
+    that into different codebooks.  Deterministic algorithms remove it at no
+    measured cost.  cuBLAS needs a fixed workspace, set before it initializes.
+    """
+    import torch
+
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
+
 def _write_run_config(args: argparse.Namespace) -> None:
     """Write run_config.json next to the --output file before work begins.
 
@@ -590,6 +604,7 @@ def _write_run_config(args: argparse.Namespace) -> None:
         num_fewshot=getattr(args, "num_fewshot", None),
         batch_size=getattr(args, "batch_size", None),
         skip_baseline=getattr(args, "skip_baseline", False),
+        deterministic=getattr(args, "deterministic", False),
         quantization_config=quant_config,
         neuropress=RunMeta.collect(),
     )
@@ -631,6 +646,8 @@ def _cmd_compare(args: argparse.Namespace) -> None:
     )
     from neuropress.meta import RunMeta
 
+    if getattr(args, "deterministic", False):
+        _enable_deterministic()
     args.tasks = normalize_tasks(args.tasks)
     unknown = validate_tasks(args.tasks)
     if unknown:
@@ -1020,6 +1037,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Disable quantization stage caching even when $NEUROPRESS_DATA_DIR "
             "is set.  Overrides --cache-dir and the auto-derived default."
+        ),
+    )
+    p_cmp.add_argument(
+        "--deterministic",
+        action="store_true",
+        default=False,
+        help=(
+            "Use deterministic algorithms so a recipe quantizes to the same "
+            "weights on every run (combine with a recipe seed)."
         ),
     )
     p_cmp.set_defaults(func=_cmd_compare)
