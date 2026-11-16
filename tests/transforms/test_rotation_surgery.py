@@ -134,6 +134,54 @@ def test_rotation_surgery_with_online_down_proj_preserves_output():
     assert torch.allclose(before, model(ids), atol=1e-9)
 
 
+class _PlainRMSNorm(_RMSNorm):
+    """Llama semantics: scale is ``weight``."""
+
+    def __init__(self, n):
+        super().__init__(n)
+        with torch.no_grad():
+            self.weight.add_(1.0)
+
+    def forward(self, x):
+        var = x.pow(2).mean(-1, keepdim=True)
+        return x * torch.rsqrt(var + 1e-6) * self.weight
+
+
+def _plain_norm_toy(seed=0):
+    model = _toy(seed)
+    d = model.model.norm.weight.numel()
+    for layer in model.model.layers:
+        layer.input_layernorm = _PlainRMSNorm(d)
+        layer.post_attention_layernorm = _PlainRMSNorm(d)
+    model.model.norm = _PlainRMSNorm(d)
+    return model
+
+
+@pytest.mark.parametrize("rotate_down_proj", [False, True])
+def test_rotation_surgery_with_plain_norms_preserves_output(rotate_down_proj):
+    """``plus_one_norms=False`` folds a plain ``weight * x`` norm (Llama)."""
+    model = _plain_norm_toy()
+    ids = torch.tensor([[1, 5, 9, 2]])
+    before = model(ids)
+
+    apply_hadamard_rotation(
+        model, seed=17, rotate_down_proj=rotate_down_proj, plus_one_norms=False
+    )
+
+    assert torch.allclose(before, model(ids), atol=1e-9)
+
+
+def test_rotation_surgery_plain_norms_need_the_flag():
+    """Folding plain norms as ``1 + weight`` changes the output."""
+    model = _plain_norm_toy()
+    ids = torch.tensor([[1, 5, 9, 2]])
+    before = model(ids)
+
+    apply_hadamard_rotation(model, seed=17, plus_one_norms=True)
+
+    assert not torch.allclose(before, model(ids), atol=1e-6)
+
+
 def test_rotation_surgery_reports_what_it_touched():
     model = _toy()
     summary = apply_hadamard_rotation(model, seed=17, rotate_down_proj=True)
@@ -234,11 +282,8 @@ def test_rotation_preserves_tiny_llama_logits():
     """Llama: plain ``weight * x`` RMSNorm (plus_one_norms=False), untied head,
     MLP width 112 = 28 x 4 like Llama-3's 14336 = 28 x 512 (online down_proj
     rotation)."""
-    transformers = pytest.importorskip("transformers")
-    LlamaConfig, LlamaForCausalLM = (
-        transformers.LlamaConfig,
-        transformers.LlamaForCausalLM,
-    )
+    pytest.importorskip("transformers")
+    from transformers import LlamaConfig, LlamaForCausalLM
 
     torch.manual_seed(0)
     cfg = LlamaConfig(
