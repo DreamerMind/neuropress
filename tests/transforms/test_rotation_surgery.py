@@ -234,7 +234,11 @@ def test_rotation_preserves_tiny_llama_logits():
     """Llama: plain ``weight * x`` RMSNorm (plus_one_norms=False), untied head,
     MLP width 112 = 28 x 4 like Llama-3's 14336 = 28 x 512 (online down_proj
     rotation)."""
-    from transformers import LlamaConfig, LlamaForCausalLM
+    transformers = pytest.importorskip("transformers")
+    LlamaConfig, LlamaForCausalLM = (
+        transformers.LlamaConfig,
+        transformers.LlamaForCausalLM,
+    )
 
     torch.manual_seed(0)
     cfg = LlamaConfig(
