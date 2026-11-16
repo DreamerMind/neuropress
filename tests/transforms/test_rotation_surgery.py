@@ -228,3 +228,34 @@ def _find_final_norm(model):
         if isinstance(mod, _RMSNorm) and name.startswith("model.norm"):
             return name, mod
     raise AssertionError("final norm not found")
+
+
+def test_rotation_preserves_tiny_llama_logits():
+    """Llama: plain ``weight * x`` RMSNorm (plus_one_norms=False), untied head,
+    MLP width 112 = 28 x 4 like Llama-3's 14336 = 28 x 512 (online down_proj
+    rotation)."""
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    torch.manual_seed(0)
+    cfg = LlamaConfig(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=112,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        tie_word_embeddings=False,
+    )
+    model = LlamaForCausalLM(cfg).double().eval()
+    with torch.no_grad():
+        for mod in model.modules():
+            if type(mod).__name__ == "LlamaRMSNorm":
+                mod.weight.add_(torch.randn_like(mod.weight) * 0.3)
+    ids = torch.randint(0, 64, (2, 12))
+    with torch.no_grad():
+        ref = model(input_ids=ids).logits
+        apply_hadamard_rotation(
+            model, seed=1, rotate_down_proj=True, plus_one_norms=False
+        )
+        out = model(input_ids=ids).logits
+    torch.testing.assert_close(out, ref, rtol=1e-6, atol=1e-6)

@@ -856,11 +856,32 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
     vector_len: int = 8
     proxy_selector: Any = None  # ProxySelector.L2 - set via __post_init__
     grouping: str = "all"
+    # Target modules (full names) that get a codebook of their own, keyed by
+    # that name, outside whatever group :attr:`grouping` puts them in, so they
+    # neither shape nor share the group's codebook.  For the few layers whose
+    # weights or activations an outlier dominates (Llama's massive-activation
+    # down_proj).  Their size follows centroids_for_group (full name, then leaf).
+    own_codebook_modules: tuple[str, ...] = ()
+    # Selective-depth residual VQ (methods/residual_vq.py): the leading
+    # residual_fraction of each layer's column groups, in the Hessian-sorted
+    # order, get a second index into a per-group residual codebook of
+    # residual_num_centroids entries.  None disables it.  The per-group tables
+    # override both, keyed like num_centroids_per_group (full name, then leaf);
+    # a group gets a residual stage when its size is set and its fraction > 0.
+    residual_num_centroids: int | None = None
+    residual_fraction: float = 0.0
+    residual_num_centroids_per_group: dict[str, int] | None = None
+    residual_fraction_per_group: dict[str, float] | None = None
     cluster_backend: Any = None  # ClusterBackend | None
     use_hessian_weighting: bool = True
     use_tiered: bool = False
     zero_escape: bool = False
     max_n_iter: int = 50
+    # Seeds the global RNG (subsampling, annealing noise) at the start of
+    # estimate() and the auto-selected clustering backend.  Runs are only
+    # reproducible with deterministic algorithms on as well: the M-step's
+    # float atomics otherwise reorder sums from run to run.
+    seed: int | None = None
     tol: float = 1e-4
     max_train_vectors: int = 50_000_000
     vram_budget: float = 0.5
@@ -877,6 +898,11 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
     gptq_damp_auto_increment: float = 0.0025
     centroid_attraction: float = 0.0
     centroid_attraction_window: int = 4
+    # Exact block LDLQ in the GPTQ passes (full VL x VL Hessian blocks for the
+    # metric and the feedback), and between passes an M-step that re-fits the
+    # codebook to that full-Hessian loss on the error-fed weights, instead of
+    # the Hessian-diagonal k-means M-step on the original weights.
+    gptq_block_ldlq: bool = False
     correction_mode: CorrectionMode = CorrectionMode.SEQUENTIAL
     ecvq_beta_schedule: tuple[float, ...] = ()
     ecvq_iters_per_step: int = 5
@@ -886,6 +912,22 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
     # per-layer entropy coding exists to spend the rate it buys.
     ecvq_beta_in_loop: float = 0.0
     ecvq_warmup_iters: int = 20
+    # Frozen codebooks: a safetensors file with one ``[NC, VL]`` tensor per
+    # group key.  Training and the Lloyd passes are skipped; each layer gets
+    # one GPTQ-corrected assignment against the given codebook, so a block-wise
+    # run (sequential statistics) keeps the codebooks a whole-model run fitted.
+    frozen_centroids_path: str | None = None
+    # "teacher" fits W + C (H + lambda I)^-1 toward the float teacher output
+    # before the GPTQ-corrected assignment (frozen codebooks only).
+    reconstruction: str = "self"
+    reconstruction_damp_percent: float = 0.01
+    # Teacher fits that move the layer output by more than this fraction of
+    # the weight's own output (both under H) are dropped for the plain weight.
+    # None keeps every fit.
+    reconstruction_max_output_ratio: float | None = None
+    # Keep the attention-sink token (sequence position 0) on the self
+    # objective: the plain teacher fit trades it for the other tokens.
+    reconstruction_protect_sink: bool = False
 
     _target_modules: dict[str, nn.Module] = field(
         default_factory=dict, init=False, repr=False, compare=False
@@ -918,6 +960,9 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
         default_factory=dict, init=False, repr=False, compare=False
     )
     _diag_h_registry: Any = field(default=None, init=False, repr=False, compare=False)
+    _leaf_names: dict[str, str] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         """Apply defaults and build optional sub-objects after dataclass init."""
@@ -940,6 +985,27 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
                 f"correction_mode must be one of {[m.value for m in CorrectionMode]}, "
                 f"got {self.correction_mode!r}."
             )
+        if self.reconstruction not in {"self", "teacher"}:
+            raise ValueError("reconstruction must be 'self' or 'teacher'")
+        if self.reconstruction_damp_percent <= 0:
+            raise ValueError("reconstruction_damp_percent must be positive")
+        if self.reconstruction == "teacher" and self.frozen_centroids_path is None:
+            raise ValueError("Teacher reconstruction needs frozen_centroids_path")
+        if (
+            self.reconstruction_max_output_ratio is not None
+            and self.reconstruction_max_output_ratio <= 0
+        ):
+            raise ValueError("reconstruction_max_output_ratio must be positive")
+        if self.reconstruction_protect_sink and self.reconstruction != "teacher":
+            raise ValueError(
+                "reconstruction_protect_sink needs reconstruction='teacher'"
+            )
+        self._validate_residual()
+        if self.frozen_centroids_path is not None and self.gptq_correction_iters != 1:
+            raise ValueError(
+                "Frozen codebooks take exactly one GPTQ-corrected assignment: "
+                "set gptq_correction_iters=1"
+            )
         if self.gptq_correction_iters:
             from .methods.vq_gptq import VQGPTQCorrector
 
@@ -950,6 +1016,7 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
                 gptq_damp_auto_increment=self.gptq_damp_auto_increment,
                 centroid_attraction=self.centroid_attraction,
                 centroid_attraction_window=self.centroid_attraction_window,
+                block_metric=self.gptq_block_ldlq,
             )
 
     def cache_stages(self) -> list[CacheStageDescriptor]:
@@ -999,6 +1066,28 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
         self._tied_aliases = collect_tied_aliases(
             model, self.module_classes, self.filter_fn
         )
+        # Fail before calibration, not hours later in _make_groups.
+        missing = set(self.own_codebook_modules) - set(self._target_modules)
+        if missing:
+            raise ValueError(
+                f"own_codebook_modules not among the target modules: {sorted(missing)}"
+            )
+        from .transforms.rotation import HadamardInputLinear
+
+        # An online rotation wraps a layer and renames its target from
+        # "...down_proj" to "...down_proj.linear"; group and size it by the
+        # layer it stands for, not by the wrapper's attribute name.
+        wrapped = {
+            f"{n}.linear"
+            for n, m in model.named_modules()
+            if isinstance(m, HadamardInputLinear)
+        }
+        self._leaf_names = {
+            name: (name.removesuffix(".linear") if name in wrapped else name).rsplit(
+                ".", 1
+            )[-1]
+            for name in self._target_modules
+        }
         LOGGER.info(
             "VPTQGroupEstimator: %d target modules (device=%s)",
             len(self._target_modules),
@@ -1036,6 +1125,12 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
         for name, mod in self._target_modules.items():
             if isinstance(mod, nn.Embedding):
                 continue
+            if self.reconstruction == "teacher":
+                requests.append(
+                    StatisticRequest(
+                        target_key=name, stat_type=self._reconstruction_stat
+                    )
+                )
             if self.gptq_correction_iters:
                 requests.append(StatisticRequest(target_key=name, stat_type="hessian"))
             else:
@@ -1158,7 +1253,9 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
 
         Args:
             group_key: Group key from :meth:`_make_groups` — the leaf module
-                name under ``grouping="by_leaf_name"``.
+                name under ``grouping="by_leaf_name"``, the full module name
+                under ``grouping="per_layer"`` (looked up exactly, then by its
+                leaf name).
 
         Returns:
             Codebook size for this group.
@@ -1170,12 +1267,20 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
             return self.num_centroids
         nc = self.num_centroids_per_group.get(group_key)
         if nc is None:
+            # grouping="per_layer" keys groups by full module name; fall back to
+            # the leaf name so a per-type table still applies to every layer.
+            nc = self.num_centroids_per_group.get(self._leaf_name(group_key))
+        if nc is None:
             return self.num_centroids
         if nc <= 0:
             raise ValueError(
                 f"num_centroids_per_group[{group_key!r}] must be positive, got {nc}."
             )
         return nc
+
+    def _leaf_name(self, name: str) -> str:
+        """Layer type of a target module name, seen through online-rotation wrappers."""
+        return self._leaf_names.get(name, name.rsplit(".", 1)[-1])
 
     def _make_groups(self) -> dict[str, list[tuple[str, nn.Module]]]:
         """Partition target modules into centroid-sharing groups.
@@ -1184,11 +1289,19 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
             Mapping from group key to list of ``(name, module)`` pairs.
         """
         groups: dict[str, list[tuple[str, nn.Module]]] = {}
+        own = set(self.own_codebook_modules)
+        missing = own - set(self._target_modules)
+        if missing:
+            raise ValueError(
+                f"own_codebook_modules not among the target modules: {sorted(missing)}"
+            )
         for name, mod in self._target_modules.items():
-            if self.grouping == "by_type":
+            if name in own:
+                key = name
+            elif self.grouping == "by_type":
                 key = type(mod).__name__
             elif self.grouping == "by_leaf_name":
-                key = name.split(".")[-1]
+                key = self._leaf_name(name)
             elif self.grouping == "per_layer":
                 key = name
             else:
@@ -1395,17 +1508,22 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
         # the full [N, k] distance matrix, so the VRAM budget formula below
         # does not apply and must be skipped.
         backend = self.cluster_backend or best_available_backend(
-            n_clusters=n_centroids, vector_len=self.vector_len
+            seed=self.seed, n_clusters=n_centroids, vector_len=self.vector_len
         )
 
-        from .transforms.cluster_backends import CudaKMeansBackend
+        from .transforms.cluster_backends import CudaKMeansBackend, TorchKMeansBackend
 
-        cuda_tiled = isinstance(backend, CudaKMeansBackend)
+        # Backends that never materialise the full [N, k] distance matrix:
+        # CudaKMeansBackend (tiled shmem E-step) and TorchKMeansBackend (chunked
+        # cdist).  For them the budget below would only drop training data, and
+        # since it reads *free* VRAM it made the training set - and the
+        # codebook - change with whatever else was running on the GPU.
+        chunked = isinstance(backend, CudaKMeansBackend | TorchKMeansBackend)
 
-        # Compute effective cap: VRAM-limited on GPU, max_train_vectors on CPU.
-        # Skip for CudaKMeansBackend - tiled kernel has no [N, k] matrix.
+        # Compute effective cap: VRAM-limited for backends that build the full
+        # distance matrix on GPU, max_train_vectors otherwise.
         effective_max = self.max_train_vectors
-        if pooled.device.type == "cuda" and not cuda_tiled:
+        if pooled.device.type == "cuda" and not chunked:
             # Same staleness concern as above: release any memory a prior
             # group's fit left cached-but-unused before reading free VRAM.
             torch.cuda.empty_cache()
@@ -1591,8 +1709,13 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
         centroids: torch.Tensor,
         registry: StatisticsRegistry,
         column_perm: torch.Tensor | None = None,
-    ) -> torch.Tensor | None:
+        mstep_stats: Any = None,
+        residual: tuple[torch.Tensor, int] | None = None,
+    ) -> Any:
         """Delegate GPTQ-corrected assignment to :class:`~.methods.vq_gptq.VQGPTQCorrector`.
+
+        With *residual* ``(codebook, groups)`` returns ``(packed, residual
+        indices)`` from :meth:`~.methods.vq_gptq.VQGPTQCorrector.correct_residual`.
 
         Fetches the full Hessian and optional diagonal from cache/registry,
         then hands off all computation to ``self._corrector``.  Returns
@@ -1613,6 +1736,18 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
             )
             return None
         diag_h = self._get_diag_h(name, K, registry)
+        if residual is not None:
+            return self._corrector.correct_residual(
+                name=name,
+                mod=mod,
+                centroids=centroids,
+                residual_centroids=residual[0],
+                residual_groups=residual[1],
+                full_h=full_h,
+                device=dev,
+                column_perm=column_perm,
+                diag_h=diag_h,
+            )
         return self._corrector.correct(
             name=name,
             mod=mod,
@@ -1621,7 +1756,141 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
             device=dev,
             column_perm=column_perm,
             diag_h=diag_h,
+            mstep_stats=mstep_stats,
         )
+
+    def _per_group(self, table: dict[str, Any] | None, group_key: str) -> Any:
+        """Look *group_key* up in a per-group table: full name, then leaf."""
+        if not table:
+            return None
+        value = table.get(group_key)
+        return value if value is not None else table.get(self._leaf_name(group_key))
+
+    def residual_for_group(self, group_key: str) -> tuple[int, float] | None:
+        """Residual ``(codebook size, column fraction)`` of a group, or ``None``."""
+        nc = self._per_group(self.residual_num_centroids_per_group, group_key)
+        frac = self._per_group(self.residual_fraction_per_group, group_key)
+        nc = self.residual_num_centroids if nc is None else nc
+        frac = self.residual_fraction if frac is None else frac
+        if nc is None or not frac:
+            return None
+        return nc, frac
+
+    def _validate_residual(self) -> None:
+        """Check residual sizes and fractions, and the GPTQ settings they need."""
+        sizes = [
+            self.residual_num_centroids,
+            *(self.residual_num_centroids_per_group or {}).values(),
+        ]
+        fracs = [
+            self.residual_fraction,
+            *(self.residual_fraction_per_group or {}).values(),
+        ]
+        for nc_r in sizes:
+            if nc_r is not None and (nc_r < 16 or nc_r & (nc_r - 1)):
+                raise ValueError(
+                    "residual_num_centroids must be a power of two >= 16 "
+                    "(indices pack at no fewer than 4 bits)"
+                )
+        for frac in fracs:
+            if not 0.0 <= frac <= 1.0:
+                raise ValueError("residual_fraction must be in [0, 1]")
+        if not any(nc is not None for nc in sizes):
+            if any(fracs):
+                raise ValueError("residual_fraction needs residual_num_centroids")
+            return
+        if not any(fracs):
+            raise ValueError("residual_num_centroids needs a residual_fraction > 0")
+        if (
+            self.gptq_correction_iters != 1
+            or self.gptq_block_ldlq
+            or self.correction_mode != CorrectionMode.SEQUENTIAL
+        ):
+            raise ValueError(
+                "Residual VQ runs in one sequential GPTQ pass: set "
+                "gptq_correction_iters=1, gptq_block_ldlq=False and "
+                "correction_mode='sequential'"
+            )
+        if not self.use_hessian_weighting:
+            raise ValueError(
+                "Residual VQ picks columns by the Hessian-sorted order: "
+                "set use_hessian_weighting=True"
+            )
+        if self.use_tiered or self.zero_escape or self.frozen_centroids_path:
+            raise ValueError(
+                "Residual VQ supports plain packing and trained codebooks only"
+            )
+
+    def _residual_groups(self, mod: nn.Module, fraction: float) -> int:
+        """Leading column groups of *mod* that get a residual index."""
+        from .methods.residual_vq import residual_groups_for
+
+        K = int(mod.weight.shape[1])
+        return residual_groups_for(K // self.vector_len, fraction)
+
+    def _train_residual_codebook(
+        self,
+        group_key: str,
+        members: list[tuple[str, nn.Module]],
+        packed_per_layer: dict[str, torch.Tensor],
+        centroids: torch.Tensor,
+        bits: int,
+        perm_per_layer: dict[str, torch.Tensor | None],
+        registry: StatisticsRegistry,
+        num_centroids: int,
+        fraction: float,
+    ) -> torch.Tensor:
+        """Weighted k-means on what the base codebook leaves in the deep groups.
+
+        The residual of each member's leading groups (Hessian-sorted order)
+        after its final plain assignment, weighted like the base training,
+        pooled over the group and subsampled to ``max_train_vectors``.
+        """
+        from .methods.residual_vq import weighted_kmeans
+        from .transforms.vq_packing import IndexPacking
+
+        dev = self._device or torch.device("cpu")
+        vl = self.vector_len
+        xs, ws = [], []
+        for name, mod in members:
+            if name not in packed_per_layer:
+                continue
+            perm = perm_per_layer.get(name)
+            if perm is None:
+                raise ValueError(
+                    f"Residual VQ needs a Hessian column order for '{name}'"
+                )
+            n_res = self._residual_groups(mod, fraction)
+            if not n_res:
+                continue
+            rows, k = mod.weight.shape
+            w = mod.weight.data.to(dev).float()[:, perm.to(dev)]
+            idx = IndexPacking.unpack(
+                packed_per_layer[name], bits, n_indices=rows * (k // vl)
+            ).to(dev)
+            base = centroids.float().to(dev)[idx].reshape(rows, k // vl, vl)
+            r = (w.reshape(rows, k // vl, vl) - base)[:, :n_res].reshape(-1, vl)
+            wt = self._compute_layer_vector_weights(name, mod, registry, perm)
+            wt = wt.reshape(rows, k // vl)[:, :n_res].reshape(-1).to(dev)
+            xs.append(r)
+            ws.append(wt)
+        if not xs:
+            raise ValueError(f"No residual training vectors in group '{group_key}'")
+        x, wt = torch.cat(xs), torch.cat(ws)
+        gen = torch.Generator().manual_seed(self.seed or 0)
+        cap = self.max_train_vectors
+        if cap is not None and x.shape[0] > cap:
+            sel = torch.randperm(x.shape[0], generator=gen)[:cap].to(dev)
+            x, wt = x[sel], wt[sel]
+        book = weighted_kmeans(x, wt, num_centroids, generator=gen)
+        LOGGER.info(
+            "VPTQGroupEstimator: group '%s' residual codebook %d x %d from %d vectors",
+            group_key,
+            book.shape[0],
+            vl,
+            x.shape[0],
+        )
+        return book
 
     def _gho_sort_members(
         self,
@@ -2095,20 +2364,24 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
         acc = self._m_step_acc
         counts = self._m_step_counts
 
-        # Populate importance weight cache on first call (Hessian never changes).
-        if not self._cached_vector_weights:
-            for n, m in members:
-                perm = perm_per_layer.get(n)
-                self._cached_vector_weights[n] = self._compute_layer_vector_weights(
-                    n, m, registry, column_perm=perm
+        # Cache importance weights per layer (the Hessian never changes).  The
+        # cache spans groups, so fill it for every member not seen yet: filling
+        # it only when empty left every group after the first unweighted.
+        missing = [(n, m) for n, m in members if n not in self._cached_vector_weights]
+        if missing and self.centroid_weighting == "hessian" and registry is not None:
+            new = {
+                n: self._compute_layer_vector_weights(
+                    n, m, registry, column_perm=perm_per_layer.get(n)
                 )
+                for n, m in missing
+            }
             # Scale no-Hessian layers (embeddings) to the mean weight of
             # Hessian-equipped layers so they compete fairly for centroids.
-            if self.centroid_weighting == "hessian" and registry is not None:
-                no_h = {
-                    n for n, m in members if not self._layer_has_hessian(n, m, registry)
-                }
-                self._scale_no_hessian_weights(self._cached_vector_weights, no_h)
+            no_h = {
+                n for n, m in missing if not self._layer_has_hessian(n, m, registry)
+            }
+            self._scale_no_hessian_weights(new, no_h)
+            self._cached_vector_weights.update(new)
 
         use_coverage = self.coverage_beta > 0 and cluster_radii is not None
         cov_sum = 0.0
@@ -2481,9 +2754,14 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
 
         self._device = _targets_device(self._target_modules, self._device)
 
+        if self.frozen_centroids_path is not None:
+            return self._estimate_frozen(registry)
+
         assignments: dict[str, Any] = {}
         cache = self._cache
         spans = self._spans
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
 
         groups = self._make_groups()
         n_groups = len(groups)
@@ -2559,6 +2837,8 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
 
             # Pass 1 - initial assignment (with per-layer cache).
             packed_per_layer: dict[str, torch.Tensor] = {}
+            residual_per_layer: dict[str, torch.Tensor] = {}
+            residual_book: torch.Tensor | None = None
             n_members = len(members)
             prog_ctx = _layer_progress(n_members) if _RICH else contextlib.nullcontext()
             with prog_ctx as progress:
@@ -2973,7 +3253,26 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
                     if self.correction_mode == CorrectionMode.GHO_LAYER
                     else members
                 )
+                residual_cfg = self.residual_for_group(group_key)
+                if residual_cfg is not None:
+                    residual_book = self._train_residual_codebook(
+                        group_key,
+                        members,
+                        packed_per_layer,
+                        centroids,
+                        bits,
+                        perm_per_layer,
+                        registry,
+                        *residual_cfg,
+                    )
                 for vptq_iter in range(self.gptq_correction_iters):
+                    ldlq_stats = None
+                    if self.gptq_block_ldlq:
+                        from .methods.vq_gptq import LDLQStats
+
+                        ldlq_stats = LDLQStats.empty(
+                            centroids.shape[0], self.vector_len
+                        )
                     _centroid_imp: torch.Tensor | None = None
                     if self.correction_mode == CorrectionMode.CENTROID_CENTRIC:
                         _centroid_imp = self._compute_centroid_importance(
@@ -3009,8 +3308,26 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
                             centroids,
                             registry,
                             column_perm=col_perm,
+                            mstep_stats=ldlq_stats,
+                            residual=(
+                                None
+                                if residual_book is None
+                                else (
+                                    residual_book,
+                                    self._residual_groups(mod, residual_cfg[1]),
+                                )
+                            ),
                         )
-                        if corrected is not None:
+                        if corrected is None and residual_book is not None:
+                            raise RuntimeError(
+                                f"GPTQ-corrected residual assignment failed for "
+                                f"'{name}' (missing Hessian or CUDA budget)"
+                            )
+                        if isinstance(corrected, tuple):
+                            packed_per_layer[name] = corrected[0]
+                            residual_per_layer[name] = corrected[1]
+                            n_corrected += 1
+                        elif corrected is not None:
                             packed_per_layer[name] = corrected
                             n_corrected += 1
                     LOGGER.info(
@@ -3025,7 +3342,28 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
                     )
                     # M-step: re-estimate centroids from corrected assignments.
                     # Skip on the final iteration - the last E-step IS the output.
-                    if vptq_iter < self.gptq_correction_iters - 1:
+                    if ldlq_stats is not None:
+                        LOGGER.info(
+                            "VPTQGroupEstimator: group '%s' LDLQ pass %d loss %.6e "
+                            "(%d layers)",
+                            group_key,
+                            vptq_iter + 1,
+                            ldlq_stats.loss,
+                            ldlq_stats.n_layers,
+                        )
+                    if (
+                        vptq_iter < self.gptq_correction_iters - 1
+                        and ldlq_stats is not None
+                    ):
+                        refit = ldlq_stats.solve(centroids)
+                        LOGGER.info(
+                            "VPTQGroupEstimator: group '%s' LDLQ M-step loss %.6e -> %.6e",
+                            group_key,
+                            ldlq_stats.loss_for(centroids),
+                            ldlq_stats.loss_for(refit),
+                        )
+                        centroids.copy_(refit)
+                    elif vptq_iter < self.gptq_correction_iters - 1:
                         self._refine_centroids(
                             members,
                             packed_per_layer,
@@ -3065,6 +3403,18 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
                     packed, bits, n_indices=n_vectors
                 ).to(dev)
 
+                res_kw: dict[str, Any] = {}
+                res_idx = residual_per_layer.get(name)
+                if res_idx is not None and res_idx.shape[1]:
+                    assert residual_book is not None
+                    res_kw = {
+                        "residual_centroids": residual_book.to(torch.float16),
+                        "residual_groups": int(res_idx.shape[1]),
+                        "residual_indices": IndexPacking.pack(
+                            res_idx.reshape(-1),
+                            IndexPacking.bits_for(residual_book.shape[0]),
+                        ),
+                    }
                 vq = VQScheme(
                     centroids=centroids,  # shared tensor reference
                     proxy_selector=self.proxy_selector,
@@ -3072,6 +3422,7 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
                     column_permutation=column_perm,
                     use_tiered=self.use_tiered,
                     zero_escape=self.zero_escape,
+                    **res_kw,
                 )
                 assignments[name] = QTensorTractVQ.from_packed(
                     indices_flat, vq, dequant_to_dtype=target_dtype
@@ -3089,6 +3440,120 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
             weight_assignments=_add_tied_aliases(assignments, self._tied_aliases),
             kept_float=_add_tied_aliases(kept_float, self._tied_aliases),
         )
+
+    def _estimate_frozen(self, registry: StatisticsRegistry) -> QuantizationPlan:
+        """One GPTQ-corrected assignment per layer against fixed codebooks.
+
+        The codebook of each group comes from :attr:`frozen_centroids_path`
+        (keyed by group key). With ``reconstruction="teacher"`` each weight is
+        first fitted toward the teacher output; the fit only feeds the
+        assignment and the module weight is restored afterwards.
+        """
+        from safetensors.torch import load_file
+
+        from .transforms.vq import QTensorTractVQ, VQScheme
+        from .transforms.vq_packing import IndexPacking
+
+        dev = self._device or torch.device("cpu")
+        books = load_file(self.frozen_centroids_path)
+        assignments: dict[str, Any] = {}
+        for group_key, members in self._make_groups().items():
+            if group_key not in books:
+                raise KeyError(
+                    f"No frozen codebook for group '{group_key}' in "
+                    f"{self.frozen_centroids_path}"
+                )
+            centroids = books[group_key].to(dev, torch.float16)
+            if centroids.shape[1] != self.vector_len:
+                raise ValueError(
+                    f"Frozen codebook '{group_key}' has vector length "
+                    f"{centroids.shape[1]}, expected {self.vector_len}"
+                )
+            bits = IndexPacking.bits_for(centroids.shape[0])
+            for name, mod in members:
+                perm = self._compute_column_perm(name, mod, registry)
+                if perm is not None:
+                    perm = perm.to(dev)
+                original = mod.weight.data
+                if self.reconstruction == "teacher":
+                    # float32 on purpose: rounding the fit back to bf16 would
+                    # erase corrections below that format's resolution.
+                    mod.weight.data = self._teacher_weight(name, mod, registry)
+                try:
+                    packed = self._gptq_corrected_assign(
+                        name, mod, centroids, registry, column_perm=perm
+                    )
+                finally:
+                    mod.weight.data = original
+                if packed is None:
+                    raise RuntimeError(
+                        f"GPTQ-corrected assignment failed for '{name}' "
+                        "(missing Hessian or CUDA budget)"
+                    )
+                indices = IndexPacking.unpack(
+                    packed, bits, n_indices=int(mod.weight.numel()) // self.vector_len
+                ).to(dev)
+                vq = VQScheme(
+                    centroids=centroids,
+                    proxy_selector=self.proxy_selector,
+                    original_shape=mod.weight.shape,
+                    column_permutation=perm,
+                )
+                assignments[name] = QTensorTractVQ.from_packed(
+                    indices, vq, dequant_to_dtype=mod.weight.dtype
+                )
+        kept_float = {
+            name: self._skip_reason(mod)
+            for name, mod in self._target_modules.items()
+            if name not in assignments
+        }
+        return QuantizationPlan(
+            weight_assignments=_add_tied_aliases(assignments, self._tied_aliases),
+            kept_float=_add_tied_aliases(kept_float, self._tied_aliases),
+        )
+
+    @property
+    def _reconstruction_stat(self) -> str:
+        """Statistic type of the teacher residual products."""
+        if self.reconstruction_protect_sink:
+            return "linear_reconstruction_sink"
+        return "linear_reconstruction"
+
+    def _teacher_weight(
+        self, name: str, mod: nn.Module, registry: StatisticsRegistry
+    ) -> torch.Tensor:
+        """Ridge fit of *mod*'s weight toward the teacher output (float32)."""
+        from .calibration.probe import reconstruction
+
+        w = mod.weight.data
+        K = int(w.shape[1])
+        h = self._get_full_hessian(name, K, registry)
+        stat = registry.get(
+            StatisticRequest(target_key=name, stat_type=self._reconstruction_stat)
+        )
+        if h is None or stat is None or stat["cross"] is None:
+            raise ValueError(f"Teacher reconstruction statistics missing for '{name}'")
+        fitted = reconstruction.reconstruct_linear_weight(
+            w, h, materialize(stat["cross"]), self.reconstruction_damp_percent
+        )
+        limit = self.reconstruction_max_output_ratio
+        if limit is None:
+            return fitted
+        hf = h.to(fitted.device, torch.float32)
+        delta = fitted - w.float()
+        moved = torch.einsum("ij,jk,ik->", delta, hf, delta)
+        own = torch.einsum("ij,jk,ik->", w.float(), hf, w.float())
+        ratio = float((moved / own.clamp_min(1e-30)).sqrt())
+        if ratio > limit:
+            LOGGER.warning(
+                "Teacher fit for '%s' moves the output by %.3f of the weight's "
+                "own output (limit %.3f); quantizing the plain weight",
+                name,
+                ratio,
+                limit,
+            )
+            return w
+        return fitted
 
     def _skip_reason(self, mod: nn.Module) -> str:
         """Explain why VPTQ left *mod* float, as precisely as its shape allows."""

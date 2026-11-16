@@ -40,26 +40,70 @@ def _paley_hadamard(q: int) -> torch.Tensor:
     return torch.eye(n, dtype=torch.float64) + s
 
 
+def _paley2_hadamard(q: int) -> torch.Tensor:
+    """Paley type-II Hadamard matrix of order ``2 (q + 1)``.
+
+    Valid when *q* is a prime with ``q % 4 == 1``: the Jacobsthal matrix is
+    then symmetric, ``C = [[0, 1], [1, Q]]`` is a symmetric conference matrix,
+    and ``C (x) [[1, 1], [1, -1]] + I (x) [[1, -1], [-1, -1]]`` is Hadamard.
+    """
+    n = q + 1
+    conference = torch.zeros(n, n, dtype=torch.float64)
+    conference[0, 1:] = 1.0
+    conference[1:, 0] = 1.0
+    conference[1:, 1:] = torch.tensor(
+        [[_legendre_symbol(i - j, q) for j in range(q)] for i in range(q)],
+        dtype=torch.float64,
+    )
+    a = torch.tensor([[1.0, 1.0], [1.0, -1.0]], dtype=torch.float64)
+    b = torch.tensor([[1.0, -1.0], [-1.0, -1.0]], dtype=torch.float64)
+    return torch.kron(conference, a) + torch.kron(torch.eye(n, dtype=torch.float64), b)
+
+
+# Non-power-of-two base orders, each times any power of two:
+# 12 (Gemma-4-E2B 1536, 6144; Qwen3.5 6144), 20, 28 (Llama-3 14336 = 28 x 512).
+_BASE_HADAMARD = {
+    12: lambda: _paley_hadamard(11),
+    20: lambda: _paley_hadamard(19),
+    28: lambda: _paley2_hadamard(13),
+}
+
+
+def _split_order(n: int) -> tuple[int, int] | None:
+    """Return ``(m, p)`` with ``n = m * p``, *p* a power of two and *m* 1 or a base order."""
+    if _is_power_of_two(n):
+        return 1, n
+    for m in _BASE_HADAMARD:
+        if n % m == 0 and _is_power_of_two(n // m):
+            return m, n // m
+    return None
+
+
+def _sylvester(n: int) -> torch.Tensor:
+    h = torch.ones(1, 1, dtype=torch.float64)
+    while h.shape[0] < n:
+        h = torch.cat([torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0)
+    return h
+
+
 def hadamard_matrix(n: int) -> torch.Tensor:
     """Return an ``n x n`` Hadamard matrix with ±1 entries (not normalized).
 
-    Supports powers of two (Sylvester doubling) and order 12 (Paley), which
-    together cover every dimension our target architectures need.
+    Supports ``m * 2^k`` for ``m`` in 1, 12, 20, 28: Sylvester doubling
+    Kronecker a Paley base, which covers every dimension our target
+    architectures need.
 
     Raises:
         ValueError: If no construction is available for *n*.
     """
-    if n == 12:
-        return _paley_hadamard(11)
-    if n >= 1 and (n & (n - 1)) == 0:
-        h = torch.ones(1, 1, dtype=torch.float64)
-        while h.shape[0] < n:
-            h = torch.cat([torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0)
-        return h
-    if n % 12 == 0 and (n // 12) >= 1 and ((n // 12) & (n // 12 - 1)) == 0:
-        # Kronecker order must match fast_hadamard_transform's factorization.
-        return torch.kron(_paley_hadamard(11), hadamard_matrix(n // 12))
-    raise ValueError(f"No Hadamard construction available for order {n}.")
+    split = _split_order(n)
+    if split is None:
+        raise ValueError(f"No Hadamard construction available for order {n}.")
+    m, p = split
+    if m == 1:
+        return _sylvester(p)
+    # Kronecker order must match fast_hadamard_transform's factorization.
+    return torch.kron(_BASE_HADAMARD[m](), _sylvester(p))
 
 
 def random_hadamard_matrix(n: int, seed: int) -> torch.Tensor:
@@ -120,11 +164,10 @@ def _fwht_power_of_two(x: torch.Tensor) -> torch.Tensor:
 def fast_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
     """Apply the orthonormal Hadamard transform along the last dimension.
 
-    Handles powers of two directly via the butterfly, and sizes of the form
-    ``12 * 2^k`` via the Kronecker factorization ``H_12 ⊗ H_2^k``.  That covers
-    every dimension our target architectures use: Gemma-4-E2B's hidden size
-    1536 = 12 x 128 and intermediate size 6144 = 12 x 512 are both non-powers
-    of two, while head_dim 256 is a plain power of two.
+    Handles powers of two directly via the butterfly, and sizes ``m * 2^k``
+    (m = 12, 20, 28) via the Kronecker factorization ``H_m ⊗ H_2^k``.  That
+    covers every dimension our target architectures use: Gemma-4-E2B's 1536 =
+    12 x 128 and 6144 = 12 x 512, Llama-3's MLP width 14336 = 28 x 512.
 
     Args:
         x: Tensor whose last dimension is a supported transform size.
@@ -136,20 +179,20 @@ def fast_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
         ValueError: If the last dimension has no available construction.
     """
     n = x.shape[-1]
-    if _is_power_of_two(n):
+    split = _split_order(n)
+    if split is None:
+        raise ValueError(
+            f"Unsupported Hadamard transform size {n}: expected m * 2^k "
+            f"with m in 1, {', '.join(map(str, _BASE_HADAMARD))}."
+        )
+    m, p = split
+    if m == 1:
         return _fwht_power_of_two(x)
-
-    if n % 12 == 0 and _is_power_of_two(n // 12):
-        m = n // 12
-        orig_shape = x.shape
-        y = _fwht_power_of_two(x.reshape(-1, 12, m))
-        h12 = hadamard_matrix(12).to(device=y.device, dtype=y.dtype) / 12**0.5
-        y = torch.einsum("ki,bij->bkj", h12, y)
-        return y.reshape(orig_shape)
-
-    raise ValueError(
-        f"Unsupported Hadamard transform size {n}: expected a power of two or 12 * 2^k."
-    )
+    orig_shape = x.shape
+    y = _fwht_power_of_two(x.reshape(-1, m, p))
+    hm = hadamard_matrix(m).to(device=y.device, dtype=y.dtype) / m**0.5
+    y = torch.einsum("ki,bij->bkj", hm, y)
+    return y.reshape(orig_shape)
 
 
 def rotate_attention_vo(

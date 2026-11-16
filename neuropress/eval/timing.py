@@ -102,6 +102,7 @@ class RunConfig(BaseModel):
     num_fewshot: int | None = None
     batch_size: int | str | None = None
     skip_baseline: bool = False
+    deterministic: bool = False
     quantization_config: dict[str, Any] | None = None
     neuropress: RunMeta
 

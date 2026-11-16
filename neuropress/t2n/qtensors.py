@@ -433,11 +433,13 @@ class _QTensorTractVQSerde(QTensorSerde):
     u8_blob              uint8            Packed VQ codebook indices
     centroids            float16          Codebook table ``[num_centroids, vector_len]``
     column_permutation   int64            Optional; present only when permutation set
+    residual_centroids   float16          Optional residual codebook ``[NC_r, vector_len]``
+    residual_u8          uint8            Optional packed residual indices
     ===================  ===============  =============================================
 
     Metadata keys: ``proxy_selector``, ``original_shape``, ``bits_per_index``,
     ``dequant_to_dtype``, ``proxy_content_hash``, ``has_column_perm``,
-    ``use_tiered``.
+    ``use_tiered``, ``residual_groups`` (``"0"`` or absent without a residual).
 
     Reconstruction strategy: indices are stored verbatim in ``u8_blob``;
     centroids are stored as-is.  On load, ``VQScheme`` is reconstructed
@@ -462,6 +464,11 @@ class _QTensorTractVQSerde(QTensorSerde):
         }
         if q.qscheme.column_permutation is not None:
             tensors["column_permutation"] = q.qscheme.column_permutation.cpu()
+        if q.qscheme.residual_centroids is not None:
+            tensors["residual_centroids"] = (
+                q.qscheme.residual_centroids.to(torch.float16).cpu().clone()
+            )
+            tensors["residual_u8"] = q.qscheme.residual_indices.cpu()
         return tensors
 
     def to_metadata(self, q: Any) -> dict[str, str]:
@@ -478,6 +485,7 @@ class _QTensorTractVQSerde(QTensorSerde):
             "has_column_perm": "1" if q.qscheme.column_permutation is not None else "0",
             "use_tiered": "1" if q.qscheme.use_tiered else "0",
             "zero_escape": "1" if q.qscheme.zero_escape else "0",
+            "residual_groups": str(q.qscheme.residual_groups),
         }
 
     def from_parts(
@@ -524,6 +532,7 @@ class _QTensorTractVQSerde(QTensorSerde):
         )
         use_tiered = metadata.get("use_tiered", "0") == "1"
         zero_escape = metadata.get("zero_escape", "0") == "1"
+        residual_groups = int(metadata.get("residual_groups", "0"))
 
         qscheme = VQScheme(
             centroids=centroids,
@@ -532,6 +541,11 @@ class _QTensorTractVQSerde(QTensorSerde):
             column_permutation=column_permutation,
             use_tiered=use_tiered,
             zero_escape=zero_escape,
+            residual_centroids=(
+                tensors["residual_centroids"] if residual_groups else None
+            ),
+            residual_groups=residual_groups,
+            residual_indices=tensors["residual_u8"] if residual_groups else None,
         )
         # Construct QTensorTractVQ directly from the stored u8_blob without
         # dequantizing and re-quantizing. The dequantize → re-quantize round

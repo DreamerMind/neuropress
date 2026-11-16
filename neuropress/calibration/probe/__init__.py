@@ -12,7 +12,10 @@ from .collectors import (
 from .hessian import HessianAccumulator
 from .hessian_diag import HessianDiagAccumulator
 from .min_max import MinMaxCollector
-from .reconstruction import LinearReconstructionCollector
+from .reconstruction import (
+    LinearReconstructionCollector,
+    SinkProtectedReconstructionCollector,
+)
 from .registry import StatisticsRegistry
 
 COLLECTOR_REGISTRY.update(
@@ -21,6 +24,7 @@ COLLECTOR_REGISTRY.update(
         "channel_max": ChannelMaxCollector,
         "hessian": HessianAccumulator,
         "linear_reconstruction": LinearReconstructionCollector,
+        "linear_reconstruction_sink": SinkProtectedReconstructionCollector,
         "hessian_diag": HessianDiagAccumulator,
     }
 )
@@ -35,6 +39,7 @@ __all__ = [
     "LinearReconstructionCollector",
     "MinMaxCollector",
     "PairedCollector",
+    "SinkProtectedReconstructionCollector",
     "StatField",
     "StatisticRequest",
     "StatisticsRegistry",

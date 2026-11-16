@@ -5,6 +5,7 @@ from .llm import (
     load_c4_calibration,
     load_eval_targeted_calibration,
     load_fineweb_calibration,
+    load_token_file_calibration,
 )
 from .registry import DATASET_REGISTRY
 
@@ -23,4 +24,5 @@ __all__ = [
     "load_eval_targeted_calibration",
     "load_fineweb_calibration",
     "load_librispeech_calibration",
+    "load_token_file_calibration",
 ]

@@ -146,6 +146,13 @@ class VQScheme(QScheme):
             matrix are reordered by this permutation before vectorization
             (high-importance features first).  :meth:`dequantize` applies the
             inverse permutation automatically.  ``None`` means no reordering.
+        residual_centroids: Optional second-stage codebook ``[NC_r, vector_len]``
+            (see :mod:`~neuropress.methods.residual_vq`).  The first
+            :attr:`residual_groups` column groups of every row (in permuted
+            order) decode as ``centroids[i] + residual_centroids[j]``.
+        residual_groups: Number of leading column groups with a residual index.
+        residual_indices: Packed residual indices, ``rows * residual_groups``
+            of them, row-major, at ``bits_for(NC_r)`` bits each.
     """
 
     def __init__(
@@ -158,6 +165,9 @@ class VQScheme(QScheme):
         hot_bits: int | None = None,
         tier_bits: list[int] | None = None,
         zero_escape: bool = False,
+        residual_centroids: torch.Tensor | None = None,
+        residual_groups: int = 0,
+        residual_indices: torch.Tensor | None = None,
     ) -> None:
         """Initialise a VQScheme.
 
@@ -196,6 +206,11 @@ class VQScheme(QScheme):
                 Requires frequency-sorted centroids and at least 257
                 centroids for full benefit (tier-2 covers centroids
                 17–256).
+            residual_centroids: Optional residual codebook ``[NC_r, vector_len]``.
+            residual_groups: Leading column groups (permuted order) that
+                carry a residual index.
+            residual_indices: Packed residual indices, row-major
+                ``[rows, residual_groups]``.
 
         Raises:
             ValueError: If ``centroids`` is not 2-D, has fewer than 2
@@ -247,6 +262,36 @@ class VQScheme(QScheme):
         self.zero_escape: bool = zero_escape
         self.original_shape = original_shape
         self.column_permutation = column_permutation
+        has_res = residual_centroids is not None
+        if has_res != (residual_indices is not None) or has_res != (
+            residual_groups > 0
+        ):
+            raise ValueError(
+                "residual_centroids, residual_indices and residual_groups > 0 "
+                "go together."
+            )
+        if has_res:
+            assert residual_centroids is not None
+            if residual_centroids.ndim != 2 or (
+                residual_centroids.shape[1] != centroids.shape[1]
+            ):
+                raise ValueError(
+                    "residual_centroids must be [NC_r, vector_len], got "
+                    f"{list(residual_centroids.shape)}."
+                )
+            if use_tiered or tier_bits is not None or zero_escape:
+                raise ValueError("Residual VQ supports plain index packing only.")
+            if original_shape is None or len(original_shape) != 2:
+                raise ValueError("Residual VQ needs a 2-D original_shape.")
+            n_groups = original_shape[-1] // centroids.shape[1]
+            if residual_groups > n_groups:
+                raise ValueError(
+                    f"residual_groups={residual_groups} exceeds the {n_groups} "
+                    "column groups of the weight."
+                )
+        self.residual_centroids = residual_centroids
+        self.residual_groups = residual_groups
+        self.residual_indices = residual_indices
 
     # ------------------------------------------------------------------
     # Cached properties
@@ -265,6 +310,18 @@ class VQScheme(QScheme):
     # ------------------------------------------------------------------
     # QScheme interface
     # ------------------------------------------------------------------
+
+    @property
+    def has_residual(self) -> bool:
+        """Whether a residual stage covers the leading column groups."""
+        return self.residual_centroids is not None
+
+    @property
+    def residual_bits(self) -> int:
+        """Bits per residual index (0 without a residual stage)."""
+        if self.residual_centroids is None:
+            return 0
+        return IndexPacking.bits_for(self.residual_centroids.shape[0])
 
     def quantize_as_torch(self, fp_tensor: torch.Tensor) -> torch.Tensor:
         """Raise — native torch does not support VQ at a tensor level.
@@ -298,6 +355,11 @@ class VQScheme(QScheme):
             ValueError: If ``fp_tensor.numel()`` is not divisible by
                 :attr:`vector_len`.
         """
+        if self.has_residual:
+            raise T2NErrorNotImplemented(
+                "Residual VQ indices come from the estimator's two-stage "
+                "assignment; build the tensor with QTensorTractVQ.from_packed."
+            )
         n = fp_tensor.numel()
         if n % self.vector_len != 0:
             raise ValueError(
@@ -403,6 +465,22 @@ class VQScheme(QScheme):
             )
         centroids = self.centroids.to(packed_indices.device)
         vectors = centroids[indices]  # [n_vectors, vector_len]
+        if self.residual_centroids is not None:
+            assert self.residual_indices is not None
+            vl = self.vector_len
+            n_groups = self.original_shape[-1] // vl
+            rows = n_vectors // n_groups
+            res_idx = IndexPacking.unpack(
+                self.residual_indices.to(packed_indices.device),
+                self.residual_bits,
+                n_indices=rows * self.residual_groups,
+            )
+            rc = self.residual_centroids.to(packed_indices.device).float()
+            vectors = vectors.float().reshape(rows, n_groups, vl)
+            vectors[:, : self.residual_groups] += rc[res_idx].reshape(
+                rows, self.residual_groups, vl
+            )
+            vectors = vectors.reshape(-1, vl)
         result = vectors.to(target_dtype).flatten().reshape(self.original_shape)
         # Invert column permutation: the stored indices encode the permuted
         # weight; we must restore the original column order.
@@ -416,6 +494,11 @@ class VQScheme(QScheme):
     def __repr__(self) -> str:
         """Return a concise string representation."""
         perm_str = ", perm=True" if self.column_permutation is not None else ""
+        if self.residual_centroids is not None:
+            perm_str += (
+                f", residual=[{self.residual_centroids.shape[0]}] x "
+                f"{self.residual_groups} groups"
+            )
         if self.zero_escape:
             tiered_str = ", zero_escape=True"
         elif self.tier_bits is not None:
