@@ -66,6 +66,7 @@ from .recipe_config import (
 )
 from .t2n import _qtensor_patch as _qtensor_patch  # patches QTensor device handling
 from .targets import ActivationTarget, WeightTarget
+from .trellis_estimator import TrellisEstimator, TrellisEstimatorConfig
 
 __all__ = [
     "ADAPTER_CONFIG_REGISTRY",
@@ -122,6 +123,8 @@ __all__ = [
     "StatisticRequest",
     "StatisticsRegistry",
     "TensorSlice",
+    "TrellisEstimator",
+    "TrellisEstimatorConfig",
     "WeightAssignmentAdapter",
     "WeightAssignmentAdapterConfig",
     "WeightTarget",
