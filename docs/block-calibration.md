@@ -193,3 +193,72 @@ joint optimization across dependent targets should use the default whole-block
 mode. An `inference_model` callback can materialize packed weights for subsequent
 GPU collection without changing the stored model. Stage settings are part of the
 checkpoint fingerprint, and resumed results retain their schedule.
+
+## Explicit stages and plan refiners
+
+`stages` replaces the traced schedule with explicit groups of block-relative
+paths, run in order, without a trace or a dependency check. Use it when a method
+wants stages other than the dependency barriers, for example GPTQ Hessians for
+all attention projections from one capture:
+
+```python
+stages = (
+    ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj"),
+    ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"),
+)
+```
+
+A `refiner` (any object with the `BlockRefiner.refine` method) is called for
+each stage after the estimator and before the adapter. It receives the block
+(stage targets still float, earlier stages adapted), the stage's plan, the
+student input batches, a callable returning the frozen float block, and the
+forward device, and edits the plan in place. The adapter then applies the
+edited plan as usual, so the storage format does not change. A refiner needs
+`input_source="sequential"`; its `repr` is part of the checkpoint fingerprint.
+`QuantizationPipeline.run(refine_plan=...)` is the same hook for one pipeline
+run.
+
+### GSQ
+
+`GSQRefiner` implements GSQ (Dadgarnia et al., "GSQ: Highly-Accurate
+Low-Precision Scalar Quantization for LLMs via Gumbel-Softmax Sampling",
+arXiv:2604.18556). Starting from the planned codes and scales of a symmetric
+scalar scheme (GPTQ, for example), it gives every weight a few logits over
+candidate grid levels (all levels up to 4 of them, otherwise shifts of
+`-2..2` around the starting level). It then optimizes the logits and the group
+scales jointly through a Gumbel-Softmax relaxation, so that a group of weights
+reproduces the float block's output, or the output of one of its submodules,
+on the student stream. The final levels are the argmax of the logits. The
+optimizer is Lion; the temperature, logit scale and learning rates follow the
+paper's defaults (`GSQConfig`).
+
+The paper's schedule for a Llama-style decoder layer, with the `stages` above:
+
+```python
+from neuropress import BlockQuantizationPipeline, GSQConfig, GSQGroup, GSQRefiner
+
+refiner = GSQRefiner(
+    groups=(
+        GSQGroup(("self_attn.v_proj", "self_attn.o_proj"), objective="self_attn"),
+        GSQGroup(("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")),
+    ),
+    config=GSQConfig(epochs=10),
+)
+runner = BlockQuantizationPipeline(
+    config,  # a GPTQ recipe, symmetric
+    input_source="sequential",
+    forward_device="cuda",
+    estimation_device="cuda",
+    stages=stages,
+    refiner=refiner,
+)
+```
+
+`q_proj` and `k_proj` keep their GPTQ codes and are used quantized while `v` and
+`o` are fitted to the attention output; the MLP is then fitted to the block
+output with the quantized attention in place. A group whose fitted codes do not
+lower its objective on the calibration batches keeps its starting codes
+(`keep_better=True`); `refiner.history` records the loss before and after each
+fit. Each optimizer step draws one relaxed sample and runs `GSQConfig.batch_size`
+calibration batches with it. On CUDA the relaxation and the optimizer update are
+compiled into fused kernels, since they read every logit several times per step.
