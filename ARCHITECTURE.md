@@ -80,6 +80,14 @@ Flow: `StatisticsRegistry.register_method(method, target_key)` scans `Annotated`
 
 `BlockQuantizationPipeline` drives `QuantizationPipeline` per block instead of per model, so only one block's activations and statistics are live. It keeps two streams: the float reference (original block on float inputs) and the student (adapted block on adapted inputs), passed between blocks as plain CPU tensor trees (`calibration/batches.py`). With `target_paths`, `QuantizationSchedule.trace` ranks targets by observed tensor dependencies, and each stage runs a fresh recipe restricted to that stage, so later stages collect through already adapted weights. The first stage pairs against the still-float block; a frozen float copy is made only when a later stage requests paired statistics. Teacher reconstruction (`GPTQEstimator(reconstruction="teacher")`) fits a ridge correction toward the teacher output before GPTQ and falls back to plain GPTQ if the fit fails. Usage and the trace contract are in `docs/block-calibration.md`.
 
+### GSQ refinement (`methods/gsq.py`, `gsq_refiner.py`)
+
+GSQ (arXiv:2604.18556) refines the codes and scales of a planned symmetric scalar scheme by gradient descent through a Gumbel-Softmax relaxation of the level choice, keeping the format:
+
+- `methods/gsq.py`: `GumbelCodes` (logits over all grid levels up to `full_levels`, else shifts around the starting level; Gaussian prior on the starting level), the `_Relax` autograd function (fused into one kernel each way on CUDA via `torch.compile`), `Lion`, and `fit_gumbel_codes(codes, loss, n_items, config)`, which takes any `loss(weights, i)`.
+- `gsq_refiner.py`: `GSQRefiner`, a `BlockRefiner` that fits `GSQGroup`s of planned weights to the float block's output (or a submodule's, via a forward hook that stops the forward there) and writes the codes and scales back into the plan.
+- Hooks: `QuantizationPipeline.run(refine_plan=...)` runs between estimation and adaptation; `BlockQuantizationPipeline(stages=..., refiner=...)` gives explicit stages and calls the refiner per stage with the block, the plan, the student batches and the frozen float block.
+
 ### Pipeline wiring: `_cache` and `_spans`
 
 `QuantizationParamEstimator` declares `_cache: CacheManager` and `_spans: SpanCollector` as class attributes with no-op defaults. The pipeline calls `set_cache()` and `set_span_collector()` before `prepare()`. Subclasses use `self._cache` / `self._spans` directly — no `getattr` fallback needed.

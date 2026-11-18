@@ -9,8 +9,9 @@ import json
 import weakref
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 import torch
 from torch import nn
@@ -101,6 +102,32 @@ class BlockCalibrationResult:
     schedule: QuantizationSchedule | None = None
 
 
+class BlockRefiner(Protocol):
+    """Changes a stage's plan before it is applied, knowing the whole block.
+
+    Called once per stage, after the estimator and before the adapter, with
+    the block (stage targets still float, earlier stages adapted), the stage's
+    plan, the student-stream input batches on the host, a callable returning
+    the frozen float block on the forward device, and the forward device. It
+    edits the plan in place. :class:`~neuropress.gsq_refiner.GSQRefiner` is one.
+    The refiner's ``repr`` enters checkpoint fingerprints, so it must describe
+    every setting that changes the result.
+    """
+
+    def refine(
+        self,
+        block: nn.Module,
+        plan: QuantizationPlan,
+        batches: list[Any],
+        teacher: Callable[[], nn.Module],
+        *,
+        device: torch.device,
+        name: str = "",
+    ) -> None:
+        """Edit the stage's *plan* in place."""
+        ...
+
+
 class BlockQuantizationPipeline:
     """Execute recipes one float block at a time, with optional teacher observations.
 
@@ -117,6 +144,12 @@ class BlockQuantizationPipeline:
     ``target_paths`` enables dependency stages within each block: collect and
     adapt independent targets together, then recollect for dependent targets.
     The trace requires a functional eval forward; teacher weights stay frozen.
+    ``stages`` gives the stages explicitly instead (block-relative module
+    paths, in order), with no trace and no dependency check.
+
+    ``refiner`` (a :class:`BlockRefiner`) may rewrite each stage's plan before
+    it is applied, for example to fit the codes to the float block's output.
+    It needs ``input_source='sequential'``.
     """
 
     def __init__(
@@ -130,6 +163,8 @@ class BlockQuantizationPipeline:
         run_id: str | None = None,
         inference_model: Callable[[nn.Module], nn.Module] | None = None,
         target_paths: tuple[str, ...] | None = None,
+        stages: tuple[tuple[str, ...], ...] | None = None,
+        refiner: BlockRefiner | None = None,
     ) -> None:
         if input_source not in {"float", "sequential"}:
             raise ValueError("input_source must be float or sequential")
@@ -145,6 +180,20 @@ class BlockQuantizationPipeline:
             )
         if target_paths is not None and input_source != "sequential":
             raise ValueError("Dependency stages require input_source=sequential")
+        if stages is not None:
+            if target_paths is not None:
+                raise ValueError("Give either target_paths or stages")
+            if input_source != "sequential":
+                raise ValueError("Explicit stages require input_source=sequential")
+            flat = [path for stage in stages for path in stage]
+            if not stages or not all(stages) or len(set(flat)) != len(flat):
+                raise ValueError("Stages must be nonempty with distinct module paths")
+        if refiner is not None and input_source != "sequential":
+            raise ValueError("A refiner requires input_source=sequential")
+        self.stages = (
+            tuple(tuple(stage) for stage in stages) if stages is not None else None
+        )
+        self.refiner = refiner
         self.target_paths = tuple(target_paths) if target_paths is not None else None
         self.config = config
         self.input_source = input_source
@@ -186,6 +235,8 @@ class BlockQuantizationPipeline:
                     if self.target_paths is not None
                     else {}
                 ),
+                **({"stages": self.stages} if self.stages is not None else {}),
+                **({"refiner": repr(self.refiner)} if self.refiner is not None else {}),
                 "run_id": self.run_id,
                 "name": name,
                 "recipe": self.config.model_dump_json(),
@@ -304,7 +355,10 @@ class BlockQuantizationPipeline:
             # Without target_paths the whole block is one stage that selects
             # every estimator target, exactly like a whole-model pipeline run.
             stages: tuple[tuple[str, ...] | None, ...] = (None,)
-            if self.target_paths is not None:
+            if self.stages is not None:
+                schedule = QuantizationSchedule(self.stages)
+                stages = schedule.stages
+            elif self.target_paths is not None:
                 # Batches are compared on the host and only the traced ones
                 # cross to the forward device.
                 schedule = QuantizationSchedule.trace(
@@ -316,7 +370,8 @@ class BlockQuantizationPipeline:
             # and need a frozen copy, taken now (before stage one adapts
             # anything) but only if one of them will pair; it is copied in host
             # memory and reaches the forward device only for stages that pair.
-            if self._later_stages_pair(model, stages):
+            # A refiner compares with the float block at every stage.
+            if self.refiner is not None or self._later_stages_pair(model, stages):
                 model.cpu()
                 teacher = copy.deepcopy(model)
             for index, stage in enumerate(stages):
@@ -336,6 +391,18 @@ class BlockQuantizationPipeline:
                     estimation_device=self.estimation_device,
                     collection_model=observed,
                     target_paths=set(stage) if stage is not None else None,
+                    refine_plan=(
+                        partial(
+                            self.refiner.refine,
+                            model,
+                            batches=source,
+                            teacher=place_teacher,
+                            device=self.forward_device,
+                            name=name,
+                        )
+                        if self.refiner is not None
+                        else None
+                    ),
                 )
                 plan.kept_float.update(pipeline.last_plan.kept_float)
                 # A separate inference view is rebuilt for the next stage, so
