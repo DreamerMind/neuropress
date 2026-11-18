@@ -5,6 +5,7 @@ from .collectors import (
     COLLECTOR_REGISTRY,
     CalibrationProbe,
     Collector,
+    InvocationCollector,
     PairedCollector,
     StatField,
     StatisticRequest,
@@ -12,6 +13,7 @@ from .collectors import (
 from .hessian import HessianAccumulator
 from .hessian_diag import HessianDiagAccumulator
 from .min_max import MinMaxCollector
+from .moe_experts import MoEExpertHessianCollector
 from .reconstruction import (
     LinearReconstructionCollector,
     SinkProtectedReconstructionCollector,
@@ -26,6 +28,7 @@ COLLECTOR_REGISTRY.update(
         "linear_reconstruction": LinearReconstructionCollector,
         "linear_reconstruction_sink": SinkProtectedReconstructionCollector,
         "hessian_diag": HessianDiagAccumulator,
+        "moe_expert_hessian": MoEExpertHessianCollector,
     }
 )
 
@@ -36,8 +39,10 @@ __all__ = [
     "Collector",
     "HessianAccumulator",
     "HessianDiagAccumulator",
+    "InvocationCollector",
     "LinearReconstructionCollector",
     "MinMaxCollector",
+    "MoEExpertHessianCollector",
     "PairedCollector",
     "SinkProtectedReconstructionCollector",
     "StatField",
