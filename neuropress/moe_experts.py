@@ -20,7 +20,10 @@ what neuropress hands it:
    the parent MoE block with the torch_to_nnef markers:
    ``_t2n_quantize_moe_experts_q40``, ``_t2n_moe_expert_layout = "linear"``
    and a quantizer (:func:`expert_q40_from_gptq_codes`) that returns the
-   GPTQ codes instead of recalibrating with min-max.
+   GPTQ codes instead of recalibrating with min-max. Only the f16 block scales
+   are kept; the codes are read back from the float parameters, which hold
+   exactly what they decode to. Checkpoints written by
+   :func:`.save_quantized_model` keep the scales and restore the markers.
 
 The layout is not a free choice. GPTQ groups run along each expert's input
 dimension, and a Q4_0 block covers 32 consecutive values of the stored
@@ -37,7 +40,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import ClassVar, Literal
+from typing import Any, ClassVar, Literal
 
 import torch
 from torch import nn
@@ -124,23 +127,43 @@ def _gptq_expert(
     return calib.quantized_codes, scheme.scale.reshape(rows, cols // group_size)
 
 
+def _q40_qtensor(
+    codes: torch.Tensor, block_scales: torch.Tensor, dtype: torch.dtype, name: str
+) -> torch.Tensor:
+    """Pack ``[..., C]`` codes and their f16 block scales as Q4_0 storage.
+
+    The single builder of expert Q4_0 tensors, for the plan and for export.
+    """
+    from torch_to_nnef.tensor.quant.base import QScalePerGroupF16
+    from torch_to_nnef.tensor.quant.qtract import QTensorTractScaleOnly
+
+    from .t2n.packing import BitPacking4
+    from .t2n.qtensors import qtensor_from_blob
+    from .transforms.weight_only import _pack_keeping_shape
+
+    return qtensor_from_blob(
+        QTensorTractScaleOnly,
+        _pack_keeping_shape(BitPacking4, codes.cpu()),
+        codes.shape,
+        QScalePerGroupF16(Q40_BLOCK, block_scales.reshape(-1, 1).half().cpu(), 4),
+        dtype,
+        [BitPacking4],
+        name,
+    )
+
+
 def _q40_tensor(
     codes: torch.Tensor,
     group_scales: torch.Tensor,
     dtype: torch.dtype,
     name: str,
 ) -> torch.Tensor:
-    """Wrap ``[E, R, C]`` codes and ``[E, R, C // g]`` scales as Q4_0 storage."""
-    from torch_to_nnef.tensor.quant.base import QScalePerGroupF16
-    from torch_to_nnef.tensor.quant.qtract import QTensorTractScaleOnly
+    """Wrap ``[E, R, C]`` codes and ``[E, R, C // g]`` scales as Q4_0 storage.
 
-    from .t2n.packing import BitPacking4
-    from .t2n.qtensors import qtensor_from_blob
-    from .transforms.weight_only import (
-        _f16_block_scales,
-        _pack_keeping_shape,
-        _store_blocks_as_zero,
-    )
+    Scales are rounded to f16 the way the ``nn.Linear`` Q4_0 export rounds
+    them, and blocks whose scale falls below the f16 range are stored as zeros.
+    """
+    from .transforms.weight_only import _f16_block_scales, _store_blocks_as_zero
 
     blocks_per_group = codes.shape[-1] // group_scales.shape[-1] // Q40_BLOCK
     scales, underflow = _f16_block_scales(
@@ -152,15 +175,7 @@ def _q40_tensor(
         torch.full_like(underflow.cpu(), 8, dtype=torch.uint8),
         Q40_BLOCK,
     )
-    return qtensor_from_blob(
-        QTensorTractScaleOnly,
-        _pack_keeping_shape(BitPacking4, codes),
-        codes.shape,
-        QScalePerGroupF16(Q40_BLOCK, scales.cpu(), 4),
-        dtype,
-        [BitPacking4],
-        name,
-    )
+    return _q40_qtensor(codes, scales, dtype, name)
 
 
 @dataclass
@@ -232,7 +247,10 @@ class GPTQMoEExpertsEstimator(QuantizationParamEstimator):
         for name, mod in self._targets.items():
             stat = registry.get(StatisticRequest(target_key=name, stat_type=STAT_TYPE))
             if stat is None or stat["nsamples"] is None:
-                plan.kept_float[name] = "no calibration call reached these experts"
+                for param_name in ("gate_up_proj", "down_proj"):
+                    plan.kept_float[f"{name}/{param_name}"] = (
+                        "no calibration call reached these experts"
+                    )
                 continue
             counts = stat["nsamples"].tolist()
             dead = sum(1 for c in counts if c == 0)
@@ -276,91 +294,96 @@ class GPTQMoEExpertsEstimator(QuantizationParamEstimator):
 
 
 @dataclass(frozen=True)
-class _ExpertCodes:
-    """Q4_0 codes ``[E, R, C]`` and f16 block scales ``[E, R, C // 32]``."""
+class _ExpertScales:
+    """f16 Q4_0 block scales ``[E, R, C // 32]`` of one expert weight.
+
+    The codes are not kept: the float parameters hold exactly what they decode
+    to, so :meth:`codes_for` reads them back from the extracted tensor.
+    """
 
     name: str
-    codes: torch.Tensor
     scales: torch.Tensor
 
-    def dequantize(self) -> torch.Tensor:
-        """Return the float32 values tract decodes from these codes."""
-        values = (self.codes.float() - 8.0).unflatten(-1, (-1, Q40_BLOCK))
-        return (values * self.scales.float().unsqueeze(-1)).flatten(-2)
+    def codes_for(self, tensor: torch.Tensor) -> torch.Tensor | None:
+        """Codes ``[E, R, C]`` that decode to *tensor*, or None if none do.
+
+        A weight must sit within a tenth of a quantization step of a grid
+        point (neighboring codes are a whole step apart), which tolerates a
+        cast of the float parameters to f16 or bf16.
+        """
+        shape = (*self.scales.shape[:-1], self.scales.shape[-1] * Q40_BLOCK)
+        if tuple(tensor.shape) != shape:
+            return None
+        values = tensor.detach().float().cpu()
+        step = self.scales.float().repeat_interleave(Q40_BLOCK, dim=-1)
+        levels = (values / step).round()
+        if levels.min() < -8 or levels.max() > 7:
+            return None
+        if not torch.all((values - levels * step).abs() <= _MATCH_STEPS * step):
+            return None
+        return (levels + 8).to(torch.uint8)
 
 
-def _expert_codes(qtensor: torch.Tensor, name: str) -> _ExpertCodes:
+def _decode(qtensor: torch.Tensor, name: str) -> tuple[torch.Tensor, _ExpertScales]:
+    """Float32 values of a planned expert Q4_0 tensor, and its block scales."""
     codes = qtensor.decompress_to_u8()
-    scales = qtensor.qscheme.scale.reshape(*codes.shape[:-1], -1)
-    return _ExpertCodes(name, codes, scales)
+    scales = qtensor.qscheme.scale.reshape(*codes.shape[:-1], -1).half()
+    values = (codes.float() - 8.0).unflatten(-1, (-1, Q40_BLOCK))
+    values = (values * scales.float().unsqueeze(-1)).flatten(-2)
+    return values, _ExpertScales(name, scales)
 
 
-def _layout_candidates(gate_up: _ExpertCodes, down: _ExpertCodes) -> list[_ExpertCodes]:
-    """Return the tensors torch_to_nnef extracts in the linear layout.
+def _layout_candidates(
+    gate_up: _ExpertScales, down: _ExpertScales
+) -> list[_ExpertScales]:
+    """Return the scales of the tensors torch_to_nnef extracts in the linear layout.
 
     ``w1`` (gate) and ``w3`` (up) are the two row halves of ``gate_up_proj``.
     Rows are quantized independently, so slicing them keeps every block.
     """
-    inter = gate_up.codes.shape[1] // 2
+    inter = gate_up.scales.shape[1] // 2
     halves = [
-        _ExpertCodes(
-            f"{gate_up.name}[w{i}]", gate_up.codes[:, rows], gate_up.scales[:, rows]
-        )
+        _ExpertScales(f"{gate_up.name}[w{i}]", gate_up.scales[:, rows].contiguous())
         for i, rows in ((1, slice(0, inter)), (3, slice(inter, None)))
     ]
-    return [*halves, _ExpertCodes(f"{down.name}[w2]", down.codes, down.scales)]
+    return [*halves, _ExpertScales(f"{down.name}[w2]", down.scales)]
 
 
 def expert_q40_from_gptq_codes(
-    tensor: torch.Tensor, *, sources: list[_ExpertCodes]
+    tensor: torch.Tensor, *, sources: list[_ExpertScales]
 ) -> torch.Tensor:
     """torch_to_nnef MoE expert quantizer returning precomputed GPTQ codes.
 
     torch_to_nnef calls it with each expert weight ``w1``/``w2``/``w3`` after
     applying the module's expert layout. The weight is matched to the source
-    whose decoded values it holds, within a tenth of a quantization step
-    (neighboring codes are a whole step apart), which tolerates a later cast
-    of the float parameters to f16 or bf16. Returns a
-    ``QTensorTractScaleOnly`` holding those exact codes and scales.
+    whose grid it lies on (:meth:`_ExpertScales.codes_for`), and a
+    ``QTensorTractScaleOnly`` holding those exact codes and scales is returned.
 
     Raises:
         ValueError: If no GPTQ source decodes to *tensor*, for instance in
             the canonical layout or after the weights changed.
     """
-    from torch_to_nnef.tensor.quant.base import QScalePerGroupF16
-    from torch_to_nnef.tensor.quant.qtract import QTensorTractScaleOnly
-
-    from .t2n.packing import BitPacking4
-    from .t2n.qtensors import qtensor_from_blob
-
-    values = tensor.detach().float().cpu()
     for source in sources:
-        if tuple(source.codes.shape) != tuple(values.shape):
-            continue
-        step = source.scales.float().repeat_interleave(Q40_BLOCK, dim=-1)
-        if torch.all((values - source.dequantize()).abs() <= _MATCH_STEPS * step):
-            return qtensor_from_blob(
-                QTensorTractScaleOnly,
-                BitPacking4.compress(source.codes),
-                source.codes.shape,
-                QScalePerGroupF16(Q40_BLOCK, source.scales.reshape(-1, 1).half(), 4),
-                tensor.dtype,
-                [BitPacking4],
-                source.name,
-            )
+        codes = source.codes_for(tensor)
+        if codes is not None:
+            return _q40_qtensor(codes, source.scales, tensor.dtype, source.name)
     raise ValueError(
-        f"no GPTQ expert codes decode to the {tuple(values.shape)} tensor "
+        f"no GPTQ expert codes decode to the {tuple(tensor.shape)} tensor "
         f"torch_to_nnef extracted; GPTQ Q4_0 experts need expert layout "
         f"{EXPERT_LAYOUT!r} and unchanged expert weights"
     )
 
 
-def _mark_for_t2n(parent: nn.Module, sources: list[_ExpertCodes]) -> bool:
+def _mark_for_t2n(parent: nn.Module, sources: list[_ExpertScales]) -> bool:
     """Set the torch_to_nnef MoE markers on *parent*; False if it has no extractor."""
     from torch_to_nnef.exceptions import T2NErrorNotImplemented
     from torch_to_nnef.op.custom_extractors import mark_moe_experts_for_q40
+    from torch_to_nnef.op.custom_extractors.moe import _get_adapter
 
     try:
+        # restricting the marking to the parent's own class always matches it, so ask
+        # the extractor itself whether it dispatches on that class
+        _get_adapter(parent)
         mark_moe_experts_for_q40(
             parent,
             quantize_q40=True,
@@ -374,19 +397,57 @@ def _mark_for_t2n(parent: nn.Module, sources: list[_ExpertCodes]) -> bool:
     return True
 
 
+SCALES_ATTR = "_neuropress_q40_block_scales"
+"""Experts-module attribute: ``{"gate_up_proj", "down_proj"}`` f16 block scales."""
+
+MANIFEST_TRANSFORM = "moe_experts_q40"
+"""Manifest transform type recording the experts that carry GPTQ Q4_0 scales."""
+
+
+def _mark_experts(model: nn.Module, path: str, scales: dict[str, torch.Tensor]) -> bool:
+    """Keep *scales* on the experts at *path* and mark their parent for export.
+
+    Returns False, keeping no marker, when torch_to_nnef has no MoE extractor
+    for the parent.
+    """
+    experts = model.get_submodule(path)
+    if set(scales) != {"gate_up_proj", "down_proj"}:
+        raise ValueError(f"{path}: expected both fused expert assignments")
+    setattr(experts, SCALES_ATTR, scales)
+    parent_path = path.rsplit(".", 1)[0] if "." in path else None
+    if parent_path is None:
+        return False
+    sources = _layout_candidates(
+        _ExpertScales(f"{path}/gate_up_proj", scales["gate_up_proj"]),
+        _ExpertScales(f"{path}/down_proj", scales["down_proj"]),
+    )
+    return _mark_for_t2n(model.get_submodule(parent_path), sources)
+
+
+def _warn_unmarked(model: nn.Module, path: str) -> None:
+    parent = model.get_submodule(path.rsplit(".", 1)[0]) if "." in path else model
+    LOGGER.warning(
+        "%s: torch_to_nnef has no MoE extractor for %s, experts keep the GPTQ "
+        "values as float",
+        path,
+        type(parent).__name__,
+    )
+
+
 class MoEExpertsQ40Adapter(ModuleQuantizationAdapter):
     """Apply :class:`GPTQMoEExpertsEstimator` assignments and mark for export.
 
-    Writes the dequantized GPTQ values into the fused float parameters and
-    sets the torch_to_nnef markers on the MoE block owning the experts. A
-    block torch_to_nnef has no MoE extractor for keeps the dequantized float
-    values, with a warning.
+    Writes the dequantized GPTQ values into the fused float parameters, keeps
+    their f16 block scales on the experts module (:data:`SCALES_ATTR`, saved
+    and restored by :mod:`neuropress.t2n.model_io`) and sets the torch_to_nnef
+    markers on the MoE block owning the experts. A block torch_to_nnef has no
+    MoE extractor for keeps the dequantized float values, with a warning.
     """
 
     @torch.no_grad()
     def apply(self, model: nn.Module, plan: QuantizationPlan) -> nn.Module:
         """Write expert assignments into *model* and mark their MoE blocks."""
-        per_module: dict[str, dict[str, _ExpertCodes]] = {}
+        per_module: dict[str, dict[str, torch.Tensor]] = {}
         for key, value in plan.weight_assignments.items():
             if "/" not in key:
                 continue
@@ -396,31 +457,54 @@ class MoEExpertsQ40Adapter(ModuleQuantizationAdapter):
             mod = model.get_submodule(path)
             if not is_fused_experts(mod):
                 continue
-            codes = _expert_codes(value, key)
+            values, scales = _decode(value, key)
             param = getattr(mod, param_name)
-            param.data.copy_(codes.dequantize().to(param.device, param.dtype))
-            per_module.setdefault(path, {})[param_name] = codes
-        parents = {
-            id(child): parent
-            for parent in model.modules()
-            for child in parent.children()
-        }
-        for path, codes in per_module.items():
-            if set(codes) != {"gate_up_proj", "down_proj"}:
-                raise ValueError(f"{path}: expected both fused expert assignments")
-            parent = parents.get(id(model.get_submodule(path)))
-            sources = _layout_candidates(codes["gate_up_proj"], codes["down_proj"])
-            if parent is None or not _mark_for_t2n(parent, sources):
-                LOGGER.warning(
-                    "%s: torch_to_nnef has no MoE extractor for %s, experts "
-                    "keep the GPTQ values as float",
-                    path,
-                    type(parent).__name__ if parent is not None else "the root",
-                )
+            param.data.copy_(values.to(param.device, param.dtype))
+            per_module.setdefault(path, {})[param_name] = scales.scales
+        marked = 0
+        for path, scales in per_module.items():
+            if _mark_experts(model, path, scales):
+                marked += 1
+            else:
+                _warn_unmarked(model, path)
         LOGGER.info(
-            "MoEExpertsQ40Adapter: %d expert modules quantized", len(per_module)
+            "MoEExpertsQ40Adapter: %d expert modules quantized, %d marked for "
+            "torch_to_nnef",
+            len(per_module),
+            marked,
         )
         return model
+
+
+def moe_q40_checkpoint(
+    model: nn.Module,
+) -> tuple[dict[str, Any] | None, dict[str, torch.Tensor]]:
+    """The manifest transform and tensors that restore the expert markers.
+
+    Returns ``(None, {})`` when no experts carry GPTQ Q4_0 scales. Tensors are
+    keyed ``"<experts path>/<param name>"``.
+    """
+    tensors = {
+        f"{path}/{param}": scales
+        for path, mod in model.named_modules()
+        for param, scales in (getattr(mod, SCALES_ATTR, None) or {}).items()
+    }
+    if not tensors:
+        return None, {}
+    paths = sorted({key.rsplit("/", 1)[0] for key in tensors})
+    return {"type": MANIFEST_TRANSFORM, "modules": paths}, tensors
+
+
+def restore_moe_q40(
+    model: nn.Module, transform: dict[str, Any], tensors: dict[str, torch.Tensor]
+) -> None:
+    """Re-mark the experts listed by a :func:`moe_q40_checkpoint` transform."""
+    for path in transform["modules"]:
+        scales = {
+            param: tensors[f"{path}/{param}"] for param in ("gate_up_proj", "down_proj")
+        }
+        if not _mark_experts(model, path, scales):
+            _warn_unmarked(model, path)
 
 
 # ---------------------------------------------------------------------------

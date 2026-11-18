@@ -75,28 +75,48 @@ class MoEExpertHessianCollector(InvocationCollector):
         inter = two_inter // 2
         hidden = hidden.reshape(-1, d_model)
         top_k_index = top_k_index.reshape(hidden.shape[0], -1)
-        device = hidden.device
         if self._gate_up is None:
-            self._gate_up = torch.zeros(
-                n_experts, d_model, d_model, device=device, dtype=torch.float32
-            )
-            self._down = torch.zeros(
-                n_experts, inter, inter, device=device, dtype=torch.float32
-            )
+            self._gate_up = self._zeros(n_experts, d_model, hidden.device)
+            self._down = self._zeros(n_experts, inter, hidden.device)
             self._counts = torch.zeros(n_experts, dtype=torch.long)
         assert self._down is not None and self._counts is not None
-        for expert in torch.unique(top_k_index).tolist():
-            if not 0 <= expert < n_experts:
-                continue  # masked-out slots (e.g. index == num_experts)
-            tokens = (top_k_index == expert).any(dim=-1).nonzero().flatten()
+        # Group the (token, slot) pairs by expert with one host sync: a token
+        # reaches an expert at most once, and masked-out slots (index outside
+        # 0..E-1) go to an extra bin that is dropped.
+        expert_of = top_k_index.flatten()
+        expert_of = torch.where(
+            (expert_of >= 0) & (expert_of < n_experts), expert_of, n_experts
+        )
+        order = expert_of.argsort(stable=True)
+        tokens_by_expert = (order // top_k_index.shape[1]).split(
+            torch.bincount(expert_of, minlength=n_experts + 1).tolist()
+        )
+        for expert, tokens in enumerate(tokens_by_expert[:n_experts]):
+            if not len(tokens):
+                continue
             x = hidden[tokens]
             weight = gate_up[expert]
             gate, up = nn.functional.linear(x, weight.to(x.dtype)).chunk(2, dim=-1)
             z = (module.act_fn(gate) * up).float()
             x = x.float()
-            self._gate_up[expert] += x.t() @ x
-            self._down[expert] += z.t() @ z
+            self._gate_up[expert] += (x.t() @ x).to(self._gate_up.device)
+            self._down[expert] += (z.t() @ z).to(self._down.device)
             self._counts[expert] += x.shape[0]
+
+    @staticmethod
+    def _zeros(n_experts: int, width: int, device: torch.device) -> torch.Tensor:
+        """``[E, width, width]`` float32 zeros, on the host if the device is short.
+
+        Same rule as :class:`.HessianAccumulator`: one MoE layer's Hessians
+        (every expert) leave the GPU when they would take a large share of its
+        free memory. The products are still computed on the GPU.
+        """
+        if device.type == "cuda":
+            nbytes = n_experts * width * width * 4
+            free, _ = torch.cuda.mem_get_info(device)
+            if nbytes * 2 > free * 0.3:
+                device = torch.device("cpu")
+        return torch.zeros(n_experts, width, width, device=device, dtype=torch.float32)
 
     def result(self) -> dict[str, Any]:
         """Return ``{"gate_up", "down"}`` Hessians stacked per expert and counts.

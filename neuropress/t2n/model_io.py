@@ -280,6 +280,13 @@ def save_quantized_model(
             else:
                 tensors[name] = param.data
 
+        # GPTQ Q4_0 expert scales, which restore the torch_to_nnef markers on load.
+        from ..moe_experts import moe_q40_checkpoint
+
+        moe_transform, moe_tensors = moe_q40_checkpoint(model)
+        for key, tensor in moe_tensors.items():
+            tensors[f"{key}{_QT_SEP}q40_block_scales"] = tensor
+
         # Include non-parameter buffers (e.g. BatchNorm running stats).
         for name, buf in model.named_buffers():
             if buf is not None and name not in tensors:
@@ -292,7 +299,9 @@ def save_quantized_model(
             "transforms": [
                 t.model_dump() if isinstance(t, BaseModel) else t
                 for t in manifest.transforms
-            ],
+                if not (isinstance(t, dict) and t.get("type") == "moe_experts_q40")
+            ]
+            + ([moe_transform] if moe_transform is not None else []),
             "recipe_config": rc,
         }
         # Move to CPU before serialising — safetensors pins GPU memory for the
@@ -578,6 +587,23 @@ def load_quantized_model(
         for path in tied_paths[id(previous)]:
             if path == param_path or path not in saved_paths:
                 _set_param(model, path, q)
+
+    # GPTQ Q4_0 experts: the float values were loaded above, the scales and the
+    # torch_to_nnef markers are restored here.
+    for t in transforms_list:
+        if isinstance(t, dict) and t.get("type") == "moe_experts_q40":
+            from ..moe_experts import restore_moe_q40
+
+            suffix = f"{_QT_SEP}q40_block_scales"
+            restore_moe_q40(
+                model,
+                t,
+                {
+                    k.removesuffix(suffix): v
+                    for k, v in all_tensors.items()
+                    if k.endswith(suffix)
+                },
+            )
 
     # -----------------------------------------------------------------------
     # Step 5: Re-attach manifest.

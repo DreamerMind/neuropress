@@ -294,3 +294,83 @@ def test_registry_entry_quantizes_linears_and_experts_of_a_causal_lm():
         w2 = moe.experts.down_proj.detach().contiguous()
         q = expert_q40_from_gptq_codes(w2, **moe._t2n_quantize_moe_experts_q40_kwargs)
         torch.testing.assert_close(q.decompress(), w2, rtol=0, atol=0)
+
+
+def test_block_without_an_extractor_is_not_marked(caplog):
+    class UnknownMoeBlock(qwen3.Qwen3MoeSparseMoeBlock):
+        pass
+
+    model = _block()
+    model.block.__class__ = UnknownMoeBlock
+    with caplog.at_level("WARNING", logger="neuropress.moe_experts"):
+        QuantizationPipeline(_recipe()).run(model, _batches(2, seed=7))
+    assert not hasattr(model.block, "_t2n_quantize_moe_experts_q40")
+    assert not hasattr(model.block, "_t2n_quantize_moe_experts_q40_kwargs")
+    assert "no MoE extractor for UnknownMoeBlock" in caplog.text
+
+
+def test_experts_keep_scales_only():
+    model = _block()
+    QuantizationPipeline(_recipe()).run(model, _batches(2, seed=8))
+    sources = model.block._t2n_quantize_moe_experts_q40_kwargs["sources"]
+    assert not any(hasattr(s, "codes") for s in sources)
+    assert [s.scales.dtype for s in sources] == [torch.float16] * 3
+    assert tuple(sources[0].scales.shape) == (EXPERTS, INTER, D // 32)
+
+
+def test_staged_run_accepts_expert_assignments():
+    model = _block()
+    out = QuantizationPipeline(_recipe()).run(
+        model, _batches(2, seed=9), target_paths={"block.experts"}
+    )
+    assert out.block._t2n_quantize_moe_experts_q40 is True
+
+
+def test_checkpoint_round_trip_restores_the_export_markers(tmp_path):
+    from neuropress.t2n.model_io import load_quantized_model, save_quantized_model
+
+    model = _block()
+    QuantizationPipeline(_recipe()).run(model, _batches(2, seed=10))
+    path = tmp_path / "moe.safetensors"
+    save_quantized_model(model, path)
+
+    fresh = _block(seed=1)
+    load_quantized_model(fresh, path, kernel_lowering=None)
+    assert fresh.block._t2n_quantize_moe_experts_q40 is True
+    assert fresh.block._t2n_moe_expert_layout == "linear"
+    w2 = fresh.block.experts.down_proj
+    before = expert_q40_from_gptq_codes(
+        model.block.experts.down_proj,
+        **model.block._t2n_quantize_moe_experts_q40_kwargs,
+    )
+    after = expert_q40_from_gptq_codes(
+        w2, **fresh.block._t2n_quantize_moe_experts_q40_kwargs
+    )
+    torch.testing.assert_close(
+        after.decompress_to_u8(), before.decompress_to_u8(), rtol=0, atol=0
+    )
+    torch.testing.assert_close(after.decompress(), w2, rtol=0, atol=0)
+    # saving the reloaded model keeps the entry once
+    save_quantized_model(fresh, tmp_path / "again.safetensors")
+    again = _block(seed=2)
+    manifest = load_quantized_model(again, tmp_path / "again.safetensors", None)
+    entries = [
+        t
+        for t in manifest.transforms
+        if isinstance(t, dict) and t["type"] == "moe_experts_q40"
+    ]
+    assert len(entries) == 1 and again.block._t2n_quantize_moe_experts_q40 is True
+
+
+def test_collector_ignores_masked_slots():
+    from neuropress.calibration.probe.moe_experts import MoEExpertHessianCollector
+
+    experts = _block().block.experts
+    hidden = torch.randn(5, D)
+    index = torch.tensor([[0, 1], [1, EXPERTS], [2, 0], [EXPERTS, EXPERTS], [3, 1]])
+    collector = MoEExpertHessianCollector()
+    collector.update_call(experts, (hidden, index, torch.ones(5, 2)), None)
+    stat = collector.result()
+    assert stat["nsamples"].tolist() == [2, 3, 1, 1]
+    x = hidden[[0, 1, 4]]
+    torch.testing.assert_close(stat["gate_up"][1], 2 * x.t() @ x / 3)

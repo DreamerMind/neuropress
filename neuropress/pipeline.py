@@ -188,7 +188,12 @@ class QuantizationPipeline:
             )
 
             if target_paths is not None:
-                assigned = set(plan.weight_assignments) | set(plan.kept_float)
+                # "<module path>/<param name>" keys (fused MoE experts) belong to
+                # the module at that path
+                assigned = {
+                    key.split("/", 1)[0]
+                    for key in (*plan.weight_assignments, *plan.kept_float)
+                }
                 if assigned - target_paths or plan.activation_assignments:
                     raise ValueError(
                         "Estimator assignments escape the selected weight stage"
