@@ -29,7 +29,7 @@ class QuantizationParamEstimator(ABC):
 
     Responsibilities:
 
-    1. Declare subgraphs / targets to quantize.
+    1. Declare the targets to quantize (:meth:`declare_targets`).
     2. Declare required statistics.
     3. Select QScheme(s) from allowed descriptors.
     4. Return a QuantizationPlan.
@@ -123,6 +123,29 @@ class QuantizationParamEstimator(ABC):
             yield
         finally:
             self.filter_fn = previous
+
+    def declare_targets(self) -> list[str]:
+        """Return the module paths this estimator quantizes, after :meth:`prepare`.
+
+        Not derivable from :meth:`declare_statistics`: estimators that work
+        from the weights alone (min-max, HQQ) request no statistics. Tied
+        aliases of a target are not listed; the adapter keeps them tied.
+
+        The default reads ``_target_modules``, where estimators that find
+        their targets with :func:`.collect_target_modules` keep them. Others
+        must override it.
+
+        Raises:
+            NotImplementedError: If the estimator does not keep its targets
+                there, or :meth:`prepare` has not run.
+        """
+        targets = getattr(self, "_target_modules", None)
+        if targets is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not declare its targets "
+                "(override declare_targets, or call prepare first)"
+            )
+        return list(targets)
 
     @abstractmethod
     def declare_statistics(self) -> list[StatisticRequest]:

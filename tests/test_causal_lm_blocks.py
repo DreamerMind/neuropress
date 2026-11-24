@@ -346,3 +346,88 @@ def test_mixed_precision_splits_reach_the_checkpoint(tmp_path, resumed):
     ids = torch.randint(0, 128, (1, 16), generator=torch.Generator().manual_seed(0))
     with torch.no_grad():
         torch.testing.assert_close(loaded(ids).logits, model(ids).logits)
+
+
+def _linear_and_embedding_config():
+    from neuropress.estimator_configs import (
+        GptqEstimatorConfig,
+        MinMaxZpWeightEstimatorConfig,
+    )
+    from neuropress.recipe_config import (
+        CompositeEstimatorConfig,
+        QuantizationRecipeConfig,
+    )
+
+    return QuantizationRecipeConfig(
+        calibration=CalibrationConfig(n_samples=4, seq_len=32, seed=0),
+        estimator=CompositeEstimatorConfig(
+            methods=[
+                GptqEstimatorConfig(
+                    target="linear",
+                    weight_transform="q4_0_packed",
+                    group_size=32,
+                    nbits=4,
+                ),
+                MinMaxZpWeightEstimatorConfig(target="embedding"),
+            ]
+        ),
+        kernel_lowering=None,
+    )
+
+
+def test_estimators_without_statistics_declare_their_targets():
+    config = _linear_and_embedding_config()
+    composite = config.build().param_estimator
+    model = _moe_model()
+    composite.prepare(model)
+    minmax = composite.estimators[1]
+    assert minmax.declare_statistics() == []
+    assert minmax.declare_targets() == ["model.embed_tokens"]
+    targets = composite.declare_targets()
+    assert targets[-1] == "model.embed_tokens"
+    assert "lm_head" in targets and "model.layers.0.self_attn.q_proj" in targets
+
+    moe = NEUROPRESS_COMPRESSION["open_text_c4_gptq_q4_0_moe"].__config__.build()
+    moe.param_estimator.prepare(model)
+    assert "model.layers.0.mlp.experts" in moe.param_estimator.declare_targets()
+
+
+def test_an_untied_embedding_without_statistics_is_quantized_in_block_mode():
+    config = _linear_and_embedding_config()
+
+    def run(block_calibration):
+        model = _moe_model()
+        run_quantization_pipeline(
+            model,
+            tokenizer=_MockTokenizer(),
+            recipe=config.build(),
+            recipe_config_json=config.model_dump_json(),
+            block_calibration=block_calibration,
+            _load_dataset=_mock_load_dataset,
+        )
+        return model
+
+    float_embedding = _moe_model().model.embed_tokens.weight.detach()
+    whole, blocks = _dense_state(run(None)), _dense_state(run("float"))
+    assert not torch.equal(blocks["model.embed_tokens.weight"], float_embedding)
+    assert whole.keys() == blocks.keys()
+    for key in whole:
+        torch.testing.assert_close(blocks[key], whole[key], msg=key)
+
+
+def test_an_estimator_that_cannot_declare_targets_is_refused():
+    from types import SimpleNamespace
+
+    from neuropress.causal_lm_blocks import _targets_outside
+    from neuropress.estimator import QuantizationParamEstimator
+
+    class Opaque(QuantizationParamEstimator):
+        def declare_statistics(self):
+            return []
+
+        def estimate(self, graph, registry, recipe):
+            raise NotImplementedError
+
+    config = SimpleNamespace(build=lambda: SimpleNamespace(param_estimator=Opaque()))
+    with pytest.raises(ValueError, match="must know every target"):
+        _targets_outside(_moe_model(), config, [])

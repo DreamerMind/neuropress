@@ -3609,6 +3609,12 @@ class CompositeEstimator(QuantizationParamEstimator):
             if hasattr(est, "prepare"):
                 est.prepare(model)
 
+    def declare_targets(self) -> list[str]:
+        """Return the union of all sub-estimator targets, in order."""
+        return list(
+            dict.fromkeys(t for est in self.estimators for t in est.declare_targets())
+        )
+
     def declare_statistics(self) -> list[StatisticRequest]:
         """Return deduplicated union of all sub-estimator statistic requests."""
         seen: set[tuple[str, str]] = set()

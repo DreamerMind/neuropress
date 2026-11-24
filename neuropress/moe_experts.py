@@ -251,6 +251,10 @@ class GPTQMoEExpertsEstimator(QuantizationParamEstimator):
             "GPTQMoEExpertsEstimator: %d fused expert modules", len(self._targets)
         )
 
+    def declare_targets(self) -> list[str]:
+        """Return the paths of the fused expert modules found by :meth:`prepare`."""
+        return list(self._targets)
+
     def declare_statistics(self) -> list[StatisticRequest]:
         """Request the per-expert Hessians of every target."""
         return [

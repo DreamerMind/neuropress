@@ -152,7 +152,12 @@ def _targets_outside(
     """Estimator targets that no block contains."""
     estimator = config.build().param_estimator
     estimator.prepare(model)
-    targets = {request.target_key for request in estimator.declare_statistics()}
+    try:
+        targets = estimator.declare_targets()
+    except NotImplementedError as error:
+        raise ValueError(
+            f"block calibration must know every target to place it: {error}"
+        ) from error
     return sorted(t for t in targets if not any(_inside(t, p) for p in prefixes))
 
 
