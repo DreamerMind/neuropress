@@ -47,7 +47,7 @@ from __future__ import annotations
 import logging
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from torch import nn
@@ -96,6 +96,7 @@ def run_quantization_pipeline(
     recipe_config_json: str | None = None,
     cache_dir: Path | str | None = None,
     span_collector: SpanCollector | None = None,
+    block_calibration: Literal["float", "sequential"] | None = None,
     **kwargs: Any,
 ) -> nn.Module:
     """Run a :class:`.QuantizationPipeline` driven entirely by *recipe*.
@@ -134,6 +135,16 @@ def run_quantization_pipeline(
             model-level isolation is the caller's responsibility.
         span_collector: Optional sink receiving one timing span per pipeline
             stage.  Defaults to logging spans at INFO level.
+        block_calibration: Calibrate one decoder layer at a time with
+            :func:`.calibrate_causal_lm_blockwise` instead of the whole model
+            at once, so only one layer's statistics are live: ``"float"``
+            (the statistics of a whole-model run) or ``"sequential"``
+            (statistics on quantized upstream activations). The estimator
+            and adapter then come from *recipe_config_json*, which is
+            required. *cache_dir* holds block checkpoints instead of
+            per-estimator stages (``<cache_dir>/blocks``): a rerun resumes
+            every block whose recipe, mode, weights and inputs match.
+            *span_collector* is not used.
         **kwargs: Extra kwargs forwarded by ``LLMExporter`` (e.g.
             ``export_dirpath``) are otherwise ignored; their presence skips
             kernel lowering, as the model is about to be exported to NNEF.
@@ -182,7 +193,26 @@ def run_quantization_pipeline(
     estimator.set_span_collector(collector)
     # Lazy device transfer — one batch on the GPU at a time.
     batches = ({k: v.to(device) for k, v in b.items()} for b in batches_raw)
-    QuantizationPipeline(recipe).run(model, batches)
+    if block_calibration is not None:
+        # Imported here: block_pipeline imports this package.
+        from ..causal_lm_blocks import calibrate_causal_lm_blockwise
+
+        if recipe_config_json is None:
+            raise ValueError("block_calibration needs recipe_config_json")
+        if span_collector is not None:
+            LOGGER.warning("block calibration does not use span_collector")
+        kept = calibrate_causal_lm_blockwise(
+            model,
+            batches,
+            QuantizationRecipeConfig.model_validate_json(recipe_config_json),
+            input_source=block_calibration,
+            device=device,
+            checkpoint_dir=Path(cache_dir) / "blocks" if cache_dir else None,
+        )
+        if kept:
+            LOGGER.warning("block calibration kept float: %s", kept)
+    else:
+        QuantizationPipeline(recipe).run(model, batches)
     attach_manifest(model, recipe_config_json=recipe_config_json)
     # Apply kernel lowering eagerly so the model is always in the fast
     # inference state.  save_quantized_model will unlower transparently.
@@ -291,7 +321,11 @@ def apply_kernel_lowering(model: nn.Module) -> nn.Module:
 NEUROPRESS_COMPRESSION_REGISTRY = "neuropress.t2n.registry.NEUROPRESS_COMPRESSION"
 
 
-def _make_entry(config: QuantizationRecipeConfig) -> partial:
+def _make_entry(
+    config: QuantizationRecipeConfig,
+    *,
+    block_calibration: Literal["float", "sequential"] | None = None,
+) -> partial:
     """Build a registry entry from *config*, capturing its JSON for the manifest.
 
     The returned callable quantizes the model **and** applies kernel lowering
@@ -300,12 +334,15 @@ def _make_entry(config: QuantizationRecipeConfig) -> partial:
     auto-unlower before saving and re-lower afterwards.
 
     The *config* is stored on the returned partial as ``.__config__``
-    so callers can retrieve it if needed.
+    so callers can retrieve it if needed. *block_calibration* is passed to
+    :func:`run_quantization_pipeline`; it is not part of the recipe JSON,
+    so it changes neither the manifest nor cache fingerprints.
     """
     entry = partial(
         run_quantization_pipeline,
         recipe=config.build(),
         recipe_config_json=config.model_dump_json(),
+        block_calibration=block_calibration,
     )
     entry.__config__ = config  # type: ignore[attr-defined]
     return entry
@@ -376,7 +413,11 @@ NEUROPRESS_COMPRESSION: dict[str, Any] = {
             adapter=CompositeAdapterConfig(
                 adapters=[WeightAssignmentAdapterConfig(), MoEExpertsQ40AdapterConfig()]
             ),
-        )
+        ),
+        # One decoder layer's expert Hessians at a time instead of every
+        # layer's (about 117 GB on Qwen3-30B-A3B), each layer calibrated on
+        # the activations of the already quantized layers before it.
+        block_calibration="sequential",
     ),
     # --- Speech / audio entries (require neuropress[audio]) -----------------
     # dataset="librispeech" → load_librispeech_calibration; seq_len is in
