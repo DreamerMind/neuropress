@@ -206,3 +206,95 @@ def test_cache_dir_resumes_every_block(tmp_path, caplog):
         torch.testing.assert_close(resumed[key], expected[key], rtol=0, atol=0)
     for layer in second.model.layers:
         assert layer.mlp._t2n_quantize_moe_experts_q40 is True
+
+
+def test_a_checkpoint_keeps_the_block_calibration_mode(tmp_path):
+    from neuropress.t2n.model_io import load_quantized_model, save_quantized_model
+
+    entry = "open_text_c4_gptq_q4_0_moe"
+    model = _quantize(_moe_model(), entry, "sequential")
+    path = tmp_path / "model.safetensors"
+    save_quantized_model(model, path, _config(entry).model_dump_json())
+    assert model.__neuropress_manifest__.block_calibration == "sequential"
+    manifest = load_quantized_model(_moe_model(), path, kernel_lowering=None)
+    assert manifest.block_calibration == "sequential"
+
+
+def test_a_whole_model_run_records_no_block_calibration():
+    model = _quantize(_moe_model(), "open_text_c4_gptq_q4_0_moe", None)
+    assert model.__neuropress_manifest__.block_calibration is None
+
+
+def test_a_tied_embedding_is_quantized_once_in_the_head_block(monkeypatch):
+    import neuropress.causal_lm_blocks as blocks
+    from neuropress.estimator_configs import MinMaxZpWeightEstimatorConfig
+    from neuropress.recipe_config import (
+        QuantizationRecipeConfig,
+        WeightAssignmentAdapterConfig,
+    )
+
+    model = _moe_model()
+    model.lm_head.weight = model.model.embed_tokens.weight
+    float_weight = model.lm_head.weight.detach().clone()
+    config = QuantizationRecipeConfig(
+        estimator=MinMaxZpWeightEstimatorConfig(target="embedding"),
+        adapter=WeightAssignmentAdapterConfig(),
+    )
+    outside_passes = []
+    monkeypatch.setattr(
+        blocks, "_quantize_outside", lambda *a: outside_passes.append(a[-1]) or {}
+    )
+    ids = torch.randint(0, 128, (1, 16), generator=torch.Generator().manual_seed(0))
+    blocks.calibrate_causal_lm_blockwise(model, [{"input_ids": ids}], config)
+    assert outside_passes == []
+    weight = model.model.embed_tokens.weight
+    assert not torch.equal(weight, float_weight)
+
+
+def test_a_model_spread_over_devices_is_refused():
+    from neuropress.causal_lm_blocks import calibrate_causal_lm_blockwise
+
+    model = _moe_model()
+    model.hf_device_map = {"model.layers.0": 0, "model.layers.1": "cpu"}
+    config = NEUROPRESS_COMPRESSION["open_text_c4_gptq_q4_0_moe"].__config__
+    with pytest.raises(ValueError, match="spread over"):
+        calibrate_causal_lm_blockwise(model, [], config)
+
+
+class _Bounds:
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+
+    def keep(self, name: str, module: nn.Module) -> bool:
+        return module.weight.shape[0] <= self.limit
+
+
+def test_recipe_structure_reads_method_instances_partials_and_closures():
+    from functools import partial
+
+    from neuropress.t2n.registry import _structure
+
+    assert _structure(_Bounds(1).keep) != _structure(_Bounds(2).keep)
+    assert _structure(_Bounds(1).keep) == _structure(_Bounds(1).keep)
+
+    def make():
+        def inner(x):
+            return x
+
+        return partial(inner, 1)
+
+    assert _structure(make()) == _structure(make())
+
+    def recursive(n):
+        return recursive(n - 1) if n else 0
+
+    _structure(recursive)  # refers to itself through its closure
+
+    def empty_cell():
+        def uses():
+            return later
+
+        return uses
+        later = 1
+
+    _structure(empty_cell())

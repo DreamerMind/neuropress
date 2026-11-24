@@ -89,6 +89,22 @@ def _path_of(model: nn.Module, module: nn.Module) -> str:
     raise ValueError("module not found in the model")
 
 
+def _check_one_device(model: nn.Module) -> None:
+    """Refuse a model placed across devices: each block moves to one device."""
+    # An accelerate dispatch keeps offloaded weights on "meta", so its map
+    # is read too; its entries (0, "cuda:0", "cpu", "disk") are compared
+    # among themselves only.
+    mapped = {str(d) for d in (getattr(model, "hf_device_map", None) or {}).values()}
+    devices = {str(t.device) for t in [*model.parameters(), *model.buffers()]}
+    if len(mapped) > 1 or len(devices) > 1:
+        devices |= mapped
+        raise ValueError(
+            "block calibration moves each block, and the whole model at the "
+            f"end, to one device; this model is spread over {sorted(devices)}. "
+            "Load it on one device, or calibrate it without blocks"
+        )
+
+
 def _inside(path: str, prefix: str) -> bool:
     return path == prefix or path.startswith(f"{prefix}.")
 
@@ -239,12 +255,12 @@ def calibrate_causal_lm_blockwise(
         The ``kept_float`` reasons of every block, keyed by full module path.
     """
     decoder = _decoder(model)
+    _check_one_device(model)
     layers = decoder.layers
     device = torch.device(device) if device else next(model.parameters()).device
     layer_paths = [_path_of(model, layer) for layer in layers]
     head_path = _path_of(model, model.lm_head)
     norm_path = _path_of(model, decoder.norm)
-    outside = _targets_outside(model, config, [*layer_paths, norm_path, head_path])
 
     embed = getattr(decoder, "embed_tokens", None)
     tied = (
@@ -253,6 +269,13 @@ def calibrate_causal_lm_blockwise(
         and embed.weight is getattr(model.lm_head, "weight", None)
     )
     head = _Head(decoder.norm, model.lm_head, embed if tied else None)
+    head_paths = {
+        "norm": norm_path,
+        "lm_head": head_path,
+        **({"embed_tokens": _path_of(model, embed)} if tied else {}),
+    }
+    # A tied embedding is part of the head block, not outside the blocks.
+    outside = _targets_outside(model, config, [*layer_paths, *head_paths.values()])
 
     runner = BlockQuantizationPipeline(
         config.model_copy(update={"kernel_lowering": None}),
@@ -304,11 +327,6 @@ def calibrate_causal_lm_blockwise(
             [{"hidden_states": h} for h in student],
             [{"hidden_states": h} for h in reference],
         )
-        head_paths = {
-            "norm": norm_path,
-            "lm_head": head_path,
-            "embed_tokens": _path_of(model, embed) if tied else "",
-        }
         for key, reason in result.kept_float.items():
             child, _, rest = key.partition(".")
             kept[head_paths[child] + (f".{rest}" if rest else "")] = reason

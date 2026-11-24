@@ -130,10 +130,15 @@ class MoEExpertHessianCollector(InvocationCollector):
         if not self._pending:
             return
         assert self._gate_up is not None and self._down is not None
-        experts = torch.tensor([e for e, _, _ in self._pending])
+        experts = [e for e, _, _ in self._pending]
         for stack, part in ((self._gate_up, 1), (self._down, 2)):
-            products = torch.stack([item[part] for item in self._pending])
-            stack.index_add_(0, experts, products.to(stack.device))
+            items = [item[part] for item in self._pending]
+            if len({t.device for t in items}) > 1:
+                # Calls from several devices: gather them where the stack is.
+                items = [t.to(stack.device) for t in items]
+            products = torch.stack(items)
+            index = torch.tensor(experts, device=stack.device)
+            stack.index_add_(0, index, products.to(stack.device))
         self._pending.clear()
 
     @staticmethod

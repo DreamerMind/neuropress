@@ -351,8 +351,11 @@ class _ExpertScales:
         A weight must sit within a tenth of a quantization step of a grid
         point (neighboring codes are a whole step apart), which tolerates a
         cast of the float parameters to f16 or bf16. An f16 cast of values on
-        a subnormal grid is off by up to half the f16 subnormal spacing, and a
-        block stored as zeros has a zero scale; both are accepted.
+        a subnormal grid is off by up to half the f16 subnormal spacing, which
+        is accepted. A block whose scale underflowed f16 is stored as code 8
+        at the smallest positive f16 scale (see :func:`_q40_tensor`), so it
+        decodes to exact zeros; a zero scale, which this module never stores,
+        is read as zero codes too.
         """
         shape = (*self.scales.shape[:-1], self.scales.shape[-1] * Q40_BLOCK)
         if tuple(tensor.shape) != shape:

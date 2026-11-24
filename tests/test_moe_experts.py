@@ -509,3 +509,25 @@ def test_experts_at_the_top_level_mark_the_root_block():
     QuantizationPipeline(_recipe()).run(model, _batches(2, seed=12))
     assert model._t2n_quantize_moe_experts_q40 is True
     assert model._t2n_moe_expert_layout == EXPERT_LAYOUT
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_collector_adds_host_calls_into_device_stacks(monkeypatch):
+    from neuropress.calibration.probe.moe_experts import MoEExpertHessianCollector
+
+    experts = _block().block.experts
+    hidden = torch.randn(64, D)
+    index = torch.randint(0, EXPERTS, (64, 2))
+    expected = MoEExpertHessianCollector()
+    expected.update_call(experts, (hidden, index, torch.ones(64, 2)), None)
+    monkeypatch.setattr(
+        MoEExpertHessianCollector,
+        "_device",
+        staticmethod(lambda n, widths, device: torch.device("cuda")),
+    )
+    collector = MoEExpertHessianCollector()
+    collector.update_call(experts, (hidden, index, torch.ones(64, 2)), None)
+    result, reference = collector.result(), expected.result()
+    for key in ("gate_up", "down"):
+        assert result[key].device.type == "cuda"
+        torch.testing.assert_close(result[key].cpu(), reference[key])

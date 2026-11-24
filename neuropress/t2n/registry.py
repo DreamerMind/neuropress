@@ -223,11 +223,8 @@ def run_quantization_pipeline(
             LOGGER.warning("block calibration kept float: %s", kept)
     else:
         QuantizationPipeline(recipe).run(model, batches)
-    attach_manifest(
-        model,
-        recipe_config_json=recipe_config_json,
-        block_calibration=block_calibration,
-    )
+    manifest = attach_manifest(model, recipe_config_json=recipe_config_json)
+    manifest.block_calibration = block_calibration
     # Apply kernel lowering eagerly so the model is always in the fast
     # inference state.  save_quantized_model will unlower transparently.
     if recipe.kernel_lowering is not None:
@@ -237,44 +234,63 @@ def run_quantization_pipeline(
     return wrapper
 
 
-def _structure(value: Any) -> Any:
+_EMPTY_CELL = object()
+
+
+def _structure(value: Any, active: frozenset[int] = frozenset()) -> Any:
     """A comparable view of a built recipe component's settings.
 
     Private attributes hold state from earlier runs (prepared targets,
-    devices) and are left out.
+    devices) and are left out. Functions compare by code, defaults and
+    closure contents, since filters are often closures built afresh by each
+    ``config.build()``; bound methods by function and instance. A value met
+    again while it is being described compares by type.
     """
+    if isinstance(value, (type, enum.Enum, types.ModuleType)):
+        return value
     if isinstance(value, torch.Tensor):
         return ("tensor", value.dtype, tuple(value.shape), value.tolist())
+    if not isinstance(value, (dict, list, tuple)) and not hasattr(value, "__dict__"):
+        return value
+    if id(value) in active:
+        return ("cycle", type(value))
+    active = active | {id(value)}
+
+    def nested(item: Any) -> Any:
+        return _structure(item, active)
+
+    if isinstance(value, dict):
+        return {k: nested(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return tuple(nested(v) for v in value)
     if isinstance(value, partial):
         return (
             "partial",
-            value.func,
-            _structure(value.args),
-            _structure(value.keywords),
+            nested(value.func),
+            nested(value.args),
+            nested(value.keywords),
         )
-    if isinstance(value, dict):
-        return {k: _structure(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return tuple(_structure(v) for v in value)
     if isinstance(value, types.MethodType):
-        return ("method", value.__func__, type(value.__self__))
+        return ("method", nested(value.__func__), nested(value.__self__))
     if isinstance(value, types.FunctionType):
-        # Filters are often closures built afresh by each config.build().
-        cells = tuple(cell.cell_contents for cell in value.__closure__ or ())
+        cells = []
+        for cell in value.__closure__ or ():
+            try:
+                cells.append(cell.cell_contents)
+            except ValueError:
+                cells.append(_EMPTY_CELL)
         return (
             "function",
             value.__code__,
-            _structure(cells),
-            _structure(value.__defaults__),
-            _structure(value.__kwdefaults__),
+            nested(tuple(cells)),
+            nested(value.__defaults__),
+            nested(value.__kwdefaults__),
         )
-    if isinstance(value, (type, enum.Enum, types.BuiltinFunctionType)):
-        return value
-    if not hasattr(value, "__dict__"):
+    if isinstance(value, types.BuiltinFunctionType):
         return value
     return (
         type(value),
-        {k: _structure(v) for k, v in vars(value).items() if not k.startswith("_")},
+        {k: nested(v) for k, v in vars(value).items() if not k.startswith("_")},
     )
 
 
@@ -398,8 +414,8 @@ def _make_entry(
 
     The *config* is stored on the returned partial as ``.__config__``
     so callers can retrieve it if needed. *block_calibration* is passed to
-    :func:`run_quantization_pipeline`; it is not part of the recipe JSON,
-    so it changes neither the manifest nor cache fingerprints.
+    :func:`run_quantization_pipeline`; it is not part of the recipe JSON or
+    the cache fingerprints, and the manifest records it separately.
     """
     entry = partial(
         run_quantization_pipeline,
