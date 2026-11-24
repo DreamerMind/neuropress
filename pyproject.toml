@@ -22,7 +22,7 @@ dependencies = [
     "torch",
     # >=0.24.7: earlier releases call DynamicCache.from_legacy_cache, which
     # transformers 5.x removed, breaking NNEF export of causal LMs.
-    "torch-to-nnef>=0.24.7",
+    "torch-to-nnef>=0.25.2",
     "pydantic>=2.0",
     "safetensors>=0.7.0",
     "pyyaml>=6.0",
@@ -51,7 +51,7 @@ eval = [
     "hf-transfer>=0.1",  # Rust-based multi-threaded HuggingFace downloader (5-10x faster)
     # torch_to_nnef.llm_tract (LLMExporter) moved into a separate distribution in
     # torch-to-nnef 0.24; it is needed to export causal LMs to NNEF.
-    "torch-to-nnef[llm-tract]>=0.24.7",
+    "torch-to-nnef[llm-tract]>=0.25.2",
 ]
 audio = [
     "datasets>=2.0",
