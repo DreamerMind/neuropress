@@ -362,15 +362,17 @@ WEIGHT_TRANSFORM_REGISTRY["q4_0_packed"] = WeightTransformEntry(
     symmetric=True,
 )
 
-_MOE_ROUTER_LEAVES = frozenset({"gate", "shared_expert_gate"})
+_MOE_ROUTER_LEAVES = frozenset({"gate", "router", "shared_expert_gate"})
+_MOE_ROUTER_PARENTS = frozenset({"gate", "router"})
 
 
 def _Q4_X_NO_ROUTER_FILTER(name: str, mod: nn.Module) -> bool:
-    # Exclude MoE routers (Qwen/OLMoE/Mixtral ``gate``, Granite ``router.*``)
-    # and Qwen shared-expert gates: tiny layers whose errors reorder the
-    # expert choice, so 4 bits saves next to nothing and costs routing.
+    # Exclude MoE routers (Qwen/OLMoE/Mixtral ``gate``, Jamba/Llama4
+    # ``router``, Granite ``router.layer``, HunYuan ``gate.wg``) and Qwen
+    # shared-expert gates: tiny layers whose errors reorder the expert
+    # choice, so 4 bits saves next to nothing and costs routing.
     parts = name.split(".")
-    if parts[-1] in _MOE_ROUTER_LEAVES or "router" in parts[:-1]:
+    if parts[-1] in _MOE_ROUTER_LEAVES or _MOE_ROUTER_PARENTS.intersection(parts[:-1]):
         return False
     return _is_q4_x_compatible(mod)
 

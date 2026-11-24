@@ -44,7 +44,9 @@ lazily (one batch at a time — no OOM), then delegates to
 
 from __future__ import annotations
 
+import enum
 import logging
+import types
 from functools import partial
 from pathlib import Path
 from typing import Any, Literal
@@ -141,7 +143,8 @@ def run_quantization_pipeline(
             (the statistics of a whole-model run) or ``"sequential"``
             (statistics on quantized upstream activations). The estimator
             and adapter then come from *recipe_config_json*, which is
-            required. *cache_dir* holds block checkpoints instead of
+            required, and a *recipe* with other settings is refused. The
+            manifest records the mode. *cache_dir* holds block checkpoints instead of
             per-estimator stages (``<cache_dir>/blocks``): a rerun resumes
             every block whose recipe, mode, weights and inputs match.
             *span_collector* is not used.
@@ -199,12 +202,19 @@ def run_quantization_pipeline(
 
         if recipe_config_json is None:
             raise ValueError("block_calibration needs recipe_config_json")
+        config = QuantizationRecipeConfig.model_validate_json(recipe_config_json)
+        if not _same_recipe(recipe, config.build()):
+            raise ValueError(
+                "block calibration builds its recipe from recipe_config_json, "
+                "which does not describe the recipe passed: pass both from "
+                "one QuantizationRecipeConfig"
+            )
         if span_collector is not None:
             LOGGER.warning("block calibration does not use span_collector")
         kept = calibrate_causal_lm_blockwise(
             model,
             batches,
-            QuantizationRecipeConfig.model_validate_json(recipe_config_json),
+            config,
             input_source=block_calibration,
             device=device,
             checkpoint_dir=Path(cache_dir) / "blocks" if cache_dir else None,
@@ -213,7 +223,11 @@ def run_quantization_pipeline(
             LOGGER.warning("block calibration kept float: %s", kept)
     else:
         QuantizationPipeline(recipe).run(model, batches)
-    attach_manifest(model, recipe_config_json=recipe_config_json)
+    attach_manifest(
+        model,
+        recipe_config_json=recipe_config_json,
+        block_calibration=block_calibration,
+    )
     # Apply kernel lowering eagerly so the model is always in the fast
     # inference state.  save_quantized_model will unlower transparently.
     if recipe.kernel_lowering is not None:
@@ -221,6 +235,55 @@ def run_quantization_pipeline(
         recipe.kernel_lowering.apply(model)
     _guard_unquantized_linear_dtype(model)
     return wrapper
+
+
+def _structure(value: Any) -> Any:
+    """A comparable view of a built recipe component's settings.
+
+    Private attributes hold state from earlier runs (prepared targets,
+    devices) and are left out.
+    """
+    if isinstance(value, torch.Tensor):
+        return ("tensor", value.dtype, tuple(value.shape), value.tolist())
+    if isinstance(value, partial):
+        return (
+            "partial",
+            value.func,
+            _structure(value.args),
+            _structure(value.keywords),
+        )
+    if isinstance(value, dict):
+        return {k: _structure(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return tuple(_structure(v) for v in value)
+    if isinstance(value, types.MethodType):
+        return ("method", value.__func__, type(value.__self__))
+    if isinstance(value, types.FunctionType):
+        # Filters are often closures built afresh by each config.build().
+        cells = tuple(cell.cell_contents for cell in value.__closure__ or ())
+        return (
+            "function",
+            value.__code__,
+            _structure(cells),
+            _structure(value.__defaults__),
+            _structure(value.__kwdefaults__),
+        )
+    if isinstance(value, (type, enum.Enum, types.BuiltinFunctionType)):
+        return value
+    if not hasattr(value, "__dict__"):
+        return value
+    return (
+        type(value),
+        {k: _structure(v) for k, v in vars(value).items() if not k.startswith("_")},
+    )
+
+
+def _same_recipe(recipe: QuantizationRecipe, built: QuantizationRecipe) -> bool:
+    """Whether *recipe* has the settings of *built*, kernel lowering aside."""
+    fields = ("calibration", "preprocessing", "param_estimator", "adapter")
+    return all(
+        _structure(getattr(recipe, f)) == _structure(getattr(built, f)) for f in fields
+    )
 
 
 def _calibration_target(model: nn.Module) -> nn.Module:

@@ -134,6 +134,9 @@ class QuantizationManifest(BaseModel):
 
     transforms: list[ManifestTransform] = Field(default_factory=list)
     recipe_config_json: str | None = None
+    # How the recipe was calibrated when not on the whole model at once, see
+    # run_quantization_pipeline(block_calibration=...).
+    block_calibration: Literal["float", "sequential"] | None = None
 
     @property
     def qtensor_params(self) -> dict[str, str]:
@@ -147,6 +150,7 @@ class QuantizationManifest(BaseModel):
 def attach_manifest(
     model: nn.Module,
     recipe_config_json: str | None = None,
+    block_calibration: Literal["float", "sequential"] | None = None,
 ) -> QuantizationManifest:
     """Scan *model* for QTensor parameters and update its manifest.
 
@@ -163,6 +167,8 @@ def attach_manifest(
         recipe_config_json: Optional JSON string of the
             :class:`~neuropress.recipe_config.QuantizationRecipeConfig` used to
             produce *model*.  Stored verbatim in the manifest.
+        block_calibration: Block calibration mode the recipe ran with, if
+            any; recorded alongside *recipe_config_json*.
 
     Returns:
         The :class:`QuantizationManifest` attached to *model*.
@@ -201,6 +207,7 @@ def attach_manifest(
 
     if recipe_config_json is not None:
         manifest.recipe_config_json = recipe_config_json
+        manifest.block_calibration = block_calibration
 
     model.__neuropress_manifest__ = manifest  # type: ignore[attr-defined]
     return manifest

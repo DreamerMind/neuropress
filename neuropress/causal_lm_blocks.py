@@ -30,6 +30,7 @@ import torch
 from torch import nn
 
 from .block_pipeline import BlockQuantizationPipeline
+from .pipeline import QuantizationPipeline
 from .recipe_config import QuantizationRecipeConfig
 
 LOGGER = logging.getLogger(__name__)
@@ -54,7 +55,11 @@ class _Head(nn.Module):
             self.embed_tokens = embed
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.lm_head(self.norm(hidden_states))
+        # The statistics come from hooks; the logits feed nothing, and the
+        # block pipeline would keep both streams of them on the host (about
+        # 40 GB for a 150k vocabulary at 128 x 512 tokens). An empty slice
+        # still runs the head.
+        return self.lm_head(self.norm(hidden_states))[..., :0]
 
 
 class _Stop(Exception):
@@ -84,21 +89,18 @@ def _path_of(model: nn.Module, module: nn.Module) -> str:
     raise ValueError("module not found in the model")
 
 
-def _check_targets(
+def _inside(path: str, prefix: str) -> bool:
+    return path == prefix or path.startswith(f"{prefix}.")
+
+
+def _targets_outside(
     model: nn.Module, config: QuantizationRecipeConfig, prefixes: list[str]
-) -> None:
-    """Refuse targets no block contains: they would silently stay float."""
+) -> list[str]:
+    """Estimator targets that no block contains."""
     estimator = config.build().param_estimator
     estimator.prepare(model)
     targets = {request.target_key for request in estimator.declare_statistics()}
-    outside = sorted(
-        t for t in targets if not any(t == p or t.startswith(f"{p}.") for p in prefixes)
-    )
-    if outside:
-        raise ValueError(
-            "block calibration covers the decoder layers and the LM head; "
-            f"these targets lie outside them: {outside}"
-        )
+    return sorted(t for t in targets if not any(_inside(t, p) for p in prefixes))
 
 
 def _host_tree(value: Any, seen: dict[int, tuple[torch.Tensor, torch.Tensor]]) -> Any:
@@ -189,6 +191,19 @@ def _hidden_states(output: Any) -> torch.Tensor:
     raise TypeError(f"cannot read hidden states from a {type(output).__name__}")
 
 
+def _quantize_outside(
+    model: nn.Module,
+    batches: list[dict[str, Any]],
+    config: QuantizationRecipeConfig,
+    targets: list[str],
+) -> dict[str, str]:
+    """Quantize *targets* in one whole-model pass restricted to them."""
+    pipeline = QuantizationPipeline(config.build())
+    with torch.no_grad():
+        pipeline.run(model, iter(batches), target_paths=set(targets))
+    return dict(pipeline.last_plan.kept_float)
+
+
 def calibrate_causal_lm_blockwise(
     model: nn.Module,
     batches: Iterable[dict[str, Any]],
@@ -200,10 +215,15 @@ def calibrate_causal_lm_blockwise(
 ) -> dict[str, str]:
     """Quantize *model* in place one decoder layer at a time, then its head.
 
+    Estimator targets outside the decoder layers and the head (a vision
+    projector, ...) are quantized in one whole-model pass restricted to them:
+    before the layers are captured with ``"sequential"``, so the layers see
+    them quantized, and after with ``"float"``, so they see a float model as
+    in a whole-model run. That pass is not checkpointed.
+
     Args:
         model: Hugging Face causal LM (``get_decoder().layers``, ``.norm`` and
-            ``.lm_head``). Every estimator target must lie in a decoder layer
-            or the LM head; others are refused before calibration.
+            ``.lm_head``).
         batches: Model inputs (``input_ids``, ...) on the model's device.
         config: Recipe; its kernel lowering is not applied here.
         input_source: ``"float"`` (whole-model statistics) or
@@ -223,7 +243,8 @@ def calibrate_causal_lm_blockwise(
     device = torch.device(device) if device else next(model.parameters()).device
     layer_paths = [_path_of(model, layer) for layer in layers]
     head_path = _path_of(model, model.lm_head)
-    _check_targets(model, config, [*layer_paths, head_path])
+    norm_path = _path_of(model, decoder.norm)
+    outside = _targets_outside(model, config, [*layer_paths, norm_path, head_path])
 
     embed = getattr(decoder, "embed_tokens", None)
     tied = (
@@ -243,9 +264,16 @@ def calibrate_causal_lm_blockwise(
         # only separates model classes in a shared directory.
         run_id=type(model).__name__ if checkpoint_dir is not None else None,
     )
-    student, kwargs_per_layer = _capture(model, layers, batches)
-    reference = student
     kept: dict[str, str] = {}
+    if outside:
+        # Model inputs are token ids: cheap to replay.
+        batches = list(batches)
+        if input_source == "sequential":
+            kept.update(_quantize_outside(model, batches, config, outside))
+    student, kwargs_per_layer = _capture(model, layers, batches)
+    if outside and input_source == "float":
+        kept.update(_quantize_outside(model, batches, config, outside))
+    reference = student
     try:
         for index, (path, layer) in enumerate(zip(layer_paths, layers, strict=True)):
             kwargs = kwargs_per_layer[index]
@@ -276,10 +304,14 @@ def calibrate_causal_lm_blockwise(
             [{"hidden_states": h} for h in student],
             [{"hidden_states": h} for h in reference],
         )
+        head_paths = {
+            "norm": norm_path,
+            "lm_head": head_path,
+            "embed_tokens": _path_of(model, embed) if tied else "",
+        }
         for key, reason in result.kept_float.items():
-            if key.startswith("lm_head"):
-                key = head_path + key.removeprefix("lm_head")
-            kept[key] = reason
+            child, _, rest = key.partition(".")
+            kept[head_paths[child] + (f".{rest}" if rest else "")] = reason
     finally:
         # run_block hands every block back on the host.
         model.to(device)

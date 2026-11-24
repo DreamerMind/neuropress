@@ -204,3 +204,6 @@ def test_no_router_filter_keeps_moe_routers_float():
     assert not keep("model.layers.0.mlp.gate", linear)
     assert not keep("model.layers.0.mlp.shared_expert_gate", linear)
     assert not keep("model.layers.0.block_sparse_moe.router.layer", linear)
+    assert not keep("model.layers.0.feed_forward.router", linear)
+    assert not keep("model.layers.0.mlp.gate.wg", linear)
+    assert keep("model.layers.0.mlp.experts.0.gate_proj", linear)

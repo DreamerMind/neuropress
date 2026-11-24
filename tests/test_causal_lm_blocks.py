@@ -6,13 +6,11 @@ transformers = pytest.importorskip("transformers")
 qwen3 = pytest.importorskip("transformers.models.qwen3")
 qwen3_moe = pytest.importorskip("transformers.models.qwen3_moe")
 
-from neuropress.causal_lm_blocks import (  # noqa: E402
-    _capture,
-    calibrate_causal_lm_blockwise,
-)
+from neuropress.causal_lm_blocks import _capture, _Head  # noqa: E402
 from neuropress.recipe import CalibrationConfig  # noqa: E402
 from neuropress.t2n.registry import (  # noqa: E402
     NEUROPRESS_COMPRESSION,
+    _same_recipe,
     run_quantization_pipeline,
 )
 
@@ -56,17 +54,31 @@ def _hybrid_model() -> nn.Module:
     return qwen3.Qwen3ForCausalLM(cfg).eval()
 
 
-def _quantize(model, entry: str, block_calibration, cache_dir=None):
-    config = NEUROPRESS_COMPRESSION[entry].__config__.model_copy(
+def _projected_moe_model() -> nn.Module:
+    """An MoE model with a linear target outside its decoder layers and head."""
+    model = _moe_model()
+    torch.manual_seed(1)
+    model.model.embed_tokens = nn.Sequential(
+        model.model.embed_tokens, nn.Linear(64, 64, bias=False)
+    )
+    return model
+
+
+def _config(entry: str):
+    return NEUROPRESS_COMPRESSION[entry].__config__.model_copy(
         update={
             "calibration": CalibrationConfig(n_samples=4, seq_len=32, seed=0),
             "kernel_lowering": None,
         }
     )
+
+
+def _quantize(model, entry: str, block_calibration, cache_dir=None, recipe=None):
+    config = _config(entry)
     run_quantization_pipeline(
         model,
         tokenizer=_MockTokenizer(),
-        recipe=config.build(),
+        recipe=recipe if recipe is not None else config.build(),
         recipe_config_json=config.model_dump_json(),
         block_calibration=block_calibration,
         cache_dir=cache_dir,
@@ -89,8 +101,9 @@ def _dense_state(model: nn.Module) -> dict[str, torch.Tensor]:
     [
         (_moe_model, "open_text_c4_gptq_q4_0_moe"),
         (_hybrid_model, "open_text_c4_gptq_q4_0"),
+        (_projected_moe_model, "open_text_c4_gptq_q4_0_moe"),
     ],
-    ids=["moe", "hybrid_attention"],
+    ids=["moe", "hybrid_attention", "target_outside_the_blocks"],
 )
 def test_float_block_calibration_matches_a_whole_model_run(make_model, entry):
     whole = _dense_state(_quantize(make_model(), entry, None))
@@ -115,8 +128,12 @@ def test_float_block_calibration_keeps_the_moe_export_markers():
 def test_sequential_block_calibration_quantizes_every_target():
     from torch_to_nnef.tensor.quant.qtract import QTensorTractScaleOnly
 
-    model = _quantize(_moe_model(), "open_text_c4_gptq_q4_0_moe", "sequential")
+    model = _quantize(
+        _projected_moe_model(), "open_text_c4_gptq_q4_0_moe", "sequential"
+    )
     assert isinstance(model.lm_head.weight, QTensorTractScaleOnly)
+    assert isinstance(model.model.embed_tokens[1].weight, QTensorTractScaleOnly)
+    assert model.__neuropress_manifest__.block_calibration == "sequential"
     for layer in model.model.layers:
         assert isinstance(layer.self_attn.q_proj.weight, QTensorTractScaleOnly)
         assert layer.mlp._t2n_quantize_moe_experts_q40 is True
@@ -148,12 +165,27 @@ def test_capture_keeps_each_layers_own_mask_and_shares_tensors():
     )
 
 
-def test_targets_outside_the_blocks_are_refused():
+def test_head_block_hands_back_no_logits():
     model = _moe_model()
-    model.extra = nn.Linear(64, 64)
-    config = NEUROPRESS_COMPRESSION["open_text_c4_gptq_q4_0_moe"].__config__
-    with pytest.raises(ValueError, match=r"outside them: \['extra'\]"):
-        calibrate_causal_lm_blockwise(model, [], config)
+    head = _Head(model.model.norm, model.lm_head, None)
+    assert head(torch.randn(2, 8, 64)).numel() == 0
+
+
+def test_a_recipe_the_json_does_not_describe_is_refused():
+    other = _config("open_text_c4_gptq_q4_0").build()
+    with pytest.raises(ValueError, match="does not describe the recipe passed"):
+        _quantize(_moe_model(), "open_text_c4_gptq_q4_0_moe", "float", recipe=other)
+
+
+def test_a_recipe_used_before_still_matches_its_json():
+    config = _config("open_text_c4_gptq_q4_0_moe")
+    recipe = config.build()
+    recipe.param_estimator.prepare(_moe_model())
+    assert _same_recipe(recipe, config.build())
+    changed = config.model_copy(
+        update={"calibration": CalibrationConfig(n_samples=8, seq_len=32, seed=0)}
+    )
+    assert not _same_recipe(recipe, changed.build())
 
 
 def test_moe_entry_calibrates_blocks_sequentially():
