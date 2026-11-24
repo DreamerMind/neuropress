@@ -16,13 +16,16 @@ what neuropress hands it:
    parameter under ``"<experts path>/gate_up_proj"`` and
    ``"<experts path>/down_proj"``.
 3. :class:`MoEExpertsQ40Adapter` writes the dequantized values into the
-   float parameters, so the PyTorch model computes what tract will, and marks
+   float parameters, so the PyTorch model computes what tract will (up to
+   the rounding of those values to a bf16 or f16 parameter dtype), and marks
    the parent MoE block with the torch_to_nnef markers:
    ``_t2n_quantize_moe_experts_q40``, ``_t2n_moe_expert_layout = "linear"``
    and a quantizer (:func:`expert_q40_from_gptq_codes`) that returns the
    GPTQ codes instead of recalibrating with min-max. Only the f16 block scales
    are kept; the codes are read back from the float parameters, which hold
-   exactly what they decode to. Checkpoints written by
+   what they decode to (rounded to the parameter dtype, far within the
+   tenth of a step :meth:`_ExpertScales.codes_for` tolerates), so the
+   export stores the exact GPTQ codes. Checkpoints written by
    :func:`.save_quantized_model` keep the scales and restore the markers.
 
 The layout is not a free choice. GPTQ groups run along each expert's input
@@ -44,6 +47,7 @@ from typing import Any, ClassVar, Literal
 
 import torch
 from torch import nn
+from torch_to_nnef.exceptions import T2NErrorImpossibleQuantization
 
 from .adapter import ModuleQuantizationAdapter
 from .calibration.batches import materialize
@@ -76,6 +80,9 @@ _MATCH_STEPS = 0.1
 bf16 rounds a decoded value up to 8 steps from zero by about 3% of a step.
 """
 
+_F16_SUBNORMAL = 2.0**-24
+"""Spacing of f16 subnormals: the absolute error floor of an f16 cast."""
+
 EXPERT_LAYOUT = "linear"
 """The torch_to_nnef expert layout whose last dimension is GPTQ's group axis."""
 
@@ -94,11 +101,15 @@ def _gptq_expert(
     damp_percent: float,
     damp_auto_increment: float,
     name: str,
+    min_tokens: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return GPTQ codes ``[R, C]`` and scales ``[R, C // group_size]``.
 
     An expert no calibration token reached is quantized against an identity
-    Hessian, which reduces GPTQ to round-to-nearest.
+    Hessian, which reduces GPTQ to round-to-nearest. One that saw fewer than
+    *min_tokens* tokens has a Hessian of low rank, which GPTQ would fit to
+    those few tokens; it is shrunk toward the identity (scaled to its mean
+    diagonal) in proportion to the missing tokens.
     """
     gran = Granularity.per_group([group_size])
     calib = GPTQCalibration(
@@ -118,7 +129,16 @@ def _gptq_expert(
     if nsamples == 0:
         hessian = torch.eye(weight.shape[1], device=weight.device)
         nsamples = 1
-    calib.hessian = hessian.to(weight.device, torch.float32)
+    # A copy: GPTQ damps its Hessian in place, and *hessian* may be the
+    # registry's own statistic.
+    hessian = hessian.to(weight.device, torch.float32, copy=True)
+    if nsamples < min_tokens:
+        shrink = 1.0 - nsamples / min_tokens
+        diag = hessian.diagonal()
+        level = diag.mean().clamp(min=torch.finfo(torch.float32).tiny)
+        hessian = (1.0 - shrink) * hessian
+        hessian.diagonal().add_(shrink * level)
+    calib.hessian = hessian
     calib.nsamples = nsamples
     _, scheme, *_ = calib.compute_quantization()
     if not torch.all(scheme.zero_point == 8):
@@ -189,6 +209,8 @@ class GPTQMoEExpertsEstimator(QuantizationParamEstimator):
     keys, so the estimator composes with the ``nn.Linear`` GPTQ estimator.
     Both ``down_proj`` Hessians come from the float ``gate_up_proj``, as all
     statistics of one pipeline run are collected on the float model.
+    Experts that saw fewer than ``min_expert_tokens`` tokens get a Hessian
+    shrunk toward the identity (see :func:`_gptq_expert`).
     """
 
     requires_graph: ClassVar[bool] = False
@@ -196,6 +218,7 @@ class GPTQMoEExpertsEstimator(QuantizationParamEstimator):
     group_size: int = Q40_BLOCK
     damp_percent: float = 0.01
     damp_auto_increment: float = 0.0025
+    min_expert_tokens: int = 64
     filter_fn: Callable[[str, nn.Module], bool] | None = None
 
     _targets: dict[str, nn.Module] = field(
@@ -245,7 +268,12 @@ class GPTQMoEExpertsEstimator(QuantizationParamEstimator):
         """Run GPTQ per expert and plan one Q4_0 tensor per fused parameter."""
         plan = QuantizationPlan()
         for name, mod in self._targets.items():
-            stat = registry.get(StatisticRequest(target_key=name, stat_type=STAT_TYPE))
+            # Not relocated: the stacks stay where collection put them (the
+            # host when the device was short) and cross one expert at a time.
+            stat = registry.get(
+                StatisticRequest(target_key=name, stat_type=STAT_TYPE),
+                relocate=False,
+            )
             if stat is None or stat["nsamples"] is None:
                 for param_name in ("gate_up_proj", "down_proj"):
                     plan.kept_float[f"{name}/{param_name}"] = (
@@ -262,29 +290,41 @@ class GPTQMoEExpertsEstimator(QuantizationParamEstimator):
                     dead,
                     len(counts),
                 )
-            for param_name, hessians in (
-                ("gate_up_proj", stat["gate_up"]),
-                ("down_proj", stat["down"]),
-            ):
-                weight = getattr(mod, param_name)
-                hessians = materialize(hessians)
-                codes, scales = [], []
-                for expert, count in enumerate(counts):
-                    c, s = _gptq_expert(
-                        weight[expert],
-                        hessians[expert],
-                        count,
-                        group_size=self.group_size,
-                        damp_percent=self.damp_percent,
-                        damp_auto_increment=self.damp_auto_increment,
-                        name=f"{name}.{param_name}[{expert}]",
+            planned: dict[str, torch.Tensor] = {}
+            try:
+                for param_name, hessians in (
+                    ("gate_up_proj", stat["gate_up"]),
+                    ("down_proj", stat["down"]),
+                ):
+                    weight = getattr(mod, param_name)
+                    hessians = materialize(hessians)
+                    codes, scales = [], []
+                    for expert, count in enumerate(counts):
+                        c, s = _gptq_expert(
+                            weight[expert],
+                            hessians[expert],
+                            count,
+                            group_size=self.group_size,
+                            damp_percent=self.damp_percent,
+                            damp_auto_increment=self.damp_auto_increment,
+                            name=f"{name}.{param_name}[{expert}]",
+                            min_tokens=self.min_expert_tokens,
+                        )
+                        codes.append(c.cpu())
+                        scales.append(s.float().cpu())
+                    key = f"{name}/{param_name}"
+                    planned[key] = _q40_tensor(
+                        torch.stack(codes), torch.stack(scales), weight.dtype, key
                     )
-                    codes.append(c.cpu())
-                    scales.append(s.float().cpu())
-                key = f"{name}/{param_name}"
-                plan.weight_assignments[key] = _q40_tensor(
-                    torch.stack(codes), torch.stack(scales), weight.dtype, key
-                )
+            except T2NErrorImpossibleQuantization as exc:
+                # Like an nn.Linear the f16 scales cannot hold, the experts
+                # stay float. Both parameters do: the export marks a block
+                # with both expert tensors or neither.
+                LOGGER.warning("%s: experts kept float: %s", name, exc)
+                for param_name in ("gate_up_proj", "down_proj"):
+                    plan.kept_float[f"{name}/{param_name}"] = str(exc)
+                continue
+            plan.weight_assignments.update(planned)
         return plan
 
 
@@ -297,8 +337,9 @@ class GPTQMoEExpertsEstimator(QuantizationParamEstimator):
 class _ExpertScales:
     """f16 Q4_0 block scales ``[E, R, C // 32]`` of one expert weight.
 
-    The codes are not kept: the float parameters hold exactly what they decode
-    to, so :meth:`codes_for` reads them back from the extracted tensor.
+    The codes are not kept: the float parameters hold what they decode to,
+    rounded to the parameter dtype, so :meth:`codes_for` reads them back from
+    the extracted tensor.
     """
 
     name: str
@@ -309,19 +350,27 @@ class _ExpertScales:
 
         A weight must sit within a tenth of a quantization step of a grid
         point (neighboring codes are a whole step apart), which tolerates a
-        cast of the float parameters to f16 or bf16.
+        cast of the float parameters to f16 or bf16. An f16 cast of values on
+        a subnormal grid is off by up to half the f16 subnormal spacing, and a
+        block stored as zeros has a zero scale; both are accepted.
         """
         shape = (*self.scales.shape[:-1], self.scales.shape[-1] * Q40_BLOCK)
         if tuple(tensor.shape) != shape:
             return None
-        values = tensor.detach().float().cpu()
-        step = self.scales.float().repeat_interleave(Q40_BLOCK, dim=-1)
-        levels = (values / step).round()
-        if levels.min() < -8 or levels.max() > 7:
-            return None
-        if not torch.all((values - levels * step).abs() <= _MATCH_STEPS * step):
-            return None
-        return (levels + 8).to(torch.uint8)
+        codes = torch.empty(shape, dtype=torch.uint8)
+        # One expert at a time: float32 temporaries of a whole MoE layer
+        # would be several times its size.
+        for expert in range(shape[0]):
+            values = tensor[expert].detach().float().cpu()
+            step = self.scales[expert].float().cpu().repeat_interleave(Q40_BLOCK, -1)
+            levels = torch.where(step > 0, values / step, 0.0).round()
+            if levels.min() < -8 or levels.max() > 7:
+                return None
+            tolerance = torch.clamp(_MATCH_STEPS * step, min=_F16_SUBNORMAL)
+            if not torch.all((values - levels * step).abs() <= tolerance):
+                return None
+            codes[expert] = (levels + 8).to(torch.uint8)
+        return codes
 
 
 def _decode(qtensor: torch.Tensor, name: str) -> tuple[torch.Tensor, _ExpertScales]:
@@ -414,18 +463,20 @@ def _mark_experts(model: nn.Module, path: str, scales: dict[str, torch.Tensor]) 
     if set(scales) != {"gate_up_proj", "down_proj"}:
         raise ValueError(f"{path}: expected both fused expert assignments")
     setattr(experts, SCALES_ATTR, scales)
-    parent_path = path.rsplit(".", 1)[0] if "." in path else None
-    if parent_path is None:
-        return False
     sources = _layout_candidates(
         _ExpertScales(f"{path}/gate_up_proj", scales["gate_up_proj"]),
         _ExpertScales(f"{path}/down_proj", scales["down_proj"]),
     )
-    return _mark_for_t2n(model.get_submodule(parent_path), sources)
+    return _mark_for_t2n(_experts_parent(model, path), sources)
+
+
+def _experts_parent(model: nn.Module, path: str) -> nn.Module:
+    """The MoE block owning the experts at *path*: *model* itself at top level."""
+    return model.get_submodule(path.rsplit(".", 1)[0]) if "." in path else model
 
 
 def _warn_unmarked(model: nn.Module, path: str) -> None:
-    parent = model.get_submodule(path.rsplit(".", 1)[0]) if "." in path else model
+    parent = _experts_parent(model, path)
     LOGGER.warning(
         "%s: torch_to_nnef has no MoE extractor for %s, experts keep the GPTQ "
         "values as float",
@@ -520,6 +571,7 @@ class GptqMoeExpertsEstimatorConfig(EstimatorConfig):
     group_size: int = Q40_BLOCK
     damp_percent: float = 0.01
     damp_auto_increment: float = 0.0025
+    min_expert_tokens: int = 64
 
     def build(self) -> GPTQMoEExpertsEstimator:
         """Build the estimator."""
@@ -529,6 +581,7 @@ class GptqMoeExpertsEstimatorConfig(EstimatorConfig):
             group_size=self.group_size,
             damp_percent=self.damp_percent,
             damp_auto_increment=self.damp_auto_increment,
+            min_expert_tokens=self.min_expert_tokens,
         )
 
 

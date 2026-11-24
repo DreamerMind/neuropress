@@ -359,7 +359,8 @@ NEUROPRESS_COMPRESSION: dict[str, Any] = {
     # Q4_0 linears plus GPTQ Q4_0 fused MoE experts (one Hessian per expert,
     # from the tokens routed to it). The adapter marks each MoE block for the
     # torch_to_nnef tract_moe_ffn extractor with the linear expert layout and
-    # a quantizer returning these codes, so no export flag is needed.
+    # a quantizer returning these codes, so no export flag is needed. Routers
+    # and shared-expert gates stay float.
     "open_text_c4_gptq_q4_0_moe": _make_entry(
         QuantizationRecipeConfig(
             estimator=CompositeEstimatorConfig(
@@ -367,7 +368,7 @@ NEUROPRESS_COMPRESSION: dict[str, Any] = {
                     GptqEstimatorConfig(
                         group_size=Q4_X_GROUP_SIZE,
                         nbits=4,
-                        weight_transform="q4_0_packed",
+                        weight_transform="q4_0_packed_no_router",
                     ),
                     GptqMoeExpertsEstimatorConfig(group_size=Q4_X_GROUP_SIZE),
                 ]

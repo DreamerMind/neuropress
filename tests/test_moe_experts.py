@@ -127,6 +127,7 @@ def test_pipeline_quantizes_experts_and_marks_the_block():
         damp_percent=0.01,
         damp_auto_increment=0.0025,
         name="ref",
+        min_tokens=GPTQMoEExpertsEstimator().min_expert_tokens,
     )
     deq = (codes.float() - 8).unflatten(-1, (-1, 32)) * scales.half().float().unsqueeze(
         -1
@@ -288,6 +289,8 @@ def test_registry_entry_quantizes_linears_and_experts_of_a_causal_lm():
     )
     for layer in model.model.layers:
         assert isinstance(layer.self_attn.q_proj.weight, QTensorTractScaleOnly)
+        # the router stays float
+        assert not isinstance(layer.mlp.gate.weight, QTensorTractScaleOnly)
         moe = layer.mlp
         assert moe._t2n_moe_expert_layout == "linear"
         assert moe._t2n_quantize_moe_experts_q40_quantizer is expert_q40_from_gptq_codes
@@ -374,3 +377,135 @@ def test_collector_ignores_masked_slots():
     assert stat["nsamples"].tolist() == [2, 3, 1, 1]
     x = hidden[[0, 1, 4]]
     torch.testing.assert_close(stat["gate_up"][1], 2 * x.t() @ x / 3)
+
+
+def test_collector_result_is_scaled_once_and_closes_the_collector():
+    from neuropress.calibration.probe.moe_experts import MoEExpertHessianCollector
+
+    experts = _block().block.experts
+    hidden = torch.randn(4, D)
+    index = torch.tensor([[0, 1], [1, 2], [2, 3], [3, 0]])
+    collector = MoEExpertHessianCollector()
+    collector.update_call(experts, (hidden, index, torch.ones(4, 2)), None)
+    first = collector.result()["gate_up"].clone()
+    torch.testing.assert_close(collector.result()["gate_up"], first)
+    with pytest.raises(RuntimeError, match="already read"):
+        collector.update_call(experts, (hidden, index, torch.ones(4, 2)), None)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_collector_host_fallback_matches_the_device_hessians(monkeypatch):
+    from neuropress.calibration.probe.moe_experts import MoEExpertHessianCollector
+
+    experts = _block().block.experts.cuda()
+    hidden = torch.randn(64, D, device="cuda")
+    index = torch.randint(0, EXPERTS, (64, 2), device="cuda")
+    results = []
+    for host in (False, True):
+        if host:
+            monkeypatch.setattr(
+                MoEExpertHessianCollector,
+                "_device",
+                staticmethod(lambda n, widths, device: torch.device("cpu")),
+            )
+        collector = MoEExpertHessianCollector()
+        for _ in range(3):
+            collector.update_call(experts, (hidden, index, torch.ones(64, 2)), None)
+        results.append(collector.result())
+    assert results[1]["gate_up"].device.type == "cpu"
+    assert results[1]["down"].device.type == "cpu"
+    for key in ("gate_up", "down"):
+        torch.testing.assert_close(results[1][key], results[0][key].cpu())
+
+
+def test_codes_for_accepts_zero_blocks_and_f16_subnormal_grids():
+    from neuropress.moe_experts import _ExpertScales
+
+    scales = torch.tensor([[[2.0**-20, 0.0]]]).half()  # subnormal, stored as zero
+    levels = torch.tensor([*range(-8, 8)] * 2, dtype=torch.float32)
+    values = torch.cat([levels * 2.0**-20, torch.zeros(32)])[None, None]
+    codes = _ExpertScales("w", scales).codes_for(values.half())
+    assert codes is not None
+    assert codes[0, 0, :32].tolist() == [int(v) + 8 for v in levels]
+    assert codes[0, 0, 32:].tolist() == [8] * 32
+
+
+def test_experts_with_few_tokens_lean_toward_round_to_nearest():
+    torch.manual_seed(0)
+    weight = torch.randn(16, 64)
+    x = torch.randn(2, 64)
+    hessian = 2 * x.t() @ x / 2
+    kwargs = {"group_size": 32, "damp_percent": 0.01, "damp_auto_increment": 0.0025}
+    rtn, _ = _gptq_expert(weight, hessian, 0, name="rtn", **kwargs)
+    raw, _ = _gptq_expert(weight, hessian, 2, name="raw", **kwargs)
+    shrunk, _ = _gptq_expert(weight, hessian, 2, name="s", min_tokens=1000, **kwargs)
+    agree = lambda a: (a == rtn).float().mean().item()  # noqa: E731
+    assert agree(shrunk) > agree(raw)
+    assert agree(shrunk) > 0.95
+
+
+def test_few_token_expert_keeps_input_columns_its_tokens_left_at_zero():
+    # Two tokens that are exactly zero on channel 5: a zero Hessian diagonal
+    # entry, which GPTQ would treat as a dead input and zero the column for.
+    torch.manual_seed(0)
+    weight = torch.randn(16, 64)
+    x = torch.randn(2, 64)
+    x[:, 5] = 0
+    hessian = x.t() @ x
+    kwargs = {"group_size": 32, "damp_percent": 0.01, "damp_auto_increment": 0.0025}
+    codes, _ = _gptq_expert(weight, hessian, 2, name="e", min_tokens=64, **kwargs)
+    assert (codes[:, 5] != 8).any()
+
+
+def _collected(model: nn.Module, batches: list[torch.Tensor], path: str):
+    registry = StatisticsRegistry()
+    request = StatisticRequest(target_key=path, stat_type="moe_expert_hessian")
+    registry.register_requests([request])
+    registry.collect(model, batches)
+    estimator = GPTQMoEExpertsEstimator()
+    estimator.prepare(model)
+    return registry, request, estimator
+
+
+def test_estimate_reads_the_hessians_where_they_were_collected():
+    model = _block()
+    registry, request, estimator = _collected(
+        model, _batches(2, seed=10), "block.experts"
+    )
+    before = {k: v.clone() for k, v in registry.get(request).items()}
+    # A relocating read would hand GPTQ meta tensors, which cannot be copied
+    # back to the weights' device.
+    registry.to("meta")
+    plan = estimator.estimate(None, registry, _recipe())
+
+    assert set(plan.weight_assignments) == {
+        "block.experts/gate_up_proj",
+        "block.experts/down_proj",
+    }
+    # GPTQ damps a copy, never the registry's statistic.
+    stat = registry.get(request, relocate=False)
+    for key, value in before.items():
+        torch.testing.assert_close(stat[key], value, rtol=0, atol=0)
+
+
+def test_experts_whose_scales_overflow_f16_stay_float(caplog):
+    model = _block()
+    with torch.no_grad():
+        model.block.experts.down_proj[1, 0, :32] = 1e6
+    float_params = {
+        n: p.detach().clone() for n, p in model.block.experts.named_parameters()
+    }
+    with caplog.at_level("WARNING", logger="neuropress.moe_experts"):
+        QuantizationPipeline(_recipe()).run(model, _batches(2, seed=11))
+
+    assert "experts kept float" in caplog.text
+    assert not hasattr(model.block, "_t2n_quantize_moe_experts_q40")
+    for n, p in model.block.experts.named_parameters():
+        torch.testing.assert_close(p, float_params[n], rtol=0, atol=0)
+
+
+def test_experts_at_the_top_level_mark_the_root_block():
+    model = _block().block
+    QuantizationPipeline(_recipe()).run(model, _batches(2, seed=12))
+    assert model._t2n_quantize_moe_experts_q40 is True
+    assert model._t2n_moe_expert_layout == EXPERT_LAYOUT

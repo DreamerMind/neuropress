@@ -61,6 +61,12 @@ class MoEExpertHessianCollector(InvocationCollector):
         self._gate_up: torch.Tensor | None = None
         self._down: torch.Tensor | None = None
         self._counts: torch.Tensor | None = None
+        self._result: dict[str, Any] | None = None
+        # Host-side Hessians: products wait on the device and cross in
+        # batches of _FLUSH experts, not one transfer per expert and call.
+        self._pending: list[tuple[int, torch.Tensor, torch.Tensor]] = []
+
+    _FLUSH = 8
 
     @torch.no_grad()
     def update_call(self, module: Any, inputs: tuple, output: Any) -> None:
@@ -75,9 +81,20 @@ class MoEExpertHessianCollector(InvocationCollector):
         inter = two_inter // 2
         hidden = hidden.reshape(-1, d_model)
         top_k_index = top_k_index.reshape(hidden.shape[0], -1)
+        if self._result is not None:
+            raise RuntimeError("the expert Hessians were already read")
         if self._gate_up is None:
-            self._gate_up = self._zeros(n_experts, d_model, hidden.device)
-            self._down = self._zeros(n_experts, inter, hidden.device)
+            # Both stacks on one device, decided together.
+            device = self._device(n_experts, (d_model, inter), hidden.device)
+            # Normal tensors even under inference mode, so result() can scale
+            # them in place and GPTQ can damp them.
+            with torch.inference_mode(False):
+                self._gate_up = torch.zeros(
+                    n_experts, d_model, d_model, device=device, dtype=torch.float32
+                )
+                self._down = torch.zeros(
+                    n_experts, inter, inter, device=device, dtype=torch.float32
+                )
             self._counts = torch.zeros(n_experts, dtype=torch.long)
         assert self._down is not None and self._counts is not None
         # Group the (token, slot) pairs by expert with one host sync: a token
@@ -99,24 +116,42 @@ class MoEExpertHessianCollector(InvocationCollector):
             gate, up = nn.functional.linear(x, weight.to(x.dtype)).chunk(2, dim=-1)
             z = (module.act_fn(gate) * up).float()
             x = x.float()
-            self._gate_up[expert] += (x.t() @ x).to(self._gate_up.device)
-            self._down[expert] += (z.t() @ z).to(self._down.device)
             self._counts[expert] += x.shape[0]
+            if self._gate_up.device == x.device:
+                self._gate_up[expert] += x.t() @ x
+                self._down[expert] += z.t() @ z
+            else:
+                self._pending.append((expert, x.t() @ x, z.t() @ z))
+                if len(self._pending) >= self._FLUSH:
+                    self._flush()
+        self._flush()
+
+    def _flush(self) -> None:
+        if not self._pending:
+            return
+        assert self._gate_up is not None and self._down is not None
+        experts = torch.tensor([e for e, _, _ in self._pending])
+        for stack, part in ((self._gate_up, 1), (self._down, 2)):
+            products = torch.stack([item[part] for item in self._pending])
+            stack.index_add_(0, experts, products.to(stack.device))
+        self._pending.clear()
 
     @staticmethod
-    def _zeros(n_experts: int, width: int, device: torch.device) -> torch.Tensor:
-        """``[E, width, width]`` float32 zeros, on the host if the device is short.
+    def _device(
+        n_experts: int, widths: tuple[int, ...], device: torch.device
+    ) -> torch.device:
+        """Where one layer's expert Hessians go: *device*, or the host if short.
 
-        Same rule as :class:`.HessianAccumulator`: one MoE layer's Hessians
-        (every expert) leave the GPU when they would take a large share of its
-        free memory. The products are still computed on the GPU.
+        Same rule as :class:`.HessianAccumulator`: the Hessians of every expert
+        of both stacks leave the GPU together when they would take a large
+        share of its free memory. The products are still computed on the GPU.
         """
         if device.type == "cuda":
-            nbytes = n_experts * width * width * 4
+            nbytes = n_experts * sum(w * w for w in widths) * 4
             free, _ = torch.cuda.mem_get_info(device)
             if nbytes * 2 > free * 0.3:
-                device = torch.device("cpu")
-        return torch.zeros(n_experts, width, width, device=device, dtype=torch.float32)
+                return torch.device("cpu")
+        return device
 
     def result(self) -> dict[str, Any]:
         """Return ``{"gate_up", "down"}`` Hessians stacked per expert and counts.
@@ -125,10 +160,16 @@ class MoEExpertHessianCollector(InvocationCollector):
         """
         if self._gate_up is None:
             return {"gate_up": None, "down": None, "nsamples": None}
-        assert self._down is not None and self._counts is not None
-        scale = (2.0 / self._counts.clamp(min=1).float()).to(self._gate_up.device)
-        return {
-            "gate_up": self._gate_up * scale.view(-1, 1, 1),
-            "down": self._down * scale.view(-1, 1, 1),
-            "nsamples": self._counts,
-        }
+        if self._result is None:
+            assert self._down is not None and self._counts is not None
+            # Scaled in place: a second copy of every Hessian would double the
+            # peak. Further updates are refused from here on.
+            scale = (2.0 / self._counts.clamp(min=1).float()).to(self._gate_up.device)
+            self._gate_up.mul_(scale.view(-1, 1, 1))
+            self._down.mul_(scale.view(-1, 1, 1))
+            self._result = {
+                "gate_up": self._gate_up,
+                "down": self._down,
+                "nsamples": self._counts,
+            }
+        return self._result
