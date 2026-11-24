@@ -298,3 +298,51 @@ def test_recipe_structure_reads_method_instances_partials_and_closures():
         later = 1
 
     _structure(empty_cell())
+
+
+@pytest.mark.parametrize("resumed", [False, True], ids=["fresh", "resumed"])
+def test_mixed_precision_splits_reach_the_checkpoint(tmp_path, resumed):
+    from neuropress.estimator_configs import GptqPanelEstimatorConfig
+    from neuropress.recipe_config import QuantizationRecipeConfig
+    from neuropress.t2n.model_io import load_quantized_model, save_quantized_model
+
+    config = QuantizationRecipeConfig(
+        calibration=CalibrationConfig(n_samples=4, seq_len=32, seed=0),
+        estimator=GptqPanelEstimatorConfig(
+            target="linear", possible_nbits=[4, 8], target_bpw=6.0
+        ),
+    )
+
+    def run():
+        model = _hybrid_model()
+        run_quantization_pipeline(
+            model,
+            tokenizer=_MockTokenizer(),
+            recipe=config.build(),
+            recipe_config_json=config.model_dump_json(),
+            block_calibration="float",
+            cache_dir=tmp_path / "cache",
+            _load_dataset=_mock_load_dataset,
+        )
+        return model
+
+    model = run()
+    if resumed:
+        model = run()
+    split = {
+        path
+        for t in model.__neuropress_manifest__.transforms
+        if getattr(t, "type", None) == "mixed_precision_split"
+        for path in t.modules
+    }
+    assert {"model.layers.0.self_attn.q_proj", "lm_head"} <= split
+    assert type(model.lm_head).__name__ == "MixedPrecisionLinear"
+    for layer in model.model.layers:
+        assert layer.__dict__.get("__neuropress_manifest__") is None
+    path = tmp_path / "model.safetensors"
+    save_quantized_model(model, path, config.model_dump_json())
+    loaded = _hybrid_model()
+    load_quantized_model(loaded, path, kernel_lowering=None)
+    ids = torch.randint(0, 128, (1, 16), generator=torch.Generator().manual_seed(0))
+    with torch.no_grad():
+        torch.testing.assert_close(loaded(ids).logits, model(ids).logits)

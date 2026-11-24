@@ -22,7 +22,7 @@ blocks before it.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any, Literal
 
@@ -32,6 +32,7 @@ from torch import nn
 from .block_pipeline import BlockQuantizationPipeline
 from .pipeline import QuantizationPipeline
 from .recipe_config import QuantizationRecipeConfig
+from .t2n.model_io import MixedPrecisionSplitTransform, QuantizationManifest
 
 LOGGER = logging.getLogger(__name__)
 
@@ -103,6 +104,42 @@ def _check_one_device(model: nn.Module) -> None:
             f"end, to one device; this model is spread over {sorted(devices)}. "
             "Load it on one device, or calibrate it without blocks"
         )
+
+
+def _adopt_splits(
+    model: nn.Module, block: nn.Module, full_path: Callable[[str], str]
+) -> None:
+    """Move the mixed-precision splits *block* recorded into *model*'s manifest.
+
+    The adapter records splits on the module it adapts, here the block, with
+    paths relative to it; a load replays the model's manifest only. The
+    block's QTensor and MoE scale entries are dropped: saving the model
+    rescans both.
+    """
+    manifest = block.__dict__.pop("__neuropress_manifest__", None)
+    if manifest is None:
+        return
+    splits = {
+        full_path(path): spec.model_copy(
+            update={
+                "shares_branches_with": full_path(spec.shares_branches_with)
+                if spec.shares_branches_with
+                else None
+            }
+        )
+        for transform in manifest.transforms
+        if isinstance(transform, MixedPrecisionSplitTransform)
+        for path, spec in transform.modules.items()
+    }
+    if not splits:
+        return
+    root = getattr(model, "__neuropress_manifest__", None)
+    if root is None:
+        root = QuantizationManifest()
+        model.__neuropress_manifest__ = root  # type: ignore[attr-defined]
+    root.transforms.append(
+        MixedPrecisionSplitTransform(type="mixed_precision_split", modules=splits)
+    )
 
 
 def _inside(path: str, prefix: str) -> bool:
@@ -313,6 +350,7 @@ def calibrate_causal_lm_blockwise(
                 ],
             )
             kwargs_per_layer[index] = []
+            _adopt_splits(model, layer, lambda rel, path=path: f"{path}.{rel}")
             student = [_hidden_states(o) for o in result.student_outputs]
             reference = [_hidden_states(o) for o in result.reference_outputs]
             kept.update({f"{path}.{k}": v for k, v in result.kept_float.items()})
@@ -327,9 +365,20 @@ def calibrate_causal_lm_blockwise(
             [{"hidden_states": h} for h in student],
             [{"hidden_states": h} for h in reference],
         )
-        for key, reason in result.kept_float.items():
-            child, _, rest = key.partition(".")
-            kept[head_paths[child] + (f".{rest}" if rest else "")] = reason
+
+        def head_path_of(rel: str) -> str:
+            child, _, rest = rel.partition(".")
+            return head_paths[child] + (f".{rest}" if rest else "")
+
+        # The adapter replaces modules on their parent, here the _Head
+        # (mixed-precision splits): install them on the model too.
+        for child, full in head_paths.items():
+            module = getattr(head, child)
+            if module is not model.get_submodule(full):
+                parent, _, leaf = full.rpartition(".")
+                setattr(model.get_submodule(parent), leaf, module)
+        _adopt_splits(model, head, head_path_of)
+        kept.update({head_path_of(k): v for k, v in result.kept_float.items()})
     finally:
         # run_block hands every block back on the host.
         model.to(device)
