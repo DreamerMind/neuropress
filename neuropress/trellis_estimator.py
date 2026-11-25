@@ -19,7 +19,7 @@ from torch import nn
 
 from .calibration.batches import materialize
 from .calibration.probe import StatisticRequest, StatisticsRegistry
-from .estimator import QuantizationParamEstimator
+from .estimator import QuantizationParamEstimator, UnpreparedTargets
 from .estimators import _add_tied_aliases, collect_target_modules, collect_tied_aliases
 from .graph.graph import QGraph
 from .methods.trellis import TrellisConfig, trellis_quantize
@@ -46,7 +46,7 @@ class TrellisEstimator(QuantizationParamEstimator):
     store: Literal["packed", "dense"] = "packed"
 
     _target_modules: dict[str, nn.Module] = field(
-        default_factory=dict, init=False, repr=False
+        default_factory=UnpreparedTargets, init=False, repr=False
     )
     _tied_aliases: dict[str, list[str]] = field(
         default_factory=dict, init=False, repr=False

@@ -43,7 +43,7 @@ from torch_to_nnef.exceptions import T2NErrorImpossibleQuantization
 
 from .calibration.batches import materialize
 from .calibration.probe import StatisticRequest, StatisticsRegistry
-from .estimator import QuantizationParamEstimator
+from .estimator import QuantizationParamEstimator, UnpreparedTargets
 from .graph.graph import QGraph
 from .methods.correction_mode import CorrectionMode
 from .methods.gptq import GPTQCalibration, _is_conv1d_transpose
@@ -292,7 +292,7 @@ class GPTQEstimator(QuantizationParamEstimator):
 
     # Set by prepare() - not part of the public construction interface.
     _target_modules: dict[str, nn.Module] = field(
-        default_factory=dict, init=False, repr=False, compare=False
+        default_factory=UnpreparedTargets, init=False, repr=False, compare=False
     )
     _tied_aliases: dict[str, list[str]] = field(
         default_factory=dict, init=False, repr=False, compare=False
@@ -563,7 +563,7 @@ class GPTQPanelEstimator(QuantizationParamEstimator):
     damp_auto_increment: float = 0.0025
 
     _target_modules: dict[str, nn.Module] = field(
-        default_factory=dict, init=False, repr=False, compare=False
+        default_factory=UnpreparedTargets, init=False, repr=False, compare=False
     )
     _tied_aliases: dict[str, list[str]] = field(
         default_factory=dict, init=False, repr=False, compare=False
@@ -658,7 +658,7 @@ class MinMaxZpWeightEstimator(QuantizationParamEstimator):
     group_size: int = 32
 
     _target_modules: dict[str, nn.Module] = field(
-        default_factory=dict, init=False, repr=False, compare=False
+        default_factory=UnpreparedTargets, init=False, repr=False, compare=False
     )
     _tied_aliases: dict[str, list[str]] = field(
         default_factory=dict, init=False, repr=False, compare=False
@@ -930,7 +930,7 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
     reconstruction_protect_sink: bool = False
 
     _target_modules: dict[str, nn.Module] = field(
-        default_factory=dict, init=False, repr=False, compare=False
+        default_factory=UnpreparedTargets, init=False, repr=False, compare=False
     )
     _tied_aliases: dict[str, list[str]] = field(
         default_factory=dict, init=False, repr=False, compare=False
@@ -3734,7 +3734,7 @@ class HQQEstimator(QuantizationParamEstimator):
     lp_norm: float = 0.5
 
     _target_modules: dict[str, nn.Module] = field(
-        default_factory=dict, init=False, repr=False, compare=False
+        default_factory=UnpreparedTargets, init=False, repr=False, compare=False
     )
     _tied_aliases: dict[str, list[str]] = field(
         default_factory=dict, init=False, repr=False, compare=False

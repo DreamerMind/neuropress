@@ -24,6 +24,14 @@ _NULL_CACHE: CacheManager = NullCacheManager()
 _DEFAULT_SPANS: SpanCollector = LoggingSpanCollector()
 
 
+class UnpreparedTargets(dict):
+    """Default target dict of an estimator whose ``prepare`` has not run.
+
+    Empty, so code reading targets early sees none, but recognisable by
+    :meth:`QuantizationParamEstimator.declare_targets`, which refuses it.
+    """
+
+
 class QuantizationParamEstimator(ABC):
     """Estimates concrete QSchemes given statistics and backend constraints.
 
@@ -132,8 +140,9 @@ class QuantizationParamEstimator(ABC):
         aliases of a target are not listed; the adapter keeps them tied.
 
         The default reads ``_target_modules``, where estimators that find
-        their targets with :func:`.collect_target_modules` keep them. Others
-        must override it.
+        their targets with :func:`.collect_target_modules` keep them (with
+        :class:`UnpreparedTargets` as the field default). Others must
+        override it.
 
         Raises:
             NotImplementedError: If the estimator does not keep its targets
@@ -143,7 +152,11 @@ class QuantizationParamEstimator(ABC):
         if targets is None:
             raise NotImplementedError(
                 f"{type(self).__name__} does not declare its targets "
-                "(override declare_targets, or call prepare first)"
+                "(override declare_targets)"
+            )
+        if isinstance(targets, UnpreparedTargets):
+            raise NotImplementedError(
+                f"{type(self).__name__}: call prepare before declare_targets"
             )
         return list(targets)
 

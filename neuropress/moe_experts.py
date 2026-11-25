@@ -53,7 +53,7 @@ from .adapter import ModuleQuantizationAdapter
 from .calibration.batches import materialize
 from .calibration.probe import StatisticRequest, StatisticsRegistry
 from .calibration.probe.moe_experts import is_fused_experts
-from .estimator import QuantizationParamEstimator
+from .estimator import QuantizationParamEstimator, UnpreparedTargets
 from .graph.graph import QGraph
 from .methods.gptq import GPTQCalibration
 from .methods.zp_scale_calib import NormZpScaleCalibration
@@ -222,7 +222,7 @@ class GPTQMoEExpertsEstimator(QuantizationParamEstimator):
     filter_fn: Callable[[str, nn.Module], bool] | None = None
 
     _targets: dict[str, nn.Module] = field(
-        default_factory=dict, init=False, repr=False, compare=False
+        default_factory=UnpreparedTargets, init=False, repr=False, compare=False
     )
 
     def prepare(self, model: nn.Module) -> None:
@@ -253,6 +253,10 @@ class GPTQMoEExpertsEstimator(QuantizationParamEstimator):
 
     def declare_targets(self) -> list[str]:
         """Return the paths of the fused expert modules found by :meth:`prepare`."""
+        if isinstance(self._targets, UnpreparedTargets):
+            raise NotImplementedError(
+                "GPTQMoEExpertsEstimator: call prepare before declare_targets"
+            )
         return list(self._targets)
 
     def declare_statistics(self) -> list[StatisticRequest]:

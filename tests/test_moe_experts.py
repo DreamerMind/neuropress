@@ -531,3 +531,28 @@ def test_collector_adds_host_calls_into_device_stacks(monkeypatch):
     for key in ("gate_up", "down"):
         assert result[key].device.type == "cuda"
         torch.testing.assert_close(result[key].cpu(), reference[key])
+
+
+def test_size_estimate_counts_fused_experts_as_q4_0():
+    import math
+
+    from neuropress.eval.size_estimate import collect_estimates
+    from neuropress.t2n.registry import NEUROPRESS_COMPRESSION
+
+    model = _block().block
+    recipe = NEUROPRESS_COMPRESSION["open_text_c4_gptq_q4_0_moe"].__config__.build()
+    estimates, _ = collect_estimates(model, recipe.param_estimator)
+    by_name = {e.name: e for e in estimates}
+    for name in ("experts.gate_up_proj", "experts.down_proj"):
+        param = model.get_parameter(name)
+        assert by_name[name].quant_bytes == math.ceil(param.numel() * 4.5 / 8)
+        assert "Q4_0 experts" in by_name[name].description
+
+
+def test_declare_targets_before_prepare_is_refused():
+    from neuropress.estimators import GPTQEstimator
+    from neuropress.moe_experts import GPTQMoEExpertsEstimator
+
+    for estimator in (GPTQEstimator(), GPTQMoEExpertsEstimator()):
+        with pytest.raises(NotImplementedError, match="call prepare"):
+            estimator.declare_targets()
