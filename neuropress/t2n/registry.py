@@ -223,12 +223,14 @@ def run_quantization_pipeline(
         if kept:
             LOGGER.warning("block calibration kept float: %s", kept)
     else:
+        # Runs the whole recipe, kernel lowering included.
         QuantizationPipeline(recipe).run(model, batches)
     manifest = attach_manifest(model, recipe_config_json=recipe_config_json)
     manifest.block_calibration = block_calibration
-    # Apply kernel lowering eagerly so the model is always in the fast
-    # inference state.  save_quantized_model will unlower transparently.
-    if recipe.kernel_lowering is not None:
+    # Block calibration never lowers: lower once here, after every block, so
+    # the model is in the fast inference state like after a whole-model run.
+    # save_quantized_model unlowers transparently.
+    if block_calibration is not None and recipe.kernel_lowering is not None:
         model.__neuropress_kernel_lowering__ = recipe.kernel_lowering  # type: ignore[attr-defined]
         recipe.kernel_lowering.apply(model)
     _guard_unquantized_linear_dtype(model)

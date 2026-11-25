@@ -288,7 +288,9 @@ def calibrate_causal_lm_blockwise(
         model: Hugging Face causal LM (``get_decoder().layers``, ``.norm`` and
             ``.lm_head``).
         batches: Model inputs (``input_ids``, ...) on the model's device.
-        config: Recipe; its kernel lowering is not applied here.
+        config: Recipe. Its kernel lowering is never applied here, not even
+            by the whole-model pass: lower the model once this returns
+            (:func:`.run_quantization_pipeline` does).
         input_source: ``"float"`` (whole-model statistics) or
             ``"sequential"`` (statistics on quantized upstream activations).
         device: Forward and estimation device; defaults to the model's.
@@ -301,6 +303,9 @@ def calibrate_causal_lm_blockwise(
     Returns:
         The ``kept_float`` reasons of every block, keyed by full module path.
     """
+    # Every pipeline below runs part of the recipe; lowering belongs to the
+    # caller, once all of it has run.
+    config = config.model_copy(update={"kernel_lowering": None})
     decoder = _decoder(model)
     _check_one_device(model)
     layers = decoder.layers
@@ -325,7 +330,7 @@ def calibrate_causal_lm_blockwise(
     outside = _targets_outside(model, config, [*layer_paths, *head_paths.values()])
 
     runner = BlockQuantizationPipeline(
-        config.model_copy(update={"kernel_lowering": None}),
+        config,
         input_source=input_source,
         forward_device=device,
         estimation_device=device,

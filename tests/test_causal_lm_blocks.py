@@ -472,3 +472,43 @@ def test_eval_run_config_records_the_block_calibration_mode(tmp_path, entry, mod
     _write_run_config(args)
     config = json.loads((tmp_path / "run_config.json").read_text())
     assert config["quantization_config"]["block_calibration"] == mode
+
+
+@pytest.mark.parametrize(
+    ("block_calibration", "export"),
+    [("sequential", False), ("float", False), (None, False), ("sequential", True)],
+    ids=["sequential", "float", "whole_model", "export"],
+)
+def test_kernel_lowering_runs_once_after_calibration(
+    monkeypatch, block_calibration, export
+):
+    from neuropress.kernel_lowering import AutoKernelLowering
+
+    entry = "open_text_c4_gptq_q4_0_moe"
+    config = NEUROPRESS_COMPRESSION[entry].__config__.model_copy(
+        update={"calibration": CalibrationConfig(n_samples=4, seq_len=32, seed=0)}
+    )
+    assert config.kernel_lowering is not None
+    model = _projected_moe_model()
+    lowered_when = []
+    monkeypatch.setattr(
+        AutoKernelLowering,
+        "apply",
+        lambda self, m: lowered_when.append(
+            all(
+                getattr(layer.mlp, "_t2n_quantize_moe_experts_q40", False)
+                for layer in model.model.layers
+            )
+        ),
+    )
+    run_quantization_pipeline(
+        model,
+        tokenizer=_MockTokenizer(),
+        recipe=config.build(),
+        recipe_config_json=config.model_dump_json(),
+        block_calibration=block_calibration,
+        _load_dataset=_mock_load_dataset,
+        **({"export_dirpath": "unused"} if export else {}),
+    )
+    # Once, with every layer already calibrated; never on the export path.
+    assert lowered_when == ([] if export else [True])
