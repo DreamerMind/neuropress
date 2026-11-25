@@ -553,7 +553,7 @@ def test_vptq_own_codebooks_may_name_modules_of_other_blocks():
 
     model = _moe_model()
     estimator = VPTQGroupEstimator(
-        own_codebook_modules=("model.layers.0.self_attn.o_proj",)
+        grouping="per_layer", own_codebook_modules=("model.layers.0.self_attn.o_proj",)
     )
     estimator.prepare(BlockAtPaths(model, ["model.layers.1"], entry="model.layers.1"))
     assert "model.layers.1.self_attn.o_proj" in estimator._target_modules
@@ -630,7 +630,7 @@ def test_vptq_own_codebooks_read_the_model_before_blocks_were_adapted():
     model.model.layers[0].self_attn.o_proj = nn.Sequential(nn.Linear(64, 64))
     own = ("model.layers.0.self_attn.o_proj",)
     block = BlockAtPaths(model, ["model.layers.1"], "model.layers.1", layout=layout)
-    VPTQGroupEstimator(own_codebook_modules=own).prepare(block)
+    VPTQGroupEstimator(grouping="per_layer", own_codebook_modules=own).prepare(block)
     stale = BlockAtPaths(model, ["model.layers.1"], "model.layers.1")
     with pytest.raises(ValueError, match="not among the target modules"):
         VPTQGroupEstimator(own_codebook_modules=own).prepare(stale)
@@ -669,3 +669,61 @@ def test_each_stream_carries_its_own_layer_arguments(monkeypatch):
     student, reference = streams["model.layers.0"]
     assert reference[0]["position_embeddings"][0] is float_rope
     assert student[0]["position_embeddings"][0] is quantized_rope
+
+
+@pytest.mark.parametrize("grouping", ["all", "by_type", "by_leaf_name"])
+def test_vptq_refuses_a_pooled_codebook_in_a_block(grouping):
+    from neuropress.block_pipeline import BlockAtPaths
+    from neuropress.estimators import VPTQGroupEstimator
+
+    model = _moe_model()
+    block = BlockAtPaths(model, ["model.layers.1"], entry="model.layers.1")
+    with pytest.raises(ValueError, match="block calibration"):
+        VPTQGroupEstimator(grouping=grouping).prepare(block)
+    # Every target with a codebook of its own pools nothing.
+    VPTQGroupEstimator(
+        grouping=grouping,
+        own_codebook_modules=tuple(
+            n
+            for n, m in model.named_modules()
+            if n.startswith("model.layers.1.") and isinstance(m, nn.Linear)
+        ),
+    ).prepare(block)
+    # Frozen codebooks are only assigned, block by block.
+    VPTQGroupEstimator(
+        grouping=grouping,
+        frozen_centroids_path="books.safetensors",
+        gptq_correction_iters=1,
+    ).prepare(block)
+    # A whole-model run still pools.
+    VPTQGroupEstimator(grouping=grouping).prepare(model)
+
+
+def test_capture_accepts_a_batch_that_sets_use_cache():
+    model = _hybrid_model()
+    ids = torch.randint(0, 128, (1, 16), generator=torch.Generator().manual_seed(0))
+    hidden, kwargs = _capture(
+        model, model.model.layers, [{"input_ids": ids, "use_cache": True}]
+    )
+    assert len(hidden) == 1
+    assert "use_cache" not in kwargs[0][0]
+
+
+def test_capture_drops_the_singular_cache_argument_of_older_layers():
+    class Layer(nn.Module):
+        def forward(self, hidden_states, past_key_value=None, scale=1.0):
+            return hidden_states * scale
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([Layer(), Layer()])
+
+        def forward(self, x, use_cache=True):
+            for layer in self.layers:
+                x = layer(x, past_key_value=object(), scale=2.0)
+            return x
+
+    model = Model()
+    _, kwargs = _capture(model, model.layers, [{"x": torch.ones(1, 2, 4)}])
+    assert kwargs[0][0] == {"scale": 2.0}

@@ -1140,6 +1140,24 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
             raise ValueError(
                 f"own_codebook_modules not among the target modules: {sorted(missing)}"
             )
+        # A grouping that pools layers trains one codebook over every layer
+        # of the model; a block holds a few, so it would train one per block
+        # (more bits, other centroids) without saying so. Frozen codebooks
+        # are trained elsewhere and only assigned here.
+        own = set(self.own_codebook_modules)
+        pooled = [n for n in self._target_modules if n not in own]
+        if (
+            whole_model(model) is not model
+            and self.grouping != "per_layer"
+            and self.frozen_centroids_path is None
+            and pooled
+        ):
+            raise ValueError(
+                f"grouping={self.grouping!r} shares codebooks across the model's "
+                "layers, which block calibration runs one block at a time; use "
+                "grouping='per_layer', own_codebook_modules for every target, or "
+                f"a whole-model run (pooled here: {pooled[:3]}...)"
+            )
         from .transforms.rotation import HadamardInputLinear
 
         # An online rotation wraps a layer and renames its target from

@@ -177,7 +177,10 @@ def _host_tree(value: Any, seen: dict[int, tuple[torch.Tensor, torch.Tensor]]) -
     raise ValueError(f"cannot carry a {type(value).__name__} between decoder blocks")
 
 
-_DROPPED_KWARGS = frozenset({"past_key_values", "use_cache", "output_attentions"})
+# Older transformers pass the cache as past_key_value, newer as past_key_values.
+_DROPPED_KWARGS = frozenset(
+    {"past_key_values", "past_key_value", "use_cache", "output_attentions"}
+)
 
 
 @torch.no_grad()
@@ -225,7 +228,7 @@ def _capture(
             for i, layer in enumerate(layers)
         ]
         try:
-            model(**batch, use_cache=False)
+            model(**{**batch, "use_cache": False})
         except _Stop:
             pass
         finally:
