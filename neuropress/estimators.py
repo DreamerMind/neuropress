@@ -43,7 +43,7 @@ from torch_to_nnef.exceptions import T2NErrorImpossibleQuantization
 
 from .calibration.batches import materialize
 from .calibration.probe import StatisticRequest, StatisticsRegistry
-from .estimator import QuantizationParamEstimator, UnpreparedTargets
+from .estimator import QuantizationParamEstimator, UnpreparedTargets, whole_model
 from .graph.graph import QGraph
 from .methods.correction_mode import CorrectionMode
 from .methods.gptq import GPTQCalibration, _is_conv1d_transpose
@@ -1066,8 +1066,14 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
         self._tied_aliases = collect_tied_aliases(
             model, self.module_classes, self.filter_fn
         )
-        # Fail before calibration, not hours later in _make_groups.
-        missing = set(self.own_codebook_modules) - set(self._target_modules)
+        # Fail before calibration, not hours later in _make_groups. A block
+        # run holds a few layers of the model; the names are checked against
+        # all of it.
+        missing = set(self.own_codebook_modules) - set(
+            collect_target_modules(
+                whole_model(model), self.module_classes, self.filter_fn
+            )
+        )
         if missing:
             raise ValueError(
                 f"own_codebook_modules not among the target modules: {sorted(missing)}"
@@ -1289,12 +1295,9 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
             Mapping from group key to list of ``(name, module)`` pairs.
         """
         groups: dict[str, list[tuple[str, nn.Module]]] = {}
+        # prepare() checked the names against the whole model; a block or
+        # a stage holds only some of them.
         own = set(self.own_codebook_modules)
-        missing = own - set(self._target_modules)
-        if missing:
-            raise ValueError(
-                f"own_codebook_modules not among the target modules: {sorted(missing)}"
-            )
         for name, mod in self._target_modules.items():
             if name in own:
                 key = name

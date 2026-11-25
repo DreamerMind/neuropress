@@ -19,7 +19,7 @@ from torch import nn
 
 from .calibration.batches import materialize
 from .calibration.probe import StatisticRequest, StatisticsRegistry
-from .estimator import QuantizationParamEstimator, UnpreparedTargets
+from .estimator import QuantizationParamEstimator, UnpreparedTargets, whole_model
 from .estimators import _add_tied_aliases, collect_target_modules, collect_tied_aliases
 from .graph.graph import QGraph
 from .methods.trellis import TrellisConfig, trellis_quantize
@@ -76,11 +76,16 @@ class TrellisEstimator(QuantizationParamEstimator):
         self._tied_aliases = collect_tied_aliases(
             model, self.module_classes, self.filter_fn
         )
-        # Seed offsets by position among all linears of the model, not among the selected
-        # targets: a staged run (select_targets) would otherwise restart them every stage
+        # Seed offsets by position among all linears of the whole model, not
+        # among the selected targets or the block at hand: a staged run
+        # (select_targets) or a block run would otherwise restart them. The
+        # adapter keeps quantized linears in place, so the blocks calibrated
+        # before this one still count.
         self._seed_offsets = {
             name: i
-            for i, name in enumerate(collect_target_modules(model, self.module_classes))
+            for i, name in enumerate(
+                collect_target_modules(whole_model(model), self.module_classes)
+            )
         }
         LOGGER.info("TrellisEstimator: %d target modules", len(self._target_modules))
 

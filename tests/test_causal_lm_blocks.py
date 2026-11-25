@@ -167,7 +167,7 @@ def test_capture_keeps_each_layers_own_mask_and_shares_tensors():
 
 def test_head_block_hands_back_no_logits():
     model = _moe_model()
-    head = _Head(model.model.norm, model.lm_head, None)
+    head = _Head(model, "model.norm", "lm_head", None)
     assert head(torch.randn(2, 8, 64)).numel() == 0
 
 
@@ -255,10 +255,19 @@ def test_a_model_spread_over_devices_is_refused():
     from neuropress.causal_lm_blocks import calibrate_causal_lm_blockwise
 
     model = _moe_model()
-    model.hf_device_map = {"model.layers.0": 0, "model.layers.1": "cpu"}
+    model.model.layers[1].to("meta")
+    model.hf_device_map = {"model.layers.0": "cpu", "model.layers.1": "disk"}
     config = NEUROPRESS_COMPRESSION["open_text_c4_gptq_q4_0_moe"].__config__
     with pytest.raises(ValueError, match="spread over"):
         calibrate_causal_lm_blockwise(model, [], config)
+
+
+def test_a_model_gathered_on_one_device_is_accepted_despite_its_old_map():
+    from neuropress.causal_lm_blocks import _check_one_device
+
+    model = _moe_model()
+    model.hf_device_map = {"model.layers.0": 0, "model.layers.1": "cpu"}
+    _check_one_device(model)
 
 
 class _Bounds:
@@ -512,3 +521,80 @@ def test_kernel_lowering_runs_once_after_calibration(
     )
     # Once, with every layer already calibrated; never on the export path.
     assert lowered_when == ([] if export else [True])
+
+
+def test_block_estimators_see_full_model_paths(monkeypatch):
+    from neuropress.estimators import GPTQEstimator
+
+    seen: list[str] = []
+    prepare = GPTQEstimator.prepare
+
+    def spy(self, model):
+        prepare(self, model)
+        seen.extend(self._target_modules)
+
+    monkeypatch.setattr(GPTQEstimator, "prepare", spy)
+    _quantize(_moe_model(), "open_text_c4_gptq_q4_0", "float")
+    assert "model.layers.1.self_attn.q_proj" in seen
+    assert "lm_head" in seen
+    assert all(name.startswith(("model.layers.", "lm_head")) for name in seen)
+
+
+def test_vptq_own_codebooks_may_name_modules_of_other_blocks():
+    from neuropress.block_pipeline import BlockAtPaths
+    from neuropress.estimators import VPTQGroupEstimator
+
+    model = _moe_model()
+    estimator = VPTQGroupEstimator(
+        own_codebook_modules=("model.layers.0.self_attn.o_proj",)
+    )
+    estimator.prepare(BlockAtPaths(model, ["model.layers.1"], entry="model.layers.1"))
+    assert "model.layers.1.self_attn.o_proj" in estimator._target_modules
+    with pytest.raises(ValueError, match="not among the target modules"):
+        VPTQGroupEstimator(own_codebook_modules=("model.layers.9.mlp",)).prepare(
+            BlockAtPaths(model, ["model.layers.1"], entry="model.layers.1")
+        )
+
+
+def test_a_teacher_copy_of_a_block_calls_its_own_modules():
+    import copy
+
+    from neuropress.block_pipeline import BlockAtPaths
+
+    model = _moe_model()
+    block = BlockAtPaths(model, ["model.norm"], entry="model.norm")
+    teacher = copy.deepcopy(block)
+    with torch.no_grad():
+        model.model.norm.weight.zero_()
+    x = torch.randn(2, 4, 64)
+    assert block(x).abs().sum() == 0
+    assert teacher(x).abs().sum() > 0
+    assert sum(p.numel() for p in teacher.parameters()) == 64
+
+
+def test_sequential_teacher_stream_stays_float_with_targets_outside(monkeypatch):
+    from neuropress.block_pipeline import BlockQuantizationPipeline
+    from neuropress.causal_lm_blocks import _capture as capture
+
+    model = _projected_moe_model()
+    ids = torch.randint(0, 128, (1, 32), generator=torch.Generator().manual_seed(0))
+    float_hidden, _ = capture(model, model.model.layers, [{"input_ids": ids}])
+    streams = {}
+    run_block = BlockQuantizationPipeline.run_block
+
+    def spy(self, name, block, student, reference):
+        streams.setdefault(name, (list(student), list(reference)))
+        return run_block(self, name, block, student, reference)
+
+    monkeypatch.setattr(BlockQuantizationPipeline, "run_block", spy)
+    from neuropress.causal_lm_blocks import calibrate_causal_lm_blockwise
+
+    calibrate_causal_lm_blockwise(
+        model,
+        [{"input_ids": ids}],
+        _config("open_text_c4_gptq_q4_0_moe"),
+        input_source="sequential",
+    )
+    student, reference = streams["model.layers.0"]
+    torch.testing.assert_close(reference[0]["hidden_states"], float_hidden[0])
+    assert not torch.equal(student[0]["hidden_states"], float_hidden[0])

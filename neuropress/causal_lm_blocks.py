@@ -22,14 +22,14 @@ blocks before it.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Literal
 
 import torch
 from torch import nn
 
-from .block_pipeline import BlockQuantizationPipeline
+from .block_pipeline import BlockAtPaths, BlockQuantizationPipeline
 from .pipeline import QuantizationPipeline
 from .recipe_config import QuantizationRecipeConfig
 from .t2n.model_io import MixedPrecisionSplitTransform, QuantizationManifest
@@ -39,28 +39,28 @@ LOGGER = logging.getLogger(__name__)
 __all__ = ["calibrate_causal_lm_blockwise"]
 
 
-class _Head(nn.Module):
-    """The final norm and LM head as one block.
+class _Head(BlockAtPaths):
+    """The final norm and LM head as one block, at their model paths.
 
     A tied input embedding is held too, unused by the forward, so the adapter
     sees the tie as it does in a whole-model run.
     """
 
     def __init__(
-        self, norm: nn.Module, lm_head: nn.Module, embed: nn.Module | None
+        self, model: nn.Module, norm: str, lm_head: str, embed: str | None
     ) -> None:
-        super().__init__()
-        self.norm = norm
-        self.lm_head = lm_head
-        if embed is not None:
-            self.embed_tokens = embed
+        super().__init__(model, [norm, lm_head, *([embed] if embed else [])])
+        self._norm = norm
+        self._lm_head = lm_head
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run the head and return no logits."""
         # The statistics come from hooks; the logits feed nothing, and the
         # block pipeline would keep both streams of them on the host (about
         # 40 GB for a 150k vocabulary at 128 x 512 tokens). An empty slice
         # still runs the head.
-        return self.lm_head(self.norm(hidden_states))[..., :0]
+        norm = self.get_submodule(self._norm)
+        return self.get_submodule(self._lm_head)(norm(hidden_states))[..., :0]
 
 
 class _Stop(Exception):
@@ -92,13 +92,15 @@ def _path_of(model: nn.Module, module: nn.Module) -> str:
 
 def _check_one_device(model: nn.Module) -> None:
     """Refuse a model placed across devices: each block moves to one device."""
-    # An accelerate dispatch keeps offloaded weights on "meta", so its map
-    # is read too; its entries (0, "cuda:0", "cpu", "disk") are compared
-    # among themselves only.
-    mapped = {str(d) for d in (getattr(model, "hf_device_map", None) or {}).values()}
     devices = {str(t.device) for t in [*model.parameters(), *model.buffers()]}
-    if len(mapped) > 1 or len(devices) > 1:
-        devices |= mapped
+    # An accelerate dispatch keeps offloaded weights on "meta", which no
+    # move can bring back; its hf_device_map says where they live. The map
+    # is read only then: it outlives a model.to() that gathers the model.
+    if "meta" in devices or len(devices) > 1:
+        if "meta" in devices:
+            devices |= {
+                str(d) for d in (getattr(model, "hf_device_map", None) or {}).values()
+            }
         raise ValueError(
             "block calibration moves each block, and the whole model at the "
             f"end, to one device; this model is spread over {sorted(devices)}. "
@@ -106,40 +108,28 @@ def _check_one_device(model: nn.Module) -> None:
         )
 
 
-def _adopt_splits(
-    model: nn.Module, block: nn.Module, full_path: Callable[[str], str]
-) -> None:
+def _adopt_splits(model: nn.Module, block: BlockAtPaths) -> None:
     """Move the mixed-precision splits *block* recorded into *model*'s manifest.
 
-    The adapter records splits on the module it adapts, here the block, with
-    paths relative to it; a load replays the model's manifest only. The
-    block's QTensor and MoE scale entries are dropped: saving the model
-    rescans both.
+    The adapter records splits on the module it adapts, here the block, under
+    full model paths; a load replays the model's manifest only. The block's
+    QTensor and MoE scale entries are dropped: saving the model rescans both.
     """
     manifest = block.__dict__.pop("__neuropress_manifest__", None)
     if manifest is None:
         return
-    splits = {
-        full_path(path): spec.model_copy(
-            update={
-                "shares_branches_with": full_path(spec.shares_branches_with)
-                if spec.shares_branches_with
-                else None
-            }
-        )
+    splits = [
+        transform
         for transform in manifest.transforms
         if isinstance(transform, MixedPrecisionSplitTransform)
-        for path, spec in transform.modules.items()
-    }
+    ]
     if not splits:
         return
     root = getattr(model, "__neuropress_manifest__", None)
     if root is None:
         root = QuantizationManifest()
         model.__neuropress_manifest__ = root  # type: ignore[attr-defined]
-    root.transforms.append(
-        MixedPrecisionSplitTransform(type="mixed_precision_split", modules=splits)
-    )
+    root.transforms.extend(splits)
 
 
 def _inside(path: str, prefix: str) -> bool:
@@ -274,10 +264,11 @@ def calibrate_causal_lm_blockwise(
     """Quantize *model* in place one decoder layer at a time, then its head.
 
     Estimator targets outside the decoder layers and the head (a vision
-    projector, ...) are quantized in one whole-model pass restricted to them:
-    before the layers are captured with ``"sequential"``, so the layers see
-    them quantized, and after with ``"float"``, so they see a float model as
-    in a whole-model run. That pass is not checkpointed.
+    projector, ...) are quantized in one whole-model pass restricted to them,
+    after the float inputs of the layers are captured, so they see a float
+    model as in a whole-model run. With ``"sequential"`` the layer inputs are
+    captured again after that pass, and the layers are calibrated on them;
+    the teacher stream stays the float one. That pass is not checkpointed.
 
     A tied input embedding shares its weight with the LM head, so it is
     quantized in the head block, after every layer: with ``"sequential"`` the
@@ -320,14 +311,10 @@ def calibrate_causal_lm_blockwise(
         and getattr(embed, "weight", None) is not None
         and embed.weight is getattr(model.lm_head, "weight", None)
     )
-    head = _Head(decoder.norm, model.lm_head, embed if tied else None)
-    head_paths = {
-        "norm": norm_path,
-        "lm_head": head_path,
-        **({"embed_tokens": _path_of(model, embed)} if tied else {}),
-    }
+    head = _Head(model, norm_path, head_path, _path_of(model, embed) if tied else None)
+    head_paths = list(head._paths)
     # A tied embedding is part of the head block, not outside the blocks.
-    outside = _targets_outside(model, config, [*layer_paths, *head_paths.values()])
+    outside = _targets_outside(model, config, [*layer_paths, *head_paths])
 
     runner = BlockQuantizationPipeline(
         config,
@@ -343,18 +330,22 @@ def calibrate_causal_lm_blockwise(
     if outside:
         # Model inputs are token ids: cheap to replay.
         batches = list(batches)
-        if input_source == "sequential":
-            kept.update(_quantize_outside(model, batches, config, outside))
-    student, kwargs_per_layer = _capture(model, layers, batches)
-    if outside and input_source == "float":
+    reference, kwargs_per_layer = _capture(model, layers, batches)
+    student = reference
+    if outside:
         kept.update(_quantize_outside(model, batches, config, outside))
-    reference = student
+        if input_source == "sequential":
+            # The layers calibrate on what the quantized targets feed them;
+            # their teacher outputs still come from the float stream.
+            student, kwargs_per_layer = _capture(model, layers, batches)
     try:
-        for index, (path, layer) in enumerate(zip(layer_paths, layers, strict=True)):
+        for index, path in enumerate(layer_paths):
             kwargs = kwargs_per_layer[index]
+            # Held at its model path, so the recipe sees the model's names.
+            block = BlockAtPaths(model, [path], entry=path)
             result = runner.run_block(
                 path,
-                layer,
+                block,
                 [
                     {"hidden_states": h, **kw}
                     for h, kw in zip(student, kwargs, strict=True)
@@ -365,10 +356,11 @@ def calibrate_causal_lm_blockwise(
                 ],
             )
             kwargs_per_layer[index] = []
-            _adopt_splits(model, layer, lambda rel, path=path: f"{path}.{rel}")
+            block.install(model)
+            _adopt_splits(model, block)
             student = [_hidden_states(o) for o in result.student_outputs]
             reference = [_hidden_states(o) for o in result.reference_outputs]
-            kept.update({f"{path}.{k}": v for k, v in result.kept_float.items()})
+            kept.update(result.kept_float)
             LOGGER.info(
                 "block calibration: %s %s",
                 path,
@@ -380,20 +372,11 @@ def calibrate_causal_lm_blockwise(
             [{"hidden_states": h} for h in student],
             [{"hidden_states": h} for h in reference],
         )
-
-        def head_path_of(rel: str) -> str:
-            child, _, rest = rel.partition(".")
-            return head_paths[child] + (f".{rest}" if rest else "")
-
-        # The adapter replaces modules on their parent, here the _Head
+        # The adapter replaces modules on their parent in the shell
         # (mixed-precision splits): install them on the model too.
-        for child, full in head_paths.items():
-            module = getattr(head, child)
-            if module is not model.get_submodule(full):
-                parent, _, leaf = full.rpartition(".")
-                setattr(model.get_submodule(parent), leaf, module)
-        _adopt_splits(model, head, head_path_of)
-        kept.update({head_path_of(k): v for k, v in result.kept_float.items()})
+        head.install(model)
+        _adopt_splits(model, head)
+        kept.update(result.kept_float)
     finally:
         # run_block hands every block back on the host.
         model.to(device)

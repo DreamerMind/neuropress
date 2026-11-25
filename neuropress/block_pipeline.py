@@ -17,6 +17,7 @@ from torch import nn
 
 from .calibration.batches import call_batch, move_batch
 from .calibration.probe import StatisticsRegistry
+from .estimator import WHOLE_MODEL_ATTR
 from .graph.schedule import QuantizationSchedule
 from .pipeline import QuantizationPipeline
 from .plan import QuantizationPlan
@@ -81,6 +82,65 @@ def _device_kind(device: torch.device) -> str:
     # 'cuda' and 'cuda:0' select the same kernels; only the backend can
     # change the numerics a checkpoint captured.
     return device.type
+
+
+class BlockAtPaths(nn.Module):
+    """Some modules of a model, held at the paths they have in it.
+
+    The estimator, the adapter and the manifest name modules by their path
+    in the module they run on, and recipes name them by their path in the
+    model (trellis ``bits_per_group``, VPTQ ``own_codebook_modules``). Run on
+    a bare decoder layer they would see ``self_attn.q_proj``; run on this
+    shell, ``model.layers.3.self_attn.q_proj``, as in a whole-model run.
+
+    The modules are the model's own, not copies: quantizing them in the shell
+    quantizes the model. A module the adapter *replaces* is replaced in the
+    shell only; :meth:`install` puts it on the model. The whole model is held
+    by a weak reference (see :func:`.estimator.whole_model`), so a deep copy
+    of the shell, such as a frozen teacher, does not copy it.
+
+    The forward calls the module at *entry*; subclasses may override it, and
+    should reach the modules through :meth:`get_submodule` so a deep copy
+    calls its own.
+    """
+
+    def __init__(
+        self, model: nn.Module, paths: Iterable[str], entry: str | None = None
+    ) -> None:
+        super().__init__()
+        self._paths = tuple(paths)
+        if entry is not None and entry not in self._paths:
+            raise ValueError(f"entry {entry!r} is not among the paths")
+        self._entry = entry
+        for path in self._paths:
+            if not path:
+                raise ValueError("the model itself cannot be held at a path")
+            parent: nn.Module = self
+            *outer, leaf = path.split(".")
+            for part in outer:
+                child = parent._modules.get(part)
+                if child is None:
+                    child = nn.Module()
+                    parent.add_module(part, child)
+                parent = child
+            if leaf in parent._modules:
+                raise ValueError(f"{path} overlaps another held path")
+            parent.add_module(leaf, model.get_submodule(path))
+        setattr(self, WHOLE_MODEL_ATTR, weakref.ref(model))
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        """Call the module at *entry*."""
+        if self._entry is None:
+            raise NotImplementedError("no entry module to call")
+        return self.get_submodule(self._entry)(*args, **kwargs)
+
+    def install(self, model: nn.Module) -> None:
+        """Put every held module the adapter replaced on *model*."""
+        for path in self._paths:
+            module = self.get_submodule(path)
+            if module is not model.get_submodule(path):
+                parent, _, leaf = path.rpartition(".")
+                setattr(model.get_submodule(parent), leaf, module)
 
 
 @dataclass

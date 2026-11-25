@@ -504,6 +504,54 @@ def test_experts_whose_scales_overflow_f16_stay_float(caplog):
         torch.testing.assert_close(p, float_params[n], rtol=0, atol=0)
 
 
+@pytest.mark.parametrize(
+    "error", [ValueError("GPTQ: NaN loss encountered"), torch.linalg.LinAlgError("x")]
+)
+def test_experts_gptq_cannot_quantize_stay_float(monkeypatch, error):
+    from neuropress import moe_experts
+
+    def failing(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(moe_experts, "_gptq_expert", failing)
+    model = _block()
+    pipeline = QuantizationPipeline(_recipe())
+    pipeline.run(model, _batches(2, seed=11))
+
+    assert not hasattr(model.block, "_t2n_quantize_moe_experts_q40")
+    assert set(pipeline.last_plan.kept_float) == {
+        "block.experts/gate_up_proj",
+        "block.experts/down_proj",
+    }
+
+
+def test_require_all_quantized_refuses_float_experts(monkeypatch):
+    from neuropress import moe_experts
+
+    def failing(*args, **kwargs):
+        raise ValueError("GPTQ: NaN loss encountered")
+
+    monkeypatch.setattr(moe_experts, "_gptq_expert", failing)
+    recipe = _recipe().model_copy(update={"require_all_quantized": True})
+    model = _block()
+    with pytest.raises(ValueError, match=r"kept 2 float: block\.experts/gate_up_proj"):
+        QuantizationPipeline(recipe).run(model, _batches(2, seed=11))
+    assert not hasattr(model.block, "_t2n_quantize_moe_experts_q40")
+
+
+def test_require_all_quantized_round_trips_and_is_omitted_while_false():
+    from neuropress.estimator_configs import GptqEstimatorConfig
+
+    loose = QuantizationRecipeConfig(estimator=GptqEstimatorConfig())
+    assert "require_all_quantized" not in loose.model_dump_json()
+    assert loose.build().require_all_quantized is False
+
+    strict = loose.model_copy(update={"require_all_quantized": True})
+    again = QuantizationRecipeConfig.model_validate_json(strict.model_dump_json())
+    assert again.require_all_quantized is True
+    assert again.build().require_all_quantized is True
+
+
 def test_experts_at_the_top_level_mark_the_root_block():
     model = _block().block
     QuantizationPipeline(_recipe()).run(model, _batches(2, seed=12))

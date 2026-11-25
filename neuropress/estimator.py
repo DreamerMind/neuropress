@@ -24,6 +24,23 @@ _NULL_CACHE: CacheManager = NullCacheManager()
 _DEFAULT_SPANS: SpanCollector = LoggingSpanCollector()
 
 
+WHOLE_MODEL_ATTR = "_neuropress_whole_model"
+
+
+def whole_model(model: nn.Module) -> nn.Module:
+    """The whole model *model* stands for: itself, unless it is a block.
+
+    A block held at its model paths (:class:`.block_pipeline.BlockAtPaths`)
+    keeps a weak reference to the model it was taken from. Estimators read
+    the whole model for what depends on more than the targets at hand: the
+    position of a layer among all of the model's layers, or whether a module
+    a recipe names exists anywhere in the model.
+    """
+    ref = getattr(model, WHOLE_MODEL_ATTR, None)
+    whole = ref() if ref is not None else None
+    return whole if whole is not None else model
+
+
 class UnpreparedTargets(dict):
     """Default target dict of an estimator whose ``prepare`` has not run.
 

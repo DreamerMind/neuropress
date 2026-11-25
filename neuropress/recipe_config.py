@@ -44,6 +44,7 @@ from pydantic import (
     ConfigDict,
     Field,
     SerializeAsAny,
+    model_serializer,
     model_validator,
 )
 
@@ -356,6 +357,9 @@ class QuantizationRecipeConfig(BaseModel):
         kernel_lowering: Optional kernel lowering config (default: ``auto``).
             Set to ``None`` to keep raw QTensor weights without lowering.
         preprocessing: Ordered list of preprocessing step configs.
+        require_all_quantized: Refuse a plan that keeps any target float
+            (see :class:`.QuantizationRecipe`). Left out of the JSON while
+            false, so recipes that predate it keep their cache fingerprints.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -374,6 +378,15 @@ class QuantizationRecipeConfig(BaseModel):
         default_factory=AutoKernelLoweringConfig
     )
     preprocessing: list[SerializeAsAny[PreprocessingStepConfig]] = []
+    require_all_quantized: bool = False
+
+    @model_serializer(mode="wrap")
+    def _omit_default_strictness(self, handler: Any) -> Any:
+        """Drop ``require_all_quantized`` from the dump while it is false."""
+        data = handler(self)
+        if isinstance(data, dict) and not self.require_all_quantized:
+            data.pop("require_all_quantized", None)
+        return data
 
     @model_validator(mode="before")
     @classmethod
@@ -432,6 +445,7 @@ class QuantizationRecipeConfig(BaseModel):
                 else None
             ),
             preprocessing=[step.build() for step in self.preprocessing],
+            require_all_quantized=self.require_all_quantized,
         )
 
 

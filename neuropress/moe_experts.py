@@ -324,10 +324,17 @@ class GPTQMoEExpertsEstimator(QuantizationParamEstimator):
                     planned[key] = _q40_tensor(
                         torch.stack(codes), torch.stack(scales), weight.dtype, key
                     )
-            except T2NErrorImpossibleQuantization as exc:
-                # Like an nn.Linear the f16 scales cannot hold, the experts
-                # stay float. Both parameters do: the export marks a block
-                # with both expert tensors or neither.
+            except (
+                T2NErrorImpossibleQuantization,
+                ValueError,
+                torch.linalg.LinAlgError,
+            ) as exc:
+                # Like an nn.Linear GPTQ cannot quantize (scales f16 cannot
+                # hold, a Hessian no damping makes positive definite), the
+                # experts stay float and the run goes on; a recipe with
+                # require_all_quantized refuses the plan instead. Both
+                # parameters stay float: the export marks a block with both
+                # expert tensors or neither.
                 LOGGER.warning("%s: experts kept float: %s", name, exc)
                 for param_name in ("gate_up_proj", "down_proj"):
                     plan.kept_float[f"{name}/{param_name}"] = str(exc)

@@ -593,6 +593,7 @@ def _write_run_config(args: argparse.Namespace) -> None:
                 if cfg.kernel_lowering
                 else None
             ),
+            "require_all_quantized": cfg.require_all_quantized,
             # Not part of the recipe: the entry's own argument.
             "block_calibration": getattr(compress_fn, "keywords", {}).get(
                 "block_calibration"

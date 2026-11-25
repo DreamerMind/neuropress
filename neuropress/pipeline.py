@@ -203,6 +203,15 @@ class QuantizationPipeline:
                         f"Stage targets not handled by estimator: {target_paths - assigned}"
                     )
 
+            if self.recipe.require_all_quantized and plan.kept_float:
+                listed = "; ".join(
+                    f"{name}: {reason}" for name, reason in plan.kept_float.items()
+                )
+                raise ValueError(
+                    "The recipe requires every target quantized, but the "
+                    f"estimator kept {len(plan.kept_float)} float: {listed}"
+                )
+
             # -- Step 6: Adapt model (weight assignment + manifest + lowering) -------
             LOGGER.info("Step 6: Adapting model structure")
             self.last_plan = plan
