@@ -593,6 +593,10 @@ def _write_run_config(args: argparse.Namespace) -> None:
                 if cfg.kernel_lowering
                 else None
             ),
+            # Not part of the recipe: the entry's own argument.
+            "block_calibration": getattr(compress_fn, "keywords", {}).get(
+                "block_calibration"
+            ),
         }
 
     run_config = RunConfig(

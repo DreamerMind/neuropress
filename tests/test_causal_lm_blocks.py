@@ -431,3 +431,44 @@ def test_an_estimator_that_cannot_declare_targets_is_refused():
     config = SimpleNamespace(build=lambda: SimpleNamespace(param_estimator=Opaque()))
     with pytest.raises(ValueError, match="must know every target"):
         _targets_outside(_moe_model(), config, [])
+
+
+class _Slotted:
+    __slots__ = ("_cache", "limit")
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self._cache = object()
+
+
+def test_recipe_structure_reads_sets_slots_and_nan():
+    from neuropress.t2n.registry import _structure
+
+    def fresh():
+        return {"names": frozenset({"a", "b"}), "nan": float("nan")}
+
+    assert _structure(fresh()) == _structure(fresh())
+    assert _structure({1, 2}) != _structure({1, 3})
+    assert _structure(_Slotted(1)) == _structure(_Slotted(1))
+    assert _structure(_Slotted(1)) != _structure(_Slotted(2))
+    assert _structure(torch.tensor([float("nan")])) == _structure(
+        torch.tensor([float("nan")])
+    )
+
+
+@pytest.mark.parametrize(
+    ("entry", "mode"),
+    [("open_text_c4_gptq_q4_0_moe", "sequential"), ("open_text_c4_gptq_q4_0", None)],
+)
+def test_eval_run_config_records_the_block_calibration_mode(tmp_path, entry, mode):
+    import argparse
+    import json
+
+    from neuropress.eval.llm_cli import _write_run_config
+
+    args = argparse.Namespace(
+        model="m", compression=entry, tasks=[], output=str(tmp_path / "out.json")
+    )
+    _write_run_config(args)
+    config = json.loads((tmp_path / "run_config.json").read_text())
+    assert config["quantization_config"]["block_calibration"] == mode

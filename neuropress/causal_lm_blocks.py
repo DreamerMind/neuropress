@@ -279,6 +279,11 @@ def calibrate_causal_lm_blockwise(
     them quantized, and after with ``"float"``, so they see a float model as
     in a whole-model run. That pass is not checkpointed.
 
+    A tied input embedding shares its weight with the LM head, so it is
+    quantized in the head block, after every layer: with ``"sequential"`` the
+    layers are calibrated on its float values. Quantizing it first would
+    quantize the head's weight before the head's own calibration.
+
     Args:
         model: Hugging Face causal LM (``get_decoder().layers``, ``.norm`` and
             ``.lm_head``).

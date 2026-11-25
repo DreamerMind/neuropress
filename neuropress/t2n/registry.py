@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import math
 import types
 from functools import partial
 from pathlib import Path
@@ -237,20 +238,54 @@ def run_quantization_pipeline(
 _EMPTY_CELL = object()
 
 
+class _Unordered:
+    """Set contents, equal to another's when its items pair up one to one."""
+
+    def __init__(self, items: list[Any]) -> None:
+        self.items = items
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, _Unordered) or len(self.items) != len(other.items):
+            return False
+        rest = list(other.items)
+        for item in self.items:
+            match = next((i for i, o in enumerate(rest) if o == item), None)
+            if match is None:
+                return False
+            del rest[match]
+        return True
+
+    __hash__ = None  # type: ignore[assignment]
+
+
 def _structure(value: Any, active: frozenset[int] = frozenset()) -> Any:
     """A comparable view of a built recipe component's settings.
 
     Private attributes hold state from earlier runs (prepared targets,
     devices) and are left out. Functions compare by code, defaults and
     closure contents, since filters are often closures built afresh by each
-    ``config.build()``; bound methods by function and instance. A value met
-    again while it is being described compares by type.
+    ``config.build()``; bound methods by function and instance; sets by
+    contents in any order; ``__slots__`` objects by their public slots; NaN
+    equals NaN. A value met again while it is being described compares by
+    type.
     """
     if isinstance(value, (type, enum.Enum, types.ModuleType)):
         return value
+    if isinstance(value, float) and math.isnan(value):
+        return ("nan",)
     if isinstance(value, torch.Tensor):
-        return ("tensor", value.dtype, tuple(value.shape), value.tolist())
-    if not isinstance(value, (dict, list, tuple)) and not hasattr(value, "__dict__"):
+        return ("tensor", value.dtype, tuple(value.shape), _structure(value.tolist()))
+    slots = [
+        name
+        for cls in type(value).__mro__
+        for name in getattr(cls, "__slots__", ())
+        if not name.startswith("_")
+    ]
+    if (
+        not isinstance(value, (dict, list, tuple, set, frozenset))
+        and not hasattr(value, "__dict__")
+        and not slots
+    ):
         return value
     if id(value) in active:
         return ("cycle", type(value))
@@ -263,6 +298,8 @@ def _structure(value: Any, active: frozenset[int] = frozenset()) -> Any:
         return {k: nested(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return tuple(nested(v) for v in value)
+    if isinstance(value, (set, frozenset)):
+        return _Unordered([nested(v) for v in value])
     if isinstance(value, partial):
         return (
             "partial",
@@ -288,9 +325,11 @@ def _structure(value: Any, active: frozenset[int] = frozenset()) -> Any:
         )
     if isinstance(value, types.BuiltinFunctionType):
         return value
+    attributes = dict(getattr(value, "__dict__", {}))
+    attributes.update({k: getattr(value, k) for k in slots if hasattr(value, k)})
     return (
         type(value),
-        {k: nested(v) for k, v in vars(value).items() if not k.startswith("_")},
+        {k: nested(v) for k, v in attributes.items() if not k.startswith("_")},
     )
 
 
