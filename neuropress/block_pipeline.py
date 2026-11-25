@@ -17,7 +17,8 @@ from torch import nn
 
 from .calibration.batches import call_batch, move_batch
 from .calibration.probe import StatisticsRegistry
-from .estimator import WHOLE_MODEL_ATTR
+from .estimator import MODEL_LAYOUT_ATTR, WHOLE_MODEL_ATTR
+from .estimators import ModelLayout, model_layout
 from .graph.schedule import QuantizationSchedule
 from .pipeline import QuantizationPipeline
 from .plan import QuantizationPlan
@@ -102,10 +103,21 @@ class BlockAtPaths(nn.Module):
     The forward calls the module at *entry*; subclasses may override it, and
     should reach the modules through :meth:`get_submodule` so a deep copy
     calls its own.
+
+    *layout* is a :func:`.estimators.model_layout` snapshot of the model
+    before any block was adapted; estimators that number the targets of the
+    whole model (trellis seeds) read it through :func:`.estimators.target_order`,
+    so modules earlier blocks replaced do not shift the numbering. Taken
+    from the model now when not given.
     """
 
     def __init__(
-        self, model: nn.Module, paths: Iterable[str], entry: str | None = None
+        self,
+        model: nn.Module,
+        paths: Iterable[str],
+        entry: str | None = None,
+        *,
+        layout: ModelLayout | None = None,
     ) -> None:
         super().__init__()
         self._paths = tuple(paths)
@@ -127,6 +139,11 @@ class BlockAtPaths(nn.Module):
                 raise ValueError(f"{path} overlaps another held path")
             parent.add_module(leaf, model.get_submodule(path))
         setattr(self, WHOLE_MODEL_ATTR, weakref.ref(model))
+        setattr(
+            self,
+            MODEL_LAYOUT_ATTR,
+            layout if layout is not None else model_layout(model),
+        )
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         """Call the module at *entry*."""

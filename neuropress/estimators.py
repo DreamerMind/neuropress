@@ -43,7 +43,12 @@ from torch_to_nnef.exceptions import T2NErrorImpossibleQuantization
 
 from .calibration.batches import materialize
 from .calibration.probe import StatisticRequest, StatisticsRegistry
-from .estimator import QuantizationParamEstimator, UnpreparedTargets, whole_model
+from .estimator import (
+    MODEL_LAYOUT_ATTR,
+    QuantizationParamEstimator,
+    UnpreparedTargets,
+    whole_model,
+)
 from .graph.graph import QGraph
 from .methods.correction_mode import CorrectionMode
 from .methods.gptq import GPTQCalibration, _is_conv1d_transpose
@@ -80,6 +85,46 @@ def _weight_identity(weight: torch.Tensor) -> tuple[str, int]:
         if not weight.is_meta and weight.numel() > 0:
             return "storage", weight.data_ptr()
     return "object", id(weight)
+
+
+ModelLayout = tuple[tuple[str, type, tuple[str, int] | None], ...]
+
+
+def model_layout(model: nn.Module) -> ModelLayout:
+    """Every module of *model*: its name, class and weight identity.
+
+    A snapshot taken before any part of the model is adapted, so
+    :func:`target_order` can list targets as they were even after earlier
+    blocks replaced modules (mixed-precision splits).
+    """
+    layout = []
+    for name, mod in model.named_modules():
+        w = getattr(mod, "weight", None)
+        key = _weight_identity(w) if isinstance(w, torch.Tensor) else None
+        layout.append((name, type(mod), key))
+    return tuple(layout)
+
+
+def target_order(model: nn.Module, module_classes: tuple[type, ...]) -> list[str]:
+    """Names :func:`collect_target_modules` gives on the whole, unadapted model.
+
+    For a block held at its model paths with a layout snapshot (see
+    :class:`.block_pipeline.BlockAtPaths`), the snapshot is read; otherwise
+    the whole model as it is now.
+    """
+    layout = getattr(model, MODEL_LAYOUT_ATTR, None)
+    if layout is None:
+        return list(collect_target_modules(whole_model(model), module_classes))
+    names, seen = [], set()
+    for name, cls, key in layout:
+        if not issubclass(cls, module_classes):
+            continue
+        if key is not None:
+            if key in seen:
+                continue
+            seen.add(key)
+        names.append(name)
+    return names
 
 
 def _targets_device(
@@ -1067,11 +1112,11 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
             model, self.module_classes, self.filter_fn
         )
         # Fail before calibration, not hours later in _make_groups. A block
-        # run holds a few layers of the model; the names are checked against
-        # all of it.
+        # run holds a few layers of the model and a stage a few targets; the
+        # names are checked against every target of the whole model.
         missing = set(self.own_codebook_modules) - set(
             collect_target_modules(
-                whole_model(model), self.module_classes, self.filter_fn
+                whole_model(model), self.module_classes, self.unstaged_filter()
             )
         )
         if missing:

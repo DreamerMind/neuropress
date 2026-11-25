@@ -51,7 +51,10 @@ class QuantizationRecipe(BaseModel):
             calibration token reached) and report why in
             ``QuantizationPlan.kept_float``. By default the run goes on with
             those targets float; with this set, :class:`.QuantizationPipeline`
-            raises before adapting the model, naming each one.
+            raises, naming each one: before adapting the model for what the
+            estimator kept float, after it for what the adapter's format
+            could not store (a scale out of f16 range), when part of the
+            model is already adapted.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)

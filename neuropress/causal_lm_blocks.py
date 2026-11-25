@@ -30,6 +30,7 @@ import torch
 from torch import nn
 
 from .block_pipeline import BlockAtPaths, BlockQuantizationPipeline
+from .estimators import ModelLayout, model_layout
 from .pipeline import QuantizationPipeline
 from .recipe_config import QuantizationRecipeConfig
 from .t2n.model_io import MixedPrecisionSplitTransform, QuantizationManifest
@@ -47,9 +48,17 @@ class _Head(BlockAtPaths):
     """
 
     def __init__(
-        self, model: nn.Module, norm: str, lm_head: str, embed: str | None
+        self,
+        model: nn.Module,
+        norm: str,
+        lm_head: str,
+        embed: str | None,
+        *,
+        layout: ModelLayout | None = None,
     ) -> None:
-        super().__init__(model, [norm, lm_head, *([embed] if embed else [])])
+        super().__init__(
+            model, [norm, lm_head, *([embed] if embed else [])], layout=layout
+        )
         self._norm = norm
         self._lm_head = lm_head
 
@@ -311,7 +320,15 @@ def calibrate_causal_lm_blockwise(
         and getattr(embed, "weight", None) is not None
         and embed.weight is getattr(model.lm_head, "weight", None)
     )
-    head = _Head(model, norm_path, head_path, _path_of(model, embed) if tied else None)
+    # Taken before anything is adapted, as a whole-model run sees the model.
+    layout = model_layout(model)
+    head = _Head(
+        model,
+        norm_path,
+        head_path,
+        _path_of(model, embed) if tied else None,
+        layout=layout,
+    )
     head_paths = list(head._paths)
     # A tied embedding is part of the head block, not outside the blocks.
     outside = _targets_outside(model, config, [*layer_paths, *head_paths])
@@ -342,7 +359,7 @@ def calibrate_causal_lm_blockwise(
         for index, path in enumerate(layer_paths):
             kwargs = kwargs_per_layer[index]
             # Held at its model path, so the recipe sees the model's names.
-            block = BlockAtPaths(model, [path], entry=path)
+            block = BlockAtPaths(model, [path], entry=path, layout=layout)
             result = runner.run_block(
                 path,
                 block,

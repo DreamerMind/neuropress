@@ -336,8 +336,18 @@ def _structure(value: Any, active: frozenset[int] = frozenset()) -> Any:
 
 
 def _same_recipe(recipe: QuantizationRecipe, built: QuantizationRecipe) -> bool:
-    """Whether *recipe* has the settings of *built*, kernel lowering aside."""
-    fields = ("calibration", "preprocessing", "param_estimator", "adapter")
+    """Whether *recipe* has the settings of *built*, kernel lowering aside.
+
+    The allowed qscheme lists are not compared: the JSON does not set them
+    and no estimator or adapter built from it reads them.
+    """
+    fields = (
+        "calibration",
+        "preprocessing",
+        "param_estimator",
+        "adapter",
+        "require_all_quantized",
+    )
     return all(
         _structure(getattr(recipe, f)) == _structure(getattr(built, f)) for f in fields
     )

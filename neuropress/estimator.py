@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, ClassVar
 
@@ -25,6 +25,7 @@ _DEFAULT_SPANS: SpanCollector = LoggingSpanCollector()
 
 
 WHOLE_MODEL_ATTR = "_neuropress_whole_model"
+MODEL_LAYOUT_ATTR = "_neuropress_model_layout"
 
 
 def whole_model(model: nn.Module) -> nn.Module:
@@ -141,6 +142,9 @@ class QuantizationParamEstimator(ABC):
             )
         paths = frozenset(paths)
         previous = self.filter_fn
+        outermost = "_unstaged_filter" not in self.__dict__
+        if outermost:
+            self._unstaged_filter = previous
         self.filter_fn = lambda name, module: (
             name in paths and (previous is None or previous(name, module))
         )
@@ -148,6 +152,16 @@ class QuantizationParamEstimator(ABC):
             yield
         finally:
             self.filter_fn = previous
+            if outermost:
+                del self._unstaged_filter
+
+    def unstaged_filter(self) -> Callable[[str, nn.Module], bool] | None:
+        """The module filter without the restriction :meth:`select_targets` adds.
+
+        For checks against every target of the model, such as whether a
+        module a recipe names exists, that must not depend on the stage.
+        """
+        return self.__dict__.get("_unstaged_filter", getattr(self, "filter_fn", None))
 
     def declare_targets(self) -> list[str]:
         """Return the module paths this estimator quantizes, after :meth:`prepare`.

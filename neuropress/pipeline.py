@@ -46,6 +46,18 @@ class QuantizationPipeline:
         self.last_plan = QuantizationPlan()
         self._graph_provider = RuntimeModuleGraphProvider()
 
+    def _refuse_float(self, plan: QuantizationPlan, stage: str) -> None:
+        """Raise if the recipe requires every target quantized and one is not."""
+        if not self.recipe.require_all_quantized or not plan.kept_float:
+            return
+        listed = "; ".join(
+            f"{name}: {reason}" for name, reason in plan.kept_float.items()
+        )
+        raise ValueError(
+            "The recipe requires every target quantized, but the "
+            f"{stage} kept {len(plan.kept_float)} float: {listed}"
+        )
+
     def run(
         self,
         model: nn.Module,
@@ -203,19 +215,17 @@ class QuantizationPipeline:
                         f"Stage targets not handled by estimator: {target_paths - assigned}"
                     )
 
-            if self.recipe.require_all_quantized and plan.kept_float:
-                listed = "; ".join(
-                    f"{name}: {reason}" for name, reason in plan.kept_float.items()
-                )
-                raise ValueError(
-                    "The recipe requires every target quantized, but the "
-                    f"estimator kept {len(plan.kept_float)} float: {listed}"
-                )
+            # Before adapting, so a refused plan leaves the model untouched.
+            self._refuse_float(plan, "estimator")
 
             # -- Step 6: Adapt model (weight assignment + manifest + lowering) -------
             LOGGER.info("Step 6: Adapting model structure")
             self.last_plan = plan
             self.recipe.adapter.apply(model, plan)
+            # The adapter keeps float what its format cannot store (a scale
+            # out of f16 range) and adds it to the plan. Some modules are
+            # adapted by then; the run is refused all the same.
+            self._refuse_float(plan, "adapter")
 
             from .t2n.model_io import attach_manifest
 

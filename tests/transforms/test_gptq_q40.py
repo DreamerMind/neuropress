@@ -136,6 +136,22 @@ def test_q40_skips_layer_that_would_decode_outside_f16():
     assert torch.isfinite(weight).all()
 
 
+def test_require_all_quantized_refuses_what_the_adapter_keeps_float():
+    torch.manual_seed(7)
+    model = nn.Sequential(nn.Linear(64, 16, bias=False)).eval()
+    with torch.no_grad():
+        model[0].weight[:, :32] *= 1e6
+    recipe = QuantizationRecipe(
+        param_estimator=GptqEstimatorConfig(
+            group_size=32, weight_transform="q4_0_packed"
+        ).build(),
+        adapter=WeightAssignmentAdapter(),
+        require_all_quantized=True,
+    )
+    with pytest.raises(ValueError, match="adapter kept 1 float: 0: "):
+        QuantizationPipeline(recipe).run(model, [torch.randn(8, 64, 64)])
+
+
 def _run_conv2d(format_name, kernel):
     torch.manual_seed(3)
     model = nn.Sequential(nn.Conv2d(64, 16, kernel, bias=False)).eval()

@@ -177,6 +177,13 @@ def test_a_recipe_the_json_does_not_describe_is_refused():
         _quantize(_moe_model(), "open_text_c4_gptq_q4_0_moe", "float", recipe=other)
 
 
+def test_a_recipe_stricter_than_its_json_is_refused():
+    recipe = _config("open_text_c4_gptq_q4_0_moe").build()
+    strict = recipe.model_copy(update={"require_all_quantized": True})
+    with pytest.raises(ValueError, match="does not describe the recipe passed"):
+        _quantize(_moe_model(), "open_text_c4_gptq_q4_0_moe", "float", recipe=strict)
+
+
 def test_a_recipe_used_before_still_matches_its_json():
     config = _config("open_text_c4_gptq_q4_0_moe")
     recipe = config.build()
@@ -598,3 +605,16 @@ def test_sequential_teacher_stream_stays_float_with_targets_outside(monkeypatch)
     student, reference = streams["model.layers.0"]
     torch.testing.assert_close(reference[0]["hidden_states"], float_hidden[0])
     assert not torch.equal(student[0]["hidden_states"], float_hidden[0])
+
+
+def test_vptq_own_codebooks_may_name_modules_outside_the_stage():
+    from neuropress.estimators import VPTQGroupEstimator
+
+    model = _moe_model()
+    estimator = VPTQGroupEstimator(
+        own_codebook_modules=("model.layers.0.self_attn.o_proj",)
+    )
+    with estimator.select_targets({"model.layers.1.self_attn.q_proj"}):
+        estimator.prepare(model)
+        assert list(estimator._target_modules) == ["model.layers.1.self_attn.q_proj"]
+    assert estimator.unstaged_filter() is estimator.filter_fn is None
