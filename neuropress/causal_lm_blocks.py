@@ -347,17 +347,17 @@ def calibrate_causal_lm_blockwise(
     if outside:
         # Model inputs are token ids: cheap to replay.
         batches = list(batches)
-    reference, kwargs_per_layer = _capture(model, layers, batches)
-    student = reference
+    reference, reference_kwargs = _capture(model, layers, batches)
+    student, student_kwargs = reference, reference_kwargs
     if outside:
         kept.update(_quantize_outside(model, batches, config, outside))
         if input_source == "sequential":
             # The layers calibrate on what the quantized targets feed them;
-            # their teacher outputs still come from the float stream.
-            student, kwargs_per_layer = _capture(model, layers, batches)
+            # their teacher outputs still come from the float stream, with
+            # the float model's layer arguments.
+            student, student_kwargs = _capture(model, layers, batches)
     try:
         for index, path in enumerate(layer_paths):
-            kwargs = kwargs_per_layer[index]
             # Held at its model path, so the recipe sees the model's names.
             block = BlockAtPaths(model, [path], entry=path, layout=layout)
             result = runner.run_block(
@@ -365,14 +365,15 @@ def calibrate_causal_lm_blockwise(
                 block,
                 [
                     {"hidden_states": h, **kw}
-                    for h, kw in zip(student, kwargs, strict=True)
+                    for h, kw in zip(student, student_kwargs[index], strict=True)
                 ],
                 [
                     {"hidden_states": h, **kw}
-                    for h, kw in zip(reference, kwargs, strict=True)
+                    for h, kw in zip(reference, reference_kwargs[index], strict=True)
                 ],
             )
-            kwargs_per_layer[index] = []
+            # The lists may be one; drop this layer's arguments from both.
+            student_kwargs[index] = reference_kwargs[index] = []
             block.install(model)
             _adopt_splits(model, block)
             student = [_hidden_states(o) for o in result.student_outputs]

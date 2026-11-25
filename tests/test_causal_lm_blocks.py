@@ -618,3 +618,54 @@ def test_vptq_own_codebooks_may_name_modules_outside_the_stage():
         estimator.prepare(model)
         assert list(estimator._target_modules) == ["model.layers.1.self_attn.q_proj"]
     assert estimator.unstaged_filter() is estimator.filter_fn is None
+
+
+def test_vptq_own_codebooks_read_the_model_before_blocks_were_adapted():
+    from neuropress.block_pipeline import BlockAtPaths
+    from neuropress.estimators import VPTQGroupEstimator, model_layout
+
+    model = _moe_model()
+    layout = model_layout(model)
+    # An earlier block's adapter split this linear.
+    model.model.layers[0].self_attn.o_proj = nn.Sequential(nn.Linear(64, 64))
+    own = ("model.layers.0.self_attn.o_proj",)
+    block = BlockAtPaths(model, ["model.layers.1"], "model.layers.1", layout=layout)
+    VPTQGroupEstimator(own_codebook_modules=own).prepare(block)
+    stale = BlockAtPaths(model, ["model.layers.1"], "model.layers.1")
+    with pytest.raises(ValueError, match="not among the target modules"):
+        VPTQGroupEstimator(own_codebook_modules=own).prepare(stale)
+
+
+def test_each_stream_carries_its_own_layer_arguments(monkeypatch):
+    import neuropress.causal_lm_blocks as blocks
+    from neuropress.block_pipeline import BlockQuantizationPipeline
+
+    captures = []
+    capture = blocks._capture
+
+    def spy_capture(*args):
+        hidden, kwargs = capture(*args)
+        # The driver empties each layer's arguments once the layer is done.
+        captures.append(kwargs[0][0]["position_embeddings"][0])
+        return hidden, kwargs
+
+    streams = {}
+    run_block = BlockQuantizationPipeline.run_block
+
+    def spy(self, name, block, student, reference):
+        streams.setdefault(name, (list(student), list(reference)))
+        return run_block(self, name, block, student, reference)
+
+    monkeypatch.setattr(blocks, "_capture", spy_capture)
+    monkeypatch.setattr(BlockQuantizationPipeline, "run_block", spy)
+    ids = torch.randint(0, 128, (1, 32), generator=torch.Generator().manual_seed(0))
+    blocks.calibrate_causal_lm_blockwise(
+        _projected_moe_model(),
+        [{"input_ids": ids}],
+        _config("open_text_c4_gptq_q4_0_moe"),
+        input_source="sequential",
+    )
+    float_rope, quantized_rope = captures
+    student, reference = streams["model.layers.0"]
+    assert reference[0]["position_embeddings"][0] is float_rope
+    assert student[0]["position_embeddings"][0] is quantized_rope

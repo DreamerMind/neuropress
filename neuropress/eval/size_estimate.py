@@ -373,6 +373,10 @@ def collect_estimates(
             None,
         )
         if expert_spec is not None:
+            from neuropress.moe_experts import t2n_exports_experts
+
+            # The adapter quantizes them, but the export stores them float.
+            exported = t2n_exports_experts(model, mod_name)
             for param_name in ("gate_up_proj", "down_proj"):
                 param = getattr(mod, param_name)
                 seen_param_ids.add(id(param))
@@ -380,12 +384,16 @@ def collect_estimates(
                     _LayerEstimate(
                         name=f"{mod_name}.{param_name}",
                         module_type=type(mod).__name__,
-                        description=expert_spec.label,
+                        description=expert_spec.label
+                        if exported
+                        else "float (no torch_to_nnef MoE extractor)",
                         n_weight=param.numel(),
                         float_bytes=param.numel() * dtype_bytes,
                         quant_bytes=_packed_bytes(
                             param.numel(), expert_spec.storage_bits
-                        ),
+                        )
+                        if exported
+                        else param.numel() * dtype_bytes,
                     )
                 )
         w = getattr(mod, "weight", None)

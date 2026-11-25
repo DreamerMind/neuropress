@@ -224,29 +224,31 @@ class GPTQMoEExpertsEstimator(QuantizationParamEstimator):
     _targets: dict[str, nn.Module] = field(
         default_factory=UnpreparedTargets, init=False, repr=False, compare=False
     )
+    # Targets whose shapes Q4_0 cannot store, with the reason: kept float
+    # and reported, not left out, so a strict recipe sees them.
+    _unfit: dict[str, str] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     def prepare(self, model: nn.Module) -> None:
         """Find the fused expert modules whose shapes Q4_0 can store."""
         if self.group_size % Q40_BLOCK:
             raise ValueError("Q4_0 needs group_size to be a multiple of 32")
         self._targets = {}
+        self._unfit = {}
         for name, mod in model.named_modules():
             if not is_fused_experts(mod):
                 continue
             if self.filter_fn is not None and not self.filter_fn(name, mod):
                 continue
             _, two_inter, d_model = mod.gate_up_proj.shape
-            if d_model % self.group_size or (two_inter // 2) % self.group_size:
-                LOGGER.warning(
-                    "%s: hidden %d / intermediate %d not multiples of %d, "
-                    "experts stay float",
-                    name,
-                    d_model,
-                    two_inter // 2,
-                    self.group_size,
-                )
-                continue
             self._targets[name] = mod
+            if d_model % self.group_size or (two_inter // 2) % self.group_size:
+                self._unfit[name] = (
+                    f"hidden {d_model} / intermediate {two_inter // 2} not "
+                    f"multiples of group size {self.group_size}"
+                )
+                LOGGER.warning("%s: experts stay float: %s", name, self._unfit[name])
         LOGGER.info(
             "GPTQMoEExpertsEstimator: %d fused expert modules", len(self._targets)
         )
@@ -264,6 +266,7 @@ class GPTQMoEExpertsEstimator(QuantizationParamEstimator):
         return [
             StatisticRequest(target_key=name, stat_type=STAT_TYPE)
             for name in self._targets
+            if name not in self._unfit
         ]
 
     @torch.no_grad()
@@ -276,6 +279,10 @@ class GPTQMoEExpertsEstimator(QuantizationParamEstimator):
         """Run GPTQ per expert and plan one Q4_0 tensor per fused parameter."""
         plan = QuantizationPlan()
         for name, mod in self._targets.items():
+            if name in self._unfit:
+                for param_name in ("gate_up_proj", "down_proj"):
+                    plan.kept_float[f"{name}/{param_name}"] = self._unfit[name]
+                continue
             # Not relocated: the stacks stay where collection put them (the
             # host when the device was short) and cross one expert at a time.
             stat = registry.get(
@@ -430,10 +437,22 @@ def expert_q40_from_gptq_codes(
         ValueError: If no GPTQ source decodes to *tensor*, for instance in
             the canonical layout or after the weights changed.
     """
+    fits = []
     for source in sources:
         codes = source.codes_for(tensor)
         if codes is not None:
-            return _q40_qtensor(codes, source.scales, tensor.dtype, source.name)
+            fits.append(_q40_qtensor(codes, source.scales, tensor.dtype, source.name))
+    if len(fits) == 1:
+        return fits[0]
+    if fits:
+        # w1 and w3 always share a shape, and w2 too when D == I: a tensor of
+        # zero blocks (dead experts) lies on every grid. Keep the source it
+        # decodes closest to; on a tie they decode alike, and the first is
+        # as good as any.
+        target = tensor.detach().float().cpu()
+        return min(
+            fits, key=lambda q: (q.decompress().float().cpu() - target).abs().sum()
+        )
     raise ValueError(
         f"no GPTQ expert codes decode to the {tuple(tensor.shape)} tensor "
         f"torch_to_nnef extracted; GPTQ Q4_0 experts need expert layout "
@@ -493,14 +512,30 @@ def _experts_parent(model: nn.Module, path: str) -> nn.Module:
     return model.get_submodule(path.rsplit(".", 1)[0]) if "." in path else model
 
 
-def _warn_unmarked(model: nn.Module, path: str) -> None:
-    parent = _experts_parent(model, path)
-    LOGGER.warning(
-        "%s: torch_to_nnef has no MoE extractor for %s, experts keep the GPTQ "
-        "values as float",
-        path,
-        type(parent).__name__,
+def t2n_exports_experts(model: nn.Module, path: str) -> bool:
+    """Whether torch_to_nnef has a MoE extractor for the block owning *path*.
+
+    Without one, the experts at *path* export float whatever they hold.
+    """
+    from torch_to_nnef.exceptions import T2NErrorNotImplemented
+    from torch_to_nnef.op.custom_extractors.moe import _get_adapter
+
+    try:
+        _get_adapter(_experts_parent(model, path))
+    except T2NErrorNotImplemented:
+        return False
+    return True
+
+
+def _warn_unmarked(model: nn.Module, path: str) -> str:
+    """Log that the experts at *path* export float, and return why."""
+    reason = (
+        f"torch_to_nnef has no MoE extractor for "
+        f"{type(_experts_parent(model, path)).__name__}, experts keep the GPTQ "
+        "values as float"
     )
+    LOGGER.warning("%s: %s", path, reason)
+    return reason
 
 
 class MoEExpertsQ40Adapter(ModuleQuantizationAdapter):
@@ -510,7 +545,8 @@ class MoEExpertsQ40Adapter(ModuleQuantizationAdapter):
     their f16 block scales on the experts module (:data:`SCALES_ATTR`, saved
     and restored by :mod:`neuropress.t2n.model_io`) and sets the torch_to_nnef
     markers on the MoE block owning the experts. A block torch_to_nnef has no
-    MoE extractor for keeps the dequantized float values, with a warning.
+    MoE extractor for keeps the dequantized float values, with a warning,
+    and is added to the plan's ``kept_float``.
     """
 
     @torch.no_grad()
@@ -525,6 +561,7 @@ class MoEExpertsQ40Adapter(ModuleQuantizationAdapter):
                 continue
             mod = model.get_submodule(path)
             if not is_fused_experts(mod):
+                plan.kept_float[key] = "not a fused experts module"
                 continue
             values, scales = _decode(value, key)
             param = getattr(mod, param_name)
@@ -535,7 +572,11 @@ class MoEExpertsQ40Adapter(ModuleQuantizationAdapter):
             if _mark_experts(model, path, scales):
                 marked += 1
             else:
-                _warn_unmarked(model, path)
+                # The values sit on the Q4_0 grid, but the export stores them
+                # float: reported like any target its format cannot store.
+                reason = _warn_unmarked(model, path)
+                for param_name in scales:
+                    plan.kept_float[f"{path}/{param_name}"] = reason
         LOGGER.info(
             "MoEExpertsQ40Adapter: %d expert modules quantized, %d marked for "
             "torch_to_nnef",

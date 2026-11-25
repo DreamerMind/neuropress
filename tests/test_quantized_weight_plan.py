@@ -176,3 +176,17 @@ def test_lowered_linear_roundtrip_preserves_codes(format_name):
         inputs, restored.qscheme.dequantize(selected, torch.float32)
     )
     torch.testing.assert_close(lowered(inputs), expected)
+
+
+def test_panel_gptq_reports_layers_it_cannot_split_into_panels():
+    torch.manual_seed(3)
+    model = nn.Sequential(nn.Linear(48, 16, bias=False))
+    estimator = GPTQPanelEstimator(
+        module_classes=(nn.Linear,),
+        group_size=32,
+        possible_nbits=[2, 4],
+        target_bpw=3.5,
+    )
+    plan = estimate(estimator, model, [torch.randn(4, 64, 48)])
+    assert plan.weight_assignments == {}
+    assert "not divisible" in plan.kept_float["0"]

@@ -105,20 +105,34 @@ def model_layout(model: nn.Module) -> ModelLayout:
     return tuple(layout)
 
 
-def target_order(model: nn.Module, module_classes: tuple[type, ...]) -> list[str]:
+def target_order(
+    model: nn.Module,
+    module_classes: tuple[type, ...],
+    filter_fn: Callable[[str, nn.Module], bool] | None = None,
+) -> list[str]:
     """Names :func:`collect_target_modules` gives on the whole, unadapted model.
 
     For a block held at its model paths with a layout snapshot (see
     :class:`.block_pipeline.BlockAtPaths`), the snapshot is read; otherwise
-    the whole model as it is now.
+    the whole model as it is now. *filter_fn* sees the module now at each
+    path; one an earlier block replaced (a mixed-precision split) is no
+    longer the module the filter was written for, and is kept.
     """
+    whole = whole_model(model)
     layout = getattr(model, MODEL_LAYOUT_ATTR, None)
     if layout is None:
-        return list(collect_target_modules(whole_model(model), module_classes))
+        return list(collect_target_modules(whole, module_classes, filter_fn))
     names, seen = [], set()
     for name, cls, key in layout:
         if not issubclass(cls, module_classes):
             continue
+        if filter_fn is not None:
+            try:
+                live = whole.get_submodule(name)
+            except AttributeError:
+                live = None
+            if isinstance(live, module_classes) and not filter_fn(name, live):
+                continue
         if key is not None:
             if key in seen:
                 continue
@@ -671,7 +685,11 @@ class GPTQPanelEstimator(QuantizationParamEstimator):
                 LOGGER.error("Panel GPTQ failed for '%s': %s - skipping", name, exc)
                 kept_float[name] = str(exc)
                 continue
-            if assignment is not None:
+            if assignment is None:
+                kept_float[name] = (
+                    f"weight columns not divisible into {self.group_size}-wide panels"
+                )
+            else:
                 assignments[name] = assignment
         return QuantizationPlan(
             weight_assignments=_add_tied_aliases(assignments, self._tied_aliases),
@@ -1113,11 +1131,10 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
         )
         # Fail before calibration, not hours later in _make_groups. A block
         # run holds a few layers of the model and a stage a few targets; the
-        # names are checked against every target of the whole model.
+        # names are checked against every target of the whole model, as it
+        # was before any block was adapted.
         missing = set(self.own_codebook_modules) - set(
-            collect_target_modules(
-                whole_model(model), self.module_classes, self.unstaged_filter()
-            )
+            target_order(model, self.module_classes, self.unstaged_filter())
         )
         if missing:
             raise ValueError(

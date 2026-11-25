@@ -604,3 +604,66 @@ def test_declare_targets_before_prepare_is_refused():
     for estimator in (GPTQEstimator(), GPTQMoEExpertsEstimator()):
         with pytest.raises(NotImplementedError, match="call prepare"):
             estimator.declare_targets()
+
+
+class _UnknownMoeBlock(qwen3.Qwen3MoeSparseMoeBlock):
+    pass
+
+
+def test_experts_without_an_extractor_are_reported_and_refused_when_strict():
+    model = _block()
+    model.block.__class__ = _UnknownMoeBlock
+    pipeline = QuantizationPipeline(_recipe())
+    pipeline.run(model, _batches(2, seed=7))
+    assert set(pipeline.last_plan.kept_float) == {
+        "block.experts/gate_up_proj",
+        "block.experts/down_proj",
+    }
+    assert (
+        "no MoE extractor" in pipeline.last_plan.kept_float["block.experts/down_proj"]
+    )
+
+    model = _block()
+    model.block.__class__ = _UnknownMoeBlock
+    strict = _recipe().model_copy(update={"require_all_quantized": True})
+    with pytest.raises(ValueError, match="adapter kept 2 float"):
+        QuantizationPipeline(strict).run(model, _batches(2, seed=7))
+
+
+def test_experts_whose_shapes_q4_0_cannot_group_are_reported():
+    estimator = GPTQMoEExpertsEstimator(group_size=64)
+    recipe = QuantizationRecipe(
+        param_estimator=CompositeEstimator(estimators=[estimator]),
+        adapter=CompositeAdapter([WeightAssignmentAdapter(), MoEExpertsQ40Adapter()]),
+    )
+    pipeline = QuantizationPipeline(recipe)
+    pipeline.run(_block(), _batches(2, seed=7))
+    assert (
+        "not multiples of group size 64"
+        in (pipeline.last_plan.kept_float["block.experts/gate_up_proj"])
+    )
+    assert estimator.declare_targets() == ["block.experts"]
+
+
+def test_size_estimate_counts_experts_the_export_keeps_float_as_float():
+    from neuropress.eval.size_estimate import collect_estimates
+    from neuropress.t2n.registry import NEUROPRESS_COMPRESSION
+
+    model = _block().block
+    model.__class__ = _UnknownMoeBlock
+    recipe = NEUROPRESS_COMPRESSION["open_text_c4_gptq_q4_0_moe"].__config__.build()
+    estimates, _ = collect_estimates(model, recipe.param_estimator)
+    by_name = {e.name: e for e in estimates}
+    for name in ("experts.gate_up_proj", "experts.down_proj"):
+        assert by_name[name].quant_bytes == by_name[name].float_bytes
+        assert "no torch_to_nnef MoE extractor" in by_name[name].description
+
+
+def test_a_tensor_on_several_grids_takes_the_closest_source():
+    from neuropress.moe_experts import _ExpertScales
+
+    values = torch.arange(-8, 8, dtype=torch.float32).repeat(2).reshape(1, 1, 32)
+    near = _ExpertScales("near", torch.ones(1, 1, 1, dtype=torch.float16))
+    far = _ExpertScales("far", torch.full((1, 1, 1), 1.0078125, dtype=torch.float16))
+    q = expert_q40_from_gptq_codes(values, sources=[far, near])
+    torch.testing.assert_close(q.decompress().float(), values, rtol=0, atol=0)
