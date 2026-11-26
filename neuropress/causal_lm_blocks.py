@@ -76,6 +76,19 @@ class _Stop(Exception):
     """Ends the capture forward after the last decoder layer's inputs."""
 
 
+# What decoders call the norm applied after their last layer: most name it
+# norm; Jamba final_layernorm; LFM2 embedding_norm.
+_FINAL_NORM_NAMES = ("norm", "final_layernorm", "embedding_norm")
+
+
+def _final_norm(decoder: nn.Module) -> nn.Module | None:
+    for name in _FINAL_NORM_NAMES:
+        norm = getattr(decoder, name, None)
+        if isinstance(norm, nn.Module):
+            return norm
+    return None
+
+
 def _decoder(model: nn.Module) -> nn.Module:
     get_decoder = getattr(model, "get_decoder", None)
     decoder = get_decoder() if callable(get_decoder) else None
@@ -85,8 +98,11 @@ def _decoder(model: nn.Module) -> nn.Module:
             f"{type(model).__name__}: block calibration needs a Hugging Face "
             "causal LM whose get_decoder() holds the decoder layers as .layers"
         )
-    if not isinstance(getattr(decoder, "norm", None), nn.Module):
-        raise ValueError(f"{type(decoder).__name__}: no final .norm to calibrate")
+    if _final_norm(decoder) is None:
+        raise ValueError(
+            f"{type(decoder).__name__}: no final norm to calibrate "
+            f"(looked for {', '.join(_FINAL_NORM_NAMES)})"
+        )
     if not isinstance(getattr(model, "lm_head", None), nn.Module):
         raise ValueError(f"{type(model).__name__}: no .lm_head to calibrate")
     return decoder
@@ -288,7 +304,8 @@ def calibrate_causal_lm_blockwise(
     quantize the head's weight before the head's own calibration.
 
     Args:
-        model: Hugging Face causal LM (``get_decoder().layers``, ``.norm`` and
+        model: Hugging Face causal LM (``get_decoder().layers``, a final
+            norm (``.norm``, ``.final_layernorm`` or ``.embedding_norm``) and
             ``.lm_head``).
         batches: Model inputs (``input_ids``, ...) on the model's device.
         config: Recipe. Its kernel lowering is never applied here, not even
@@ -315,7 +332,7 @@ def calibrate_causal_lm_blockwise(
     device = torch.device(device) if device else next(model.parameters()).device
     layer_paths = [_path_of(model, layer) for layer in layers]
     head_path = _path_of(model, model.lm_head)
-    norm_path = _path_of(model, decoder.norm)
+    norm_path = _path_of(model, _final_norm(decoder))
 
     embed = getattr(decoder, "embed_tokens", None)
     tied = (

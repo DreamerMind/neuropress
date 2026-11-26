@@ -727,3 +727,89 @@ def test_capture_drops_the_singular_cache_argument_of_older_layers():
     model = Model()
     _, kwargs = _capture(model, model.layers, [{"x": torch.ones(1, 2, 4)}])
     assert kwargs[0][0] == {"scale": 2.0}
+
+
+def _jamba_model() -> nn.Module:
+    cfg = transformers.JambaConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        num_experts=4,
+        num_experts_per_tok=2,
+        expert_layer_period=1,
+        expert_layer_offset=0,
+        attn_layer_period=2,
+        attn_layer_offset=1,
+        mamba_d_state=8,
+        use_mamba_kernels=False,
+    )
+    torch.manual_seed(0)
+    return transformers.JambaForCausalLM(cfg).eval()
+
+
+def _lfm2_moe_model() -> nn.Module:
+    cfg = transformers.Lfm2MoeConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=64,
+        moe_intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        num_experts=4,
+        num_experts_per_tok=2,
+        num_dense_layers=0,
+        layer_types=["conv", "full_attention"],
+    )
+    torch.manual_seed(0)
+    return transformers.Lfm2MoeForCausalLM(cfg).eval()
+
+
+@pytest.mark.parametrize(
+    ("make_model", "norm"),
+    [(_jamba_model, "final_layernorm"), (_lfm2_moe_model, "embedding_norm")],
+)
+def test_block_calibration_finds_a_final_norm_under_other_names(
+    make_model, norm, monkeypatch
+):
+    from neuropress.causal_lm_blocks import calibrate_causal_lm_blockwise
+
+    model = make_model()
+    heads = []
+    original = _Head.__init__
+
+    def spy(self, model, norm_path, *args, **kwargs):
+        heads.append(norm_path)
+        original(self, model, norm_path, *args, **kwargs)
+
+    monkeypatch.setattr(_Head, "__init__", spy)
+    ids = torch.randint(0, 128, (1, 32), generator=torch.Generator().manual_seed(0))
+    kept = calibrate_causal_lm_blockwise(
+        model, [{"input_ids": ids}], _config("open_text_c4_gptq_q4_0_moe")
+    )
+    assert heads == [f"model.{norm}"]
+    # torch_to_nnef exports neither family's experts; they are reported.
+    assert all("no MoE extractor" in reason for reason in kept.values())
+    assert kept
+
+
+def test_block_calibration_refuses_preprocessing_before_touching_the_model():
+    from neuropress.causal_lm_blocks import calibrate_causal_lm_blockwise
+    from neuropress.recipe_config import QuantizationRecipeConfig
+
+    model = _projected_moe_model()
+    before = {k: v.clone() for k, v in model.state_dict().items()}
+    config = QuantizationRecipeConfig.model_validate(
+        {
+            **_config("open_text_c4_gptq_q4_0_moe").model_dump(),
+            "preprocessing": [{"type": "smooth_quant", "alpha": 0.5}],
+        }
+    )
+    ids = torch.randint(0, 128, (1, 32), generator=torch.Generator().manual_seed(0))
+    with pytest.raises(ValueError, match="preprocessing before block calibration"):
+        calibrate_causal_lm_blockwise(model, [{"input_ids": ids}], config)
+    for key, value in model.state_dict().items():
+        assert torch.equal(value, before[key]), key
