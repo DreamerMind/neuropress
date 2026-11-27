@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, ClassVar
 
@@ -24,12 +24,38 @@ _NULL_CACHE: CacheManager = NullCacheManager()
 _DEFAULT_SPANS: SpanCollector = LoggingSpanCollector()
 
 
+WHOLE_MODEL_ATTR = "_neuropress_whole_model"
+MODEL_LAYOUT_ATTR = "_neuropress_model_layout"
+
+
+def whole_model(model: nn.Module) -> nn.Module:
+    """The whole model *model* stands for: itself, unless it is a block.
+
+    A block held at its model paths (:class:`.block_pipeline.BlockAtPaths`)
+    keeps a weak reference to the model it was taken from. Estimators read
+    the whole model for what depends on more than the targets at hand: the
+    position of a layer among all of the model's layers, or whether a module
+    a recipe names exists anywhere in the model.
+    """
+    ref = getattr(model, WHOLE_MODEL_ATTR, None)
+    whole = ref() if ref is not None else None
+    return whole if whole is not None else model
+
+
+class UnpreparedTargets(dict):
+    """Default target dict of an estimator whose ``prepare`` has not run.
+
+    Empty, so code reading targets early sees none, but recognisable by
+    :meth:`QuantizationParamEstimator.declare_targets`, which refuses it.
+    """
+
+
 class QuantizationParamEstimator(ABC):
     """Estimates concrete QSchemes given statistics and backend constraints.
 
     Responsibilities:
 
-    1. Declare subgraphs / targets to quantize.
+    1. Declare the targets to quantize (:meth:`declare_targets`).
     2. Declare required statistics.
     3. Select QScheme(s) from allowed descriptors.
     4. Return a QuantizationPlan.
@@ -116,6 +142,9 @@ class QuantizationParamEstimator(ABC):
             )
         paths = frozenset(paths)
         previous = self.filter_fn
+        outermost = "_unstaged_filter" not in self.__dict__
+        if outermost:
+            self._unstaged_filter = previous
         self.filter_fn = lambda name, module: (
             name in paths and (previous is None or previous(name, module))
         )
@@ -123,6 +152,44 @@ class QuantizationParamEstimator(ABC):
             yield
         finally:
             self.filter_fn = previous
+            if outermost:
+                del self._unstaged_filter
+
+    def unstaged_filter(self) -> Callable[[str, nn.Module], bool] | None:
+        """The module filter without the restriction :meth:`select_targets` adds.
+
+        For checks against every target of the model, such as whether a
+        module a recipe names exists, that must not depend on the stage.
+        """
+        return self.__dict__.get("_unstaged_filter", getattr(self, "filter_fn", None))
+
+    def declare_targets(self) -> list[str]:
+        """Return the module paths this estimator quantizes, after :meth:`prepare`.
+
+        Not derivable from :meth:`declare_statistics`: estimators that work
+        from the weights alone (min-max, HQQ) request no statistics. Tied
+        aliases of a target are not listed; the adapter keeps them tied.
+
+        The default reads ``_target_modules``, where estimators that find
+        their targets with :func:`.collect_target_modules` keep them (with
+        :class:`UnpreparedTargets` as the field default). Others must
+        override it.
+
+        Raises:
+            NotImplementedError: If the estimator does not keep its targets
+                there, or :meth:`prepare` has not run.
+        """
+        targets = getattr(self, "_target_modules", None)
+        if targets is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not declare its targets "
+                "(override declare_targets)"
+            )
+        if isinstance(targets, UnpreparedTargets):
+            raise NotImplementedError(
+                f"{type(self).__name__}: call prepare before declare_targets"
+            )
+        return list(targets)
 
     @abstractmethod
     def declare_statistics(self) -> list[StatisticRequest]:

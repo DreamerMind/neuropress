@@ -56,6 +56,9 @@ class _EstimatorSpec:
     group_size: int | None
     is_packed: bool
     filter_fn: Callable[[str, nn.Module], bool] | None
+    # Sizes the 3-D gate_up_proj / down_proj of fused MoE experts modules
+    # instead of a .weight.
+    fused_experts: bool = False
 
 
 def _get_transform_entry(
@@ -182,6 +185,35 @@ def _specs_for_transform_estimator(
     return specs
 
 
+def _moe_experts_spec(estimator: Any) -> _EstimatorSpec:
+    """Spec for :class:`~neuropress.moe_experts.GPTQMoEExpertsEstimator`.
+
+    Its targets mirror ``prepare``: fused experts modules whose hidden and
+    intermediate sizes are multiples of the group size, stored as Q4_0.
+    """
+    from neuropress.calibration.probe.moe_experts import is_fused_experts
+
+    entry = _get_transform_entry("q4_0_packed")
+    assert entry is not None and entry.storage_bits is not None
+    group_size = estimator.group_size
+
+    def _experts_filter(name: str, mod: nn.Module, _gs: int = group_size) -> bool:
+        if not is_fused_experts(mod):
+            return False
+        _, two_inter, d_model = mod.gate_up_proj.shape
+        return not (d_model % _gs or (two_inter // 2) % _gs)
+
+    return _EstimatorSpec(
+        module_class=nn.Module,
+        label=f"Q4_0 experts (GPTQ, {entry.storage_bits:g}-bit storage)",
+        storage_bits=float(entry.storage_bits),
+        group_size=entry.group_size,
+        is_packed=True,
+        filter_fn=_combine_filters(estimator.filter_fn, _experts_filter),
+        fused_experts=True,
+    )
+
+
 def _parse_specs(estimator: QuantizationParamEstimator) -> list[_EstimatorSpec]:
     """Recursively extract a flat list of :class:`_EstimatorSpec` from *estimator*.
 
@@ -203,6 +235,7 @@ def _parse_specs(estimator: QuantizationParamEstimator) -> list[_EstimatorSpec]:
         HQQEstimator,
         MinMaxZpWeightEstimator,
     )
+    from neuropress.moe_experts import GPTQMoEExpertsEstimator
 
     if isinstance(estimator, CompositeEstimator):
         specs: list[_EstimatorSpec] = []
@@ -246,6 +279,9 @@ def _parse_specs(estimator: QuantizationParamEstimator) -> list[_EstimatorSpec]:
 
     if isinstance(estimator, MinMaxZpWeightEstimator):
         return _specs_for_transform_estimator(estimator, "MinMax")
+
+    if isinstance(estimator, GPTQMoEExpertsEstimator):
+        return [_moe_experts_spec(estimator)]
 
     if isinstance(estimator, HQQEstimator):
         return _specs_for_transform_estimator(estimator, "HQQ")
@@ -329,7 +365,37 @@ def collect_estimates(
     seen_weight_ids: set[int] = set()
     seen_param_ids: set[int] = set()
 
+    experts_specs = [s for s in specs if s.fused_experts]
+    specs = [s for s in specs if not s.fused_experts]
     for mod_name, mod in model.named_modules():
+        expert_spec = next(
+            (s for s in experts_specs if s.filter_fn and s.filter_fn(mod_name, mod)),
+            None,
+        )
+        if expert_spec is not None:
+            from neuropress.moe_experts import t2n_exports_experts
+
+            # The adapter quantizes them, but the export stores them float.
+            exported = t2n_exports_experts(model, mod_name)
+            for param_name in ("gate_up_proj", "down_proj"):
+                param = getattr(mod, param_name)
+                seen_param_ids.add(id(param))
+                estimates.append(
+                    _LayerEstimate(
+                        name=f"{mod_name}.{param_name}",
+                        module_type=type(mod).__name__,
+                        description=expert_spec.label
+                        if exported
+                        else "float (no torch_to_nnef MoE extractor)",
+                        n_weight=param.numel(),
+                        float_bytes=param.numel() * dtype_bytes,
+                        quant_bytes=_packed_bytes(
+                            param.numel(), expert_spec.storage_bits
+                        )
+                        if exported
+                        else param.numel() * dtype_bytes,
+                    )
+                )
         w = getattr(mod, "weight", None)
         if w is None:
             continue

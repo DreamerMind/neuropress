@@ -20,7 +20,14 @@ from neuropress.transforms.weight_only import _q4_0_from_assignment
 
 
 @pytest.mark.parametrize(
-    "format_name", ["q4_0", "q4_0_unpacked", "q4_0_packed", "q4_0_packed_no_lm_head"]
+    "format_name",
+    [
+        "q4_0",
+        "q4_0_unpacked",
+        "q4_0_packed",
+        "q4_0_packed_no_lm_head",
+        "q4_0_packed_no_router",
+    ],
 )
 @pytest.mark.parametrize("group_size", [32, 64])
 def test_pipeline_preserves_gptq_grid_in_nnef(format_name, group_size, tmp_path):
@@ -129,6 +136,22 @@ def test_q40_skips_layer_that_would_decode_outside_f16():
     assert torch.isfinite(weight).all()
 
 
+def test_require_all_quantized_refuses_what_the_adapter_keeps_float():
+    torch.manual_seed(7)
+    model = nn.Sequential(nn.Linear(64, 16, bias=False)).eval()
+    with torch.no_grad():
+        model[0].weight[:, :32] *= 1e6
+    recipe = QuantizationRecipe(
+        param_estimator=GptqEstimatorConfig(
+            group_size=32, weight_transform="q4_0_packed"
+        ).build(),
+        adapter=WeightAssignmentAdapter(),
+        require_all_quantized=True,
+    )
+    with pytest.raises(ValueError, match="adapter kept 1 float: 0: "):
+        QuantizationPipeline(recipe).run(model, [torch.randn(8, 64, 64)])
+
+
 def _run_conv2d(format_name, kernel):
     torch.manual_seed(3)
     model = nn.Sequential(nn.Conv2d(64, 16, kernel, bias=False)).eval()
@@ -186,3 +209,17 @@ def test_q40_rejection_keeps_other_layers():
     QuantizationPipeline(recipe).run(model, [torch.randn(8, 96)])
     assert not isinstance(model.compatible.weight, QTensorTractScaleOnly)
     assert isinstance(model.rejected.weight, QTensorTractScaleOnly)
+
+
+def test_no_router_filter_keeps_moe_routers_float():
+    from neuropress.transforms.weight_only import WEIGHT_TRANSFORM_REGISTRY
+
+    keep = WEIGHT_TRANSFORM_REGISTRY["q4_0_packed_no_router"].filter_fn
+    linear = nn.Linear(64, 64, bias=False)
+    assert keep("model.layers.0.mlp.shared_expert.gate_proj", linear)
+    assert not keep("model.layers.0.mlp.gate", linear)
+    assert not keep("model.layers.0.mlp.shared_expert_gate", linear)
+    assert not keep("model.layers.0.block_sparse_moe.router.layer", linear)
+    assert not keep("model.layers.0.feed_forward.router", linear)
+    assert not keep("model.layers.0.mlp.gate.wg", linear)
+    assert keep("model.layers.0.mlp.experts.0.gate_proj", linear)

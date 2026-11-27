@@ -244,6 +244,37 @@ def test_seed_offsets_survive_target_selection():
         assert est._seed_offsets == whole
 
 
+def test_seed_offsets_and_bits_of_a_block_are_the_whole_models():
+    """A block held at its model paths keys bits and seeds as the whole model does."""
+    from neuropress.block_pipeline import BlockAtPaths
+
+    model = _two_blocks()
+    est = TrellisEstimator(bits_per_group={"1.b": 2.0})
+    est.prepare(model)
+    whole = dict(est._seed_offsets)
+    est.prepare(BlockAtPaths(model, ["1"], entry="1"))
+    assert list(est._target_modules) == ["1.a", "1.b"]
+    assert est._seed_offsets == whole
+    assert est.bits_for("1.b") == 2.0
+
+
+def test_block_seed_offsets_ignore_modules_earlier_blocks_replaced():
+    from neuropress.block_pipeline import BlockAtPaths
+    from neuropress.estimators import model_layout
+
+    model = _two_blocks()
+    est = TrellisEstimator()
+    est.prepare(model)
+    whole = dict(est._seed_offsets)
+    layout = model_layout(model)
+    # An earlier block's adapter split "0.a" into two linears.
+    model[0]["a"] = nn.Sequential(nn.Linear(128, 64), nn.Linear(128, 64))
+    est.prepare(BlockAtPaths(model, ["1"], entry="1", layout=layout))
+    assert est._seed_offsets == whole
+    est.prepare(BlockAtPaths(model, ["1"], entry="1"))
+    assert est._seed_offsets["1.a"] == whole["1.a"] + 1
+
+
 def test_scheme_moves_the_lut():
     from neuropress.transforms.trellis import TrellisScheme
 

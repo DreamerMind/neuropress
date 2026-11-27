@@ -43,7 +43,12 @@ from torch_to_nnef.exceptions import T2NErrorImpossibleQuantization
 
 from .calibration.batches import materialize
 from .calibration.probe import StatisticRequest, StatisticsRegistry
-from .estimator import QuantizationParamEstimator
+from .estimator import (
+    MODEL_LAYOUT_ATTR,
+    QuantizationParamEstimator,
+    UnpreparedTargets,
+    whole_model,
+)
 from .graph.graph import QGraph
 from .methods.correction_mode import CorrectionMode
 from .methods.gptq import GPTQCalibration, _is_conv1d_transpose
@@ -80,6 +85,60 @@ def _weight_identity(weight: torch.Tensor) -> tuple[str, int]:
         if not weight.is_meta and weight.numel() > 0:
             return "storage", weight.data_ptr()
     return "object", id(weight)
+
+
+ModelLayout = tuple[tuple[str, type, tuple[str, int] | None], ...]
+
+
+def model_layout(model: nn.Module) -> ModelLayout:
+    """Every module of *model*: its name, class and weight identity.
+
+    A snapshot taken before any part of the model is adapted, so
+    :func:`target_order` can list targets as they were even after earlier
+    blocks replaced modules (mixed-precision splits).
+    """
+    layout = []
+    for name, mod in model.named_modules():
+        w = getattr(mod, "weight", None)
+        key = _weight_identity(w) if isinstance(w, torch.Tensor) else None
+        layout.append((name, type(mod), key))
+    return tuple(layout)
+
+
+def target_order(
+    model: nn.Module,
+    module_classes: tuple[type, ...],
+    filter_fn: Callable[[str, nn.Module], bool] | None = None,
+) -> list[str]:
+    """Names :func:`collect_target_modules` gives on the whole, unadapted model.
+
+    For a block held at its model paths with a layout snapshot (see
+    :class:`.block_pipeline.BlockAtPaths`), the snapshot is read; otherwise
+    the whole model as it is now. *filter_fn* sees the module now at each
+    path; one an earlier block replaced (a mixed-precision split) is no
+    longer the module the filter was written for, and is kept.
+    """
+    whole = whole_model(model)
+    layout = getattr(model, MODEL_LAYOUT_ATTR, None)
+    if layout is None:
+        return list(collect_target_modules(whole, module_classes, filter_fn))
+    names, seen = [], set()
+    for name, cls, key in layout:
+        if not issubclass(cls, module_classes):
+            continue
+        if filter_fn is not None:
+            try:
+                live = whole.get_submodule(name)
+            except AttributeError:
+                live = None
+            if isinstance(live, module_classes) and not filter_fn(name, live):
+                continue
+        if key is not None:
+            if key in seen:
+                continue
+            seen.add(key)
+        names.append(name)
+    return names
 
 
 def _targets_device(
@@ -292,7 +351,7 @@ class GPTQEstimator(QuantizationParamEstimator):
 
     # Set by prepare() - not part of the public construction interface.
     _target_modules: dict[str, nn.Module] = field(
-        default_factory=dict, init=False, repr=False, compare=False
+        default_factory=UnpreparedTargets, init=False, repr=False, compare=False
     )
     _tied_aliases: dict[str, list[str]] = field(
         default_factory=dict, init=False, repr=False, compare=False
@@ -563,7 +622,7 @@ class GPTQPanelEstimator(QuantizationParamEstimator):
     damp_auto_increment: float = 0.0025
 
     _target_modules: dict[str, nn.Module] = field(
-        default_factory=dict, init=False, repr=False, compare=False
+        default_factory=UnpreparedTargets, init=False, repr=False, compare=False
     )
     _tied_aliases: dict[str, list[str]] = field(
         default_factory=dict, init=False, repr=False, compare=False
@@ -626,7 +685,11 @@ class GPTQPanelEstimator(QuantizationParamEstimator):
                 LOGGER.error("Panel GPTQ failed for '%s': %s - skipping", name, exc)
                 kept_float[name] = str(exc)
                 continue
-            if assignment is not None:
+            if assignment is None:
+                kept_float[name] = (
+                    f"weight columns not divisible into {self.group_size}-wide panels"
+                )
+            else:
                 assignments[name] = assignment
         return QuantizationPlan(
             weight_assignments=_add_tied_aliases(assignments, self._tied_aliases),
@@ -658,7 +721,7 @@ class MinMaxZpWeightEstimator(QuantizationParamEstimator):
     group_size: int = 32
 
     _target_modules: dict[str, nn.Module] = field(
-        default_factory=dict, init=False, repr=False, compare=False
+        default_factory=UnpreparedTargets, init=False, repr=False, compare=False
     )
     _tied_aliases: dict[str, list[str]] = field(
         default_factory=dict, init=False, repr=False, compare=False
@@ -930,7 +993,7 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
     reconstruction_protect_sink: bool = False
 
     _target_modules: dict[str, nn.Module] = field(
-        default_factory=dict, init=False, repr=False, compare=False
+        default_factory=UnpreparedTargets, init=False, repr=False, compare=False
     )
     _tied_aliases: dict[str, list[str]] = field(
         default_factory=dict, init=False, repr=False, compare=False
@@ -1066,11 +1129,34 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
         self._tied_aliases = collect_tied_aliases(
             model, self.module_classes, self.filter_fn
         )
-        # Fail before calibration, not hours later in _make_groups.
-        missing = set(self.own_codebook_modules) - set(self._target_modules)
+        # Fail before calibration, not hours later in _make_groups. A block
+        # run holds a few layers of the model and a stage a few targets; the
+        # names are checked against every target of the whole model, as it
+        # was before any block was adapted.
+        missing = set(self.own_codebook_modules) - set(
+            target_order(model, self.module_classes, self.unstaged_filter())
+        )
         if missing:
             raise ValueError(
                 f"own_codebook_modules not among the target modules: {sorted(missing)}"
+            )
+        # A grouping that pools layers trains one codebook over every layer
+        # of the model; a block holds a few, so it would train one per block
+        # (more bits, other centroids) without saying so. Frozen codebooks
+        # are trained elsewhere and only assigned here.
+        own = set(self.own_codebook_modules)
+        pooled = [n for n in self._target_modules if n not in own]
+        if (
+            whole_model(model) is not model
+            and self.grouping != "per_layer"
+            and self.frozen_centroids_path is None
+            and pooled
+        ):
+            raise ValueError(
+                f"grouping={self.grouping!r} shares codebooks across the model's "
+                "layers, which block calibration runs one block at a time; use "
+                "grouping='per_layer', own_codebook_modules for every target, or "
+                f"a whole-model run (pooled here: {pooled[:3]}...)"
             )
         from .transforms.rotation import HadamardInputLinear
 
@@ -1289,12 +1375,9 @@ class VPTQGroupEstimator(QuantizationParamEstimator):
             Mapping from group key to list of ``(name, module)`` pairs.
         """
         groups: dict[str, list[tuple[str, nn.Module]]] = {}
+        # prepare() checked the names against the whole model; a block or
+        # a stage holds only some of them.
         own = set(self.own_codebook_modules)
-        missing = own - set(self._target_modules)
-        if missing:
-            raise ValueError(
-                f"own_codebook_modules not among the target modules: {sorted(missing)}"
-            )
         for name, mod in self._target_modules.items():
             if name in own:
                 key = name
@@ -3609,6 +3692,12 @@ class CompositeEstimator(QuantizationParamEstimator):
             if hasattr(est, "prepare"):
                 est.prepare(model)
 
+    def declare_targets(self) -> list[str]:
+        """Return the union of all sub-estimator targets, in order."""
+        return list(
+            dict.fromkeys(t for est in self.estimators for t in est.declare_targets())
+        )
+
     def declare_statistics(self) -> list[StatisticRequest]:
         """Return deduplicated union of all sub-estimator statistic requests."""
         seen: set[tuple[str, str]] = set()
@@ -3728,7 +3817,7 @@ class HQQEstimator(QuantizationParamEstimator):
     lp_norm: float = 0.5
 
     _target_modules: dict[str, nn.Module] = field(
-        default_factory=dict, init=False, repr=False, compare=False
+        default_factory=UnpreparedTargets, init=False, repr=False, compare=False
     )
     _tied_aliases: dict[str, list[str]] = field(
         default_factory=dict, init=False, repr=False, compare=False

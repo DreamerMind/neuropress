@@ -19,8 +19,13 @@ from torch import nn
 
 from .calibration.batches import materialize
 from .calibration.probe import StatisticRequest, StatisticsRegistry
-from .estimator import QuantizationParamEstimator
-from .estimators import _add_tied_aliases, collect_target_modules, collect_tied_aliases
+from .estimator import QuantizationParamEstimator, UnpreparedTargets
+from .estimators import (
+    _add_tied_aliases,
+    collect_target_modules,
+    collect_tied_aliases,
+    target_order,
+)
 from .graph.graph import QGraph
 from .methods.trellis import TrellisConfig, trellis_quantize
 from .plan import QuantizationPlan
@@ -46,7 +51,7 @@ class TrellisEstimator(QuantizationParamEstimator):
     store: Literal["packed", "dense"] = "packed"
 
     _target_modules: dict[str, nn.Module] = field(
-        default_factory=dict, init=False, repr=False
+        default_factory=UnpreparedTargets, init=False, repr=False
     )
     _tied_aliases: dict[str, list[str]] = field(
         default_factory=dict, init=False, repr=False
@@ -76,11 +81,12 @@ class TrellisEstimator(QuantizationParamEstimator):
         self._tied_aliases = collect_tied_aliases(
             model, self.module_classes, self.filter_fn
         )
-        # Seed offsets by position among all linears of the model, not among the selected
-        # targets: a staged run (select_targets) would otherwise restart them every stage
+        # Seed offsets by position among all linears of the whole model, not
+        # among the selected targets or the block at hand: a staged run
+        # (select_targets) or a block run would otherwise restart them. A
+        # block reads the model as it was before any block was adapted.
         self._seed_offsets = {
-            name: i
-            for i, name in enumerate(collect_target_modules(model, self.module_classes))
+            name: i for i, name in enumerate(target_order(model, self.module_classes))
         }
         LOGGER.info("TrellisEstimator: %d target modules", len(self._target_modules))
 

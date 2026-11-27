@@ -29,6 +29,12 @@ from .graph import QGraph, QNode, QValue, RuntimeModuleGraphProvider
 from .graph.schedule import QuantizationSchedule
 from .kernel_lowering import AutoKernelLowering, KernelLowering
 from .methods import METHOD_REGISTRY
+from .moe_experts import (
+    GPTQMoEExpertsEstimator,
+    GptqMoeExpertsEstimatorConfig,
+    MoEExpertsQ40Adapter,
+    MoEExpertsQ40AdapterConfig,
+)
 from .pipeline import QuantizationPipeline
 from .plan import QuantizationPlan, QuantizedWeight
 from .preprocessing import (
@@ -90,8 +96,10 @@ __all__ = [
     "CompositeEstimatorConfig",
     "EstimatorConfig",
     "GPTQEstimator",
+    "GPTQMoEExpertsEstimator",
     "GPTQPanelEstimator",
     "GptqEstimatorConfig",
+    "GptqMoeExpertsEstimatorConfig",
     "GptqPanelEstimatorConfig",
     "Granularity",
     "GranularityType",
@@ -101,6 +109,8 @@ __all__ = [
     "KernelLoweringConfig",
     "MinMaxZpWeightEstimator",
     "MinMaxZpWeightEstimatorConfig",
+    "MoEExpertsQ40Adapter",
+    "MoEExpertsQ40AdapterConfig",
     "ModuleQuantizationAdapter",
     "PanelSpec",
     "PreprocessingStep",

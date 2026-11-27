@@ -44,10 +44,13 @@ lazily (one batch at a time — no OOM), then delegates to
 
 from __future__ import annotations
 
+import enum
 import logging
+import math
+import types
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from torch import nn
@@ -61,6 +64,7 @@ from ..estimator_configs import (
     MinMaxZpWeightEstimatorConfig,
     VptqGroupEstimatorConfig,
 )
+from ..moe_experts import GptqMoeExpertsEstimatorConfig, MoEExpertsQ40AdapterConfig
 from ..pipeline import QuantizationPipeline
 from ..quantization.cache import DiskCacheManager, _cal_fingerprint, _recipe_fingerprint
 from ..quantization.spans import (
@@ -68,7 +72,12 @@ from ..quantization.spans import (
     SpanCollector,
 )
 from ..recipe import CalibrationConfig, QuantizationRecipe
-from ..recipe_config import CompositeEstimatorConfig, QuantizationRecipeConfig
+from ..recipe_config import (
+    CompositeAdapterConfig,
+    CompositeEstimatorConfig,
+    QuantizationRecipeConfig,
+    WeightAssignmentAdapterConfig,
+)
 from ..transforms import Q4_X_GROUP_SIZE
 from .model_io import attach_manifest
 
@@ -90,6 +99,7 @@ def run_quantization_pipeline(
     recipe_config_json: str | None = None,
     cache_dir: Path | str | None = None,
     span_collector: SpanCollector | None = None,
+    block_calibration: Literal["float", "sequential"] | None = None,
     **kwargs: Any,
 ) -> nn.Module:
     """Run a :class:`.QuantizationPipeline` driven entirely by *recipe*.
@@ -128,6 +138,17 @@ def run_quantization_pipeline(
             model-level isolation is the caller's responsibility.
         span_collector: Optional sink receiving one timing span per pipeline
             stage.  Defaults to logging spans at INFO level.
+        block_calibration: Calibrate one decoder layer at a time with
+            :func:`.calibrate_causal_lm_blockwise` instead of the whole model
+            at once, so only one layer's statistics are live: ``"float"``
+            (the statistics of a whole-model run) or ``"sequential"``
+            (statistics on quantized upstream activations). The estimator
+            and adapter then come from *recipe_config_json*, which is
+            required, and a *recipe* with other settings is refused. The
+            manifest records the mode. *cache_dir* holds block checkpoints instead of
+            per-estimator stages (``<cache_dir>/blocks``): a rerun resumes
+            every block whose recipe, mode, weights and inputs match.
+            *span_collector* is not used.
         **kwargs: Extra kwargs forwarded by ``LLMExporter`` (e.g.
             ``export_dirpath``) are otherwise ignored; their presence skips
             kernel lowering, as the model is about to be exported to NNEF.
@@ -176,15 +197,160 @@ def run_quantization_pipeline(
     estimator.set_span_collector(collector)
     # Lazy device transfer — one batch on the GPU at a time.
     batches = ({k: v.to(device) for k, v in b.items()} for b in batches_raw)
-    QuantizationPipeline(recipe).run(model, batches)
-    attach_manifest(model, recipe_config_json=recipe_config_json)
-    # Apply kernel lowering eagerly so the model is always in the fast
-    # inference state.  save_quantized_model will unlower transparently.
-    if recipe.kernel_lowering is not None:
+    if block_calibration is not None:
+        # Imported here: block_pipeline imports this package.
+        from ..causal_lm_blocks import calibrate_causal_lm_blockwise
+
+        if recipe_config_json is None:
+            raise ValueError("block_calibration needs recipe_config_json")
+        config = QuantizationRecipeConfig.model_validate_json(recipe_config_json)
+        if not _same_recipe(recipe, config.build()):
+            raise ValueError(
+                "block calibration builds its recipe from recipe_config_json, "
+                "which does not describe the recipe passed: pass both from "
+                "one QuantizationRecipeConfig"
+            )
+        if span_collector is not None:
+            LOGGER.warning("block calibration does not use span_collector")
+        kept = calibrate_causal_lm_blockwise(
+            model,
+            batches,
+            config,
+            input_source=block_calibration,
+            device=device,
+            checkpoint_dir=Path(cache_dir) / "blocks" if cache_dir else None,
+        )
+        if kept:
+            LOGGER.warning("block calibration kept float: %s", kept)
+    else:
+        # Runs the whole recipe, kernel lowering included.
+        QuantizationPipeline(recipe).run(model, batches)
+    manifest = attach_manifest(model, recipe_config_json=recipe_config_json)
+    manifest.block_calibration = block_calibration
+    # Block calibration never lowers: lower once here, after every block, so
+    # the model is in the fast inference state like after a whole-model run.
+    # save_quantized_model unlowers transparently.
+    if block_calibration is not None and recipe.kernel_lowering is not None:
         model.__neuropress_kernel_lowering__ = recipe.kernel_lowering  # type: ignore[attr-defined]
         recipe.kernel_lowering.apply(model)
     _guard_unquantized_linear_dtype(model)
     return wrapper
+
+
+_EMPTY_CELL = object()
+
+
+class _Unordered:
+    """Set contents, equal to another's when its items pair up one to one."""
+
+    def __init__(self, items: list[Any]) -> None:
+        self.items = items
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, _Unordered) or len(self.items) != len(other.items):
+            return False
+        rest = list(other.items)
+        for item in self.items:
+            match = next((i for i, o in enumerate(rest) if o == item), None)
+            if match is None:
+                return False
+            del rest[match]
+        return True
+
+    __hash__ = None  # type: ignore[assignment]
+
+
+def _structure(value: Any, active: frozenset[int] = frozenset()) -> Any:
+    """A comparable view of a built recipe component's settings.
+
+    Private attributes hold state from earlier runs (prepared targets,
+    devices) and are left out. Functions compare by code, defaults and
+    closure contents, since filters are often closures built afresh by each
+    ``config.build()``; bound methods by function and instance; sets by
+    contents in any order; ``__slots__`` objects by their public slots; NaN
+    equals NaN. A value met again while it is being described compares by
+    type.
+    """
+    if isinstance(value, (type, enum.Enum, types.ModuleType)):
+        return value
+    if isinstance(value, float) and math.isnan(value):
+        return ("nan",)
+    if isinstance(value, torch.Tensor):
+        return ("tensor", value.dtype, tuple(value.shape), _structure(value.tolist()))
+    slots = [
+        name
+        for cls in type(value).__mro__
+        for name in getattr(cls, "__slots__", ())
+        if not name.startswith("_")
+    ]
+    if (
+        not isinstance(value, (dict, list, tuple, set, frozenset))
+        and not hasattr(value, "__dict__")
+        and not slots
+    ):
+        return value
+    if id(value) in active:
+        return ("cycle", type(value))
+    active = active | {id(value)}
+
+    def nested(item: Any) -> Any:
+        return _structure(item, active)
+
+    if isinstance(value, dict):
+        return {k: nested(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return tuple(nested(v) for v in value)
+    if isinstance(value, (set, frozenset)):
+        return _Unordered([nested(v) for v in value])
+    if isinstance(value, partial):
+        return (
+            "partial",
+            nested(value.func),
+            nested(value.args),
+            nested(value.keywords),
+        )
+    if isinstance(value, types.MethodType):
+        return ("method", nested(value.__func__), nested(value.__self__))
+    if isinstance(value, types.FunctionType):
+        cells = []
+        for cell in value.__closure__ or ():
+            try:
+                cells.append(cell.cell_contents)
+            except ValueError:
+                cells.append(_EMPTY_CELL)
+        return (
+            "function",
+            value.__code__,
+            nested(tuple(cells)),
+            nested(value.__defaults__),
+            nested(value.__kwdefaults__),
+        )
+    if isinstance(value, types.BuiltinFunctionType):
+        return value
+    attributes = dict(getattr(value, "__dict__", {}))
+    attributes.update({k: getattr(value, k) for k in slots if hasattr(value, k)})
+    return (
+        type(value),
+        {k: nested(v) for k, v in attributes.items() if not k.startswith("_")},
+    )
+
+
+def _same_recipe(recipe: QuantizationRecipe, built: QuantizationRecipe) -> bool:
+    """Whether *recipe* has the settings of *built*, kernel lowering aside.
+
+    The allowed qscheme lists are not compared: the JSON does not set them
+    and no estimator or adapter built from it reads them.
+    """
+    fields = (
+        "calibration",
+        "preprocessing",
+        "param_estimator",
+        "adapter",
+        "require_all_quantized",
+    )
+    return all(
+        _structure(getattr(recipe, f)) == _structure(getattr(built, f)) for f in fields
+    )
 
 
 def _calibration_target(model: nn.Module) -> nn.Module:
@@ -285,7 +451,11 @@ def apply_kernel_lowering(model: nn.Module) -> nn.Module:
 NEUROPRESS_COMPRESSION_REGISTRY = "neuropress.t2n.registry.NEUROPRESS_COMPRESSION"
 
 
-def _make_entry(config: QuantizationRecipeConfig) -> partial:
+def _make_entry(
+    config: QuantizationRecipeConfig,
+    *,
+    block_calibration: Literal["float", "sequential"] | None = None,
+) -> partial:
     """Build a registry entry from *config*, capturing its JSON for the manifest.
 
     The returned callable quantizes the model **and** applies kernel lowering
@@ -294,12 +464,15 @@ def _make_entry(config: QuantizationRecipeConfig) -> partial:
     auto-unlower before saving and re-lower afterwards.
 
     The *config* is stored on the returned partial as ``.__config__``
-    so callers can retrieve it if needed.
+    so callers can retrieve it if needed. *block_calibration* is passed to
+    :func:`run_quantization_pipeline`; it is not part of the recipe JSON or
+    the cache fingerprints, and the manifest records it separately.
     """
     entry = partial(
         run_quantization_pipeline,
         recipe=config.build(),
         recipe_config_json=config.model_dump_json(),
+        block_calibration=block_calibration,
     )
     entry.__config__ = config  # type: ignore[attr-defined]
     return entry
@@ -349,6 +522,32 @@ NEUROPRESS_COMPRESSION: dict[str, Any] = {
                 weight_transform="q4_0_packed_no_lm_head",
             ),
         )
+    ),
+    # Q4_0 linears plus GPTQ Q4_0 fused MoE experts (one Hessian per expert,
+    # from the tokens routed to it). The adapter marks each MoE block for the
+    # torch_to_nnef tract_moe_ffn extractor with the linear expert layout and
+    # a quantizer returning these codes, so no export flag is needed. Routers
+    # and shared-expert gates stay float.
+    "open_text_c4_gptq_q4_0_moe": _make_entry(
+        QuantizationRecipeConfig(
+            estimator=CompositeEstimatorConfig(
+                methods=[
+                    GptqEstimatorConfig(
+                        group_size=Q4_X_GROUP_SIZE,
+                        nbits=4,
+                        weight_transform="q4_0_packed_no_router",
+                    ),
+                    GptqMoeExpertsEstimatorConfig(group_size=Q4_X_GROUP_SIZE),
+                ]
+            ),
+            adapter=CompositeAdapterConfig(
+                adapters=[WeightAssignmentAdapterConfig(), MoEExpertsQ40AdapterConfig()]
+            ),
+        ),
+        # One decoder layer's expert Hessians at a time instead of every
+        # layer's (about 117 GB on Qwen3-30B-A3B), each layer calibrated on
+        # the activations of the already quantized layers before it.
+        block_calibration="sequential",
     ),
     # --- Speech / audio entries (require neuropress[audio]) -----------------
     # dataset="librispeech" → load_librispeech_calibration; seq_len is in

@@ -45,6 +45,16 @@ class QuantizationRecipe(BaseModel):
         adapter: Applies the QuantizationPlan to the model.
         kernel_lowering: Optional hardware-specific kernel lowering pass.
         preprocessing: Optional preprocessing steps run before calibration.
+        require_all_quantized: Refuse a plan that keeps any target float.
+            Estimators keep a target float when they cannot quantize it (an
+            ill-conditioned Hessian, a scale f16 cannot hold, experts no
+            calibration token reached) and report why in
+            ``QuantizationPlan.kept_float``. By default the run goes on with
+            those targets float; with this set, :class:`.QuantizationPipeline`
+            raises, naming each one: before adapting the model for what the
+            estimator kept float, after it for what the adapter's format
+            could not store (a scale out of f16 range), when part of the
+            model is already adapted.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -56,3 +66,4 @@ class QuantizationRecipe(BaseModel):
     adapter: ModuleQuantizationAdapter
     kernel_lowering: KernelLowering | None = None
     preprocessing: list[PreprocessingStep] = []
+    require_all_quantized: bool = False
