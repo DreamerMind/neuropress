@@ -168,7 +168,8 @@ class GSQRefiner:
     groups: tuple[GSQGroup, ...]
     config: GSQConfig = field(default_factory=GSQConfig)
     keep_better: bool = True
-    cache_device: str | None = None
+    # Placement only: left out of the repr, which fingerprints checkpoints.
+    cache_device: str | None = field(default=None, repr=False)
     history: list[dict[str, Any]] = field(
         default_factory=list, repr=False, compare=False
     )

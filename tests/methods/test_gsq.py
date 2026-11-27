@@ -465,3 +465,28 @@ def test_the_teacher_leaves_the_device_before_the_fit(monkeypatch):
     runner = BlockQuantizationPipeline(_recipe(), stages=STAGES, refiner=refiner)
     list(runner.run([("b", _Block().eval())], _batches(2)))
     assert events[:2] == ["teacher to host", "fit"]
+
+
+def test_an_unreached_target_is_refused_before_any_step(monkeypatch):
+    import neuropress.methods.gsq as gsq
+
+    steps = []
+    monkeypatch.setattr(gsq.Lion, "step", lambda self, *a, **k: steps.append(1))
+    refiner = GSQRefiner(
+        (GSQGroup(("up", "down"), objective="up"),), GSQConfig(epochs=3)
+    )
+    runner = BlockQuantizationPipeline(_recipe(), stages=STAGES, refiner=refiner)
+    with pytest.raises(ValueError, match=r"does not depend on \['down'\]"):
+        list(runner.run([("b", _Block().eval())], _batches(4)))
+    assert steps == []
+
+
+def test_a_flat_tuple_of_stage_paths_is_refused():
+    with pytest.raises(ValueError, match="tuple of stages"):
+        BlockQuantizationPipeline(
+            _recipe(), input_source="sequential", stages=("attn.v", "attn.o")
+        )
+
+
+def test_the_cache_device_is_not_part_of_the_fingerprint():
+    assert repr(GSQRefiner(GROUPS, cache_device="cpu")) == repr(GSQRefiner(GROUPS))

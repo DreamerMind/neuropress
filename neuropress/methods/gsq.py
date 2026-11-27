@@ -442,6 +442,29 @@ def evaluate_codes(
 
 
 @torch.enable_grad()
+def _check_reached(codes, loss, n_items: int) -> None:
+    """Refuse codes the loss never reaches, before any optimizer step.
+
+    Their logits would get no gradient, and the fit would hand back the
+    argmax of their noisy initial logits. A well-posed group is reached by
+    the first item: one forward and backward at the starting weights.
+    """
+    missing = set(codes)
+    for i in range(n_items):
+        leaves = {n: codes[n].initial().detach().requires_grad_() for n in missing}
+        value = loss(leaves, i)
+        if value.requires_grad:
+            value.backward()
+        missing = {n for n in missing if leaves[n].grad is None}
+        if not missing:
+            return
+    raise ValueError(
+        f"the loss does not depend on {sorted(missing)}: is the objective "
+        "downstream of every target?"
+    )
+
+
+@torch.enable_grad()
 def fit_gumbel_codes(
     codes: Mapping[str, GumbelCodes],
     loss: LossFn,
@@ -491,9 +514,9 @@ def fit_gumbel_codes(
     steps_per_epoch = math.ceil(n_items / config.batch_size)
     total = steps_per_epoch * config.epochs
     order_generator = torch.Generator().manual_seed(config.seed)
+    _check_reached(codes, loss, n_items)
     history = []
     step = 0
-    reached: set[str] = set()
     for epoch in range(config.epochs):
         order = torch.randperm(n_items, generator=order_generator).tolist()
         # summed on the device, read once per epoch
@@ -510,11 +533,10 @@ def fit_gumbel_codes(
             leaves = {name: w.detach().requires_grad_() for name, w in soft.items()}
             for i in items:
                 value = loss(leaves, i) / len(items)
-                if value.requires_grad:  # else no code reaches it; see below
+                if value.requires_grad:  # an item may reach none of the codes
                     value.backward()
                 epoch_loss = epoch_loss + value.detach().double() * len(items)
             names = [n for n in soft if leaves[n].grad is not None]
-            reached.update(names)
             torch.autograd.backward(
                 [soft[n] for n in names], [leaves[n].grad for n in names]
             )
@@ -522,14 +544,6 @@ def fit_gumbel_codes(
             for c in codes.values():
                 c.clamp_scale()
             step += 1
-        if epoch == 0 and reached != set(codes):
-            # Codes the loss never reaches would only take the argmax of
-            # their noisy initial logits.
-            raise ValueError(
-                "the loss does not depend on "
-                f"{sorted(set(codes) - reached)}: is the objective downstream "
-                "of every target?"
-            )
         history.append(float(epoch_loss) / n_items)
         if log is not None:
             log(

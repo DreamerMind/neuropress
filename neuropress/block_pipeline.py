@@ -185,6 +185,11 @@ class BlockQuantizationPipeline:
                 raise ValueError("Give either target_paths or stages")
             if input_source != "sequential":
                 raise ValueError("Explicit stages require input_source=sequential")
+            if isinstance(stages, str) or any(isinstance(s, str) for s in stages):
+                raise ValueError(
+                    "stages is a tuple of stages, each a tuple of module paths "
+                    '(stages=(("a", "b"),)), not a tuple of paths'
+                )
             flat = [path for stage in stages for path in stage]
             if not stages or not all(stages) or len(set(flat)) != len(flat):
                 raise ValueError("Stages must be nonempty with distinct module paths")
