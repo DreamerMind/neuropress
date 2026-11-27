@@ -490,3 +490,37 @@ def test_a_flat_tuple_of_stage_paths_is_refused():
 
 def test_the_cache_device_is_not_part_of_the_fingerprint():
     assert repr(GSQRefiner(GROUPS, cache_device="cpu")) == repr(GSQRefiner(GROUPS))
+
+
+def test_a_finite_fit_beats_a_non_finite_start(monkeypatch):
+    import neuropress.gsq_refiner as gsq_refiner
+
+    losses = iter([float("nan"), 1.0])
+    monkeypatch.setattr(gsq_refiner, "evaluate_codes", lambda *a, **k: next(losses))
+    refiner = GSQRefiner(
+        (GSQGroup(("attn.v", "attn.o"), objective="mix"),),
+        GSQConfig(epochs=1, batch_size=2),
+    )
+    runner = BlockQuantizationPipeline(_recipe(), stages=(STAGES[0],), refiner=refiner)
+    list(runner.run([("b", _Block().eval())], _batches(2)))
+    assert refiner.history[0]["kept"] is True
+
+
+def test_targets_in_no_explicit_stage_are_reported_float():
+    runner = BlockQuantizationPipeline(
+        _recipe(), input_source="sequential", stages=(STAGES[0],)
+    )
+    (result,) = runner.run([("b", _Block().eval())], _batches(2))
+    assert result.kept_float == {
+        "up": "in no explicit stage",
+        "down": "in no explicit stage",
+    }
+
+
+def test_a_group_no_stage_plans_is_refused():
+    refiner = GSQRefiner(GROUPS, GSQConfig(epochs=1, batch_size=2))
+    runner = BlockQuantizationPipeline(_recipe(), stages=(STAGES[0],), refiner=refiner)
+    with pytest.raises(
+        ValueError, match=r"no stage planned the groups \[\('up', 'down'\)\]"
+    ):
+        list(runner.run([("b", _Block().eval())], _batches(2)))

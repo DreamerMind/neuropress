@@ -6,6 +6,7 @@ import copy
 import hashlib
 import importlib.metadata
 import json
+import logging
 import weakref
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
@@ -23,6 +24,8 @@ from .pipeline import QuantizationPipeline
 from .plan import QuantizationPlan
 from .recipe_config import QuantizationRecipeConfig
 from .t2n.model_io import load_quantized_model, save_quantized_model
+
+LOGGER = logging.getLogger(__name__)
 
 # Leaves that hash identically across processes. Checkpointed streams are
 # reloaded with torch.load(weights_only=True), which accepts little more than
@@ -126,6 +129,29 @@ class BlockRefiner(Protocol):
     ) -> None:
         """Edit the stage's *plan* in place."""
         ...
+
+
+def _finish_refiner(refiner: Any, name: str) -> None:
+    """Call the optional ``finish(name)`` of a refiner after a block's stages.
+
+    A refiner sees one stage at a time; ``finish`` is where it can tell that
+    something it was given never came up in any of them.
+    """
+    finish = getattr(refiner, "finish", None)
+    if callable(finish):
+        finish(name)
+
+
+def _estimator_targets(estimator: Any) -> list[str] | None:
+    """The targets a prepared estimator selects, or ``None`` if it cannot tell."""
+    declare = getattr(estimator, "declare_targets", None)
+    if callable(declare):
+        try:
+            return list(declare())
+        except NotImplementedError:
+            return None
+    targets = getattr(estimator, "_target_modules", None)
+    return list(targets) if isinstance(targets, dict) else None
 
 
 class BlockQuantizationPipeline:
@@ -283,6 +309,32 @@ class BlockQuantizationPipeline:
             registry.register_requests(estimator.declare_statistics())
             return registry.requires_pairing()
 
+    def _outside_stages(self, model: nn.Module) -> dict[str, str]:
+        """Estimator targets of *model* that no explicit stage covers.
+
+        They are not quantized; recorded in ``kept_float`` like every other
+        target left float, rather than dropped without a word.
+        """
+        assert self.stages is not None
+        estimator = self.config.build().param_estimator
+        estimator.prepare(model)
+        targets = _estimator_targets(estimator)
+        if targets is None:
+            return {}
+        covered = [path for stage in self.stages for path in stage]
+        outside = {
+            target: "in no explicit stage"
+            for target in targets
+            if not any(target == p or target.startswith(f"{p}.") for p in covered)
+        }
+        if outside:
+            LOGGER.warning(
+                "%d estimator targets are in no explicit stage and stay float: %s",
+                len(outside),
+                sorted(outside),
+            )
+        return outside
+
     def _inference_view(self, model: nn.Module) -> nn.Module:
         """Return the module that statistics and the student forward observe."""
         if self.inference_model is None:
@@ -379,6 +431,8 @@ class BlockQuantizationPipeline:
             if self.refiner is not None or self._later_stages_pair(model, stages):
                 model.cpu()
                 teacher = copy.deepcopy(model)
+            if self.stages is not None:
+                plan.kept_float.update(self._outside_stages(model))
             for index, stage in enumerate(stages):
                 observed = self._inference_view(model)
                 observed.to(self.forward_device).eval()
@@ -417,6 +471,8 @@ class BlockQuantizationPipeline:
                 observed = None
                 if teacher is not None:
                     teacher.cpu()
+            if self.refiner is not None:
+                _finish_refiner(self.refiner, name)
             observed = self._inference_view(model)
             student_outputs = self._forward(observed, student)
             observed = None

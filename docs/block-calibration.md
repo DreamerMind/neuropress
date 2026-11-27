@@ -208,8 +208,13 @@ stages = (
 )
 ```
 
+Estimator targets that no stage covers are not quantized: they are logged and
+recorded in the block's `kept_float` as "in no explicit stage".
+
 A `refiner` (any object with the `BlockRefiner.refine` method) is called for
-each stage after the estimator and before the adapter. It receives the block
+each stage after the estimator and before the adapter. A refiner may also
+define `finish(name)`, called after the block's last stage; `GSQRefiner` uses
+it to refuse a group that no stage planned. It receives the block
 (stage targets still float, earlier stages adapted), the stage's plan, the
 student input batches, a callable returning the frozen float block, and the
 forward device, and edits the plan in place. The adapter then applies the
@@ -258,7 +263,8 @@ runner = BlockQuantizationPipeline(
 `o` are fitted to the attention output; the MLP is then fitted to the block
 output with the quantized attention in place. A group whose fitted codes do not
 lower its objective on the calibration batches keeps its starting codes
-(`keep_better=True`); `refiner.history` records the loss before and after each
+(`keep_better=True`), unless the starting loss is not finite and the fitted
+one is; `refiner.history` records the loss before and after each
 fit. A group's objective must be downstream of every one of its targets, and
 the targets must have 2-D weights (linears); either mistake is refused rather
 than fitted. Each optimizer step draws one relaxed sample and runs `GSQConfig.batch_size`

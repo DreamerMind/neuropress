@@ -28,6 +28,7 @@ residual is common to both sides.
 from __future__ import annotations
 
 import logging
+import math
 import zlib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
@@ -173,6 +174,10 @@ class GSQRefiner:
     history: list[dict[str, Any]] = field(
         default_factory=list, repr=False, compare=False
     )
+    # Per block: indices of the groups some stage planned (or kept float).
+    _handled: dict[str, set[int]] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         seen: set[str] = set()
@@ -215,10 +220,14 @@ class GSQRefiner:
         # is still fitted around them.
         handled = planned | set(plan.kept_float)
         groups = []
+        done = self._handled.setdefault(name, set())
         for group in self.groups:
             targets = tuple(t for t in group.targets if t in planned)
+            if set(group.targets) <= set(plan.kept_float):
+                done.add(self.groups.index(group))  # all float: nothing to fit
             if not targets:
                 continue
+            done.add(self.groups.index(group))
             if not set(group.targets) <= handled:
                 raise ValueError(f"a GSQ group spans pipeline stages: {group.targets}")
             if len(targets) < len(group.targets):
@@ -243,6 +252,20 @@ class GSQRefiner:
             for p, flag in frozen.items():
                 p.requires_grad_(flag)
             block.to(home)
+
+    def finish(self, name: str) -> None:
+        """Refuse groups none of the block's stages planned.
+
+        Called by the block pipeline after the block's last stage. A group
+        left out of every stage would otherwise keep its GPTQ codes silently.
+        """
+        done = self._handled.pop(name, set())
+        missing = [g.targets for i, g in enumerate(self.groups) if i not in done]
+        if missing:
+            raise ValueError(
+                f"GSQ {name}: no stage planned the groups {missing}; add their "
+                "targets to a stage or drop the groups"
+            )
 
     def _fixed_weights(
         self, block: nn.Module, plan: QuantizationPlan, exclude: set[str], device
@@ -334,7 +357,11 @@ class GSQRefiner:
         )
         # On a tie the GPTQ codes stay: fitted codes that change nothing
         # measurable are only noise.
-        kept = final < start or not self.keep_better
+        # A non-finite start (an overflow at the GPTQ codes) loses to any
+        # finite fit; a non-finite fit never wins.
+        kept = not self.keep_better or (
+            math.isfinite(final) and (not math.isfinite(start) or final < start)
+        )
         LOGGER.info(
             "GSQ %s: start %.4e -> fitted %.4e (%s)",
             label,
