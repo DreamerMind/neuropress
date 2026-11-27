@@ -213,8 +213,10 @@ recorded in the block's `kept_float` as "in no explicit stage".
 
 A `refiner` (any object with the `BlockRefiner.refine` method) is called for
 each stage after the estimator and before the adapter. A refiner may also
-define `finish(name)`, called after the block's last stage; `GSQRefiner` uses
-it to refuse a group that no stage planned. It receives the block
+define `start(name)` and `finish(name)`, called before the block's first stage
+and after its last; `GSQRefiner` uses them to refuse a group that no stage
+planned. An estimator whose targets cannot be listed gets a warning that targets
+in no stage go unreported. It receives the block
 (stage targets still float, earlier stages adapted), the stage's plan, the
 student input batches, a callable returning the frozen float block, and the
 forward device, and edits the plan in place. The adapter then applies the
@@ -259,7 +261,8 @@ runner = BlockQuantizationPipeline(
 )
 ```
 
-`q_proj` and `k_proj` keep their GPTQ codes and are used quantized while `v` and
+`q_proj` and `k_proj` keep their GPTQ codes and are used as the adapter will
+install them (dequantized, or decompressed for VQ and trellis plans) while `v` and
 `o` are fitted to the attention output; the MLP is then fitted to the block
 output with the quantized attention in place. A group whose fitted codes do not
 lower its objective on the calibration batches keeps its starting codes
@@ -267,6 +270,9 @@ lower its objective on the calibration batches keeps its starting codes
 one is; `refiner.history` records the loss before and after each
 fit. A group's objective must be downstream of every one of its targets, and
 the targets must have 2-D weights (linears); either mistake is refused rather
-than fitted. Each optimizer step draws one relaxed sample and runs `GSQConfig.batch_size`
+than fitted. During a fit the calibration inputs and the cached float outputs
+stay on the forward device, so a step moves nothing; with long calibration
+sets on a small card, `GSQRefiner(..., cache_device="cpu")` holds them on the
+host instead. Each optimizer step draws one relaxed sample and runs `GSQConfig.batch_size`
 calibration batches with it. On CUDA the relaxation and the optimizer update are
 compiled into fused kernels, since they read every logit several times per step.

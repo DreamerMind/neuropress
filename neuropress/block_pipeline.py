@@ -131,15 +131,16 @@ class BlockRefiner(Protocol):
         ...
 
 
-def _finish_refiner(refiner: Any, name: str) -> None:
-    """Call the optional ``finish(name)`` of a refiner after a block's stages.
+def _refiner_hook(refiner: Any, hook: str, name: str) -> None:
+    """Call a refiner's optional ``start(name)`` or ``finish(name)``.
 
-    A refiner sees one stage at a time; ``finish`` is where it can tell that
+    A refiner sees one stage at a time. ``start`` runs before a block's first
+    stage, ``finish`` after its last, where the refiner can tell that
     something it was given never came up in any of them.
     """
-    finish = getattr(refiner, "finish", None)
-    if callable(finish):
-        finish(name)
+    method = getattr(refiner, hook, None)
+    if callable(method):
+        method(name)
 
 
 def _estimator_targets(estimator: Any) -> list[str] | None:
@@ -150,6 +151,12 @@ def _estimator_targets(estimator: Any) -> list[str] | None:
             return list(declare())
         except NotImplementedError:
             return None
+    members = getattr(estimator, "estimators", None)
+    if isinstance(members, list):  # CompositeEstimator
+        found = [_estimator_targets(member) for member in members]
+        if any(targets is None for targets in found):
+            return None
+        return [t for targets in found if targets is not None for t in targets]
     targets = getattr(estimator, "_target_modules", None)
     return list(targets) if isinstance(targets, dict) else None
 
@@ -320,6 +327,11 @@ class BlockQuantizationPipeline:
         estimator.prepare(model)
         targets = _estimator_targets(estimator)
         if targets is None:
+            LOGGER.warning(
+                "%s cannot list its targets: targets in no explicit stage stay "
+                "float without being recorded in kept_float",
+                type(estimator).__name__,
+            )
             return {}
         covered = [path for stage in self.stages for path in stage]
         outside = {
@@ -433,6 +445,8 @@ class BlockQuantizationPipeline:
                 teacher = copy.deepcopy(model)
             if self.stages is not None:
                 plan.kept_float.update(self._outside_stages(model))
+            if self.refiner is not None:
+                _refiner_hook(self.refiner, "start", name)
             for index, stage in enumerate(stages):
                 observed = self._inference_view(model)
                 observed.to(self.forward_device).eval()
@@ -472,7 +486,7 @@ class BlockQuantizationPipeline:
                 if teacher is not None:
                     teacher.cpu()
             if self.refiner is not None:
-                _finish_refiner(self.refiner, name)
+                _refiner_hook(self.refiner, "finish", name)
             observed = self._inference_view(model)
             student_outputs = self._forward(observed, student)
             observed = None

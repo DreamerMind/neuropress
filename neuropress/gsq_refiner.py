@@ -37,6 +37,7 @@ from typing import Any
 import torch
 from torch import nn
 from torch.func import functional_call
+from torch_to_nnef.tensor.quant import QTensor
 
 from .calibration.batches import call_batch, move_batch
 from .methods.gsq import (
@@ -133,6 +134,40 @@ def _scalar_parts(
     return levels, scale, -zp, scheme.maxq - zp, zp
 
 
+def _dense(assignment: Any) -> torch.Tensor:
+    """The weight a plan entry gives the adapted module, as a plain tensor.
+
+    Scalar plans dequantize; VQ and packed trellis plans are torch_to_nnef
+    QTensors and decompress; a plain tensor is the replacement weight itself.
+    """
+    if isinstance(assignment, QuantizedWeight):
+        return assignment.dequantize()
+    if isinstance(assignment, QTensor):
+        return assignment.decompress()
+    return assignment
+
+
+def _placement(block: nn.Module) -> dict[str, torch.device]:
+    """The device of each parameter and buffer, by name."""
+    tensors = [*block.named_parameters(), *block.named_buffers()]
+    return {name: t.device for name, t in tensors}
+
+
+def _restore(block: nn.Module, placement: dict[str, torch.device]) -> None:
+    """Put each parameter and buffer back on the device *placement* records."""
+    for module_name, module in block.named_modules():
+        prefix = f"{module_name}." if module_name else ""
+        for store in (module._parameters, module._buffers):
+            for key, tensor in store.items():
+                device = placement.get(prefix + key)
+                if tensor is None or device is None or tensor.device == device:
+                    continue
+                if isinstance(tensor, nn.Parameter):
+                    tensor.data = tensor.data.to(device)
+                else:
+                    store[key] = tensor.to(device)
+
+
 def _write_back(qw: QuantizedWeight, codes: GumbelCodes, zp: int) -> QuantizedWeight:
     scheme = qw.scheme
     assert isinstance(scheme, ZpScaleScheme)
@@ -159,8 +194,11 @@ class GSQRefiner:
         config: GSQ optimization settings.
         keep_better: Keep the starting codes of a group whose fitted codes do
             not lower the objective on the calibration batches.
-        cache_device: Where the float outputs wait during a fit; ``None`` keeps
-            them on the forward device.
+        cache_device: Where the calibration inputs and the float outputs wait
+            during a fit. ``None`` keeps both on the forward device, so a step
+            moves nothing (about 4 GB for a Llama-8B MLP group at 128 x 2048
+            tokens); ``"cpu"`` holds them on the host and moves one batch per
+            loss evaluation.
 
     ``history`` collects one record per fitted group: its targets, the loss of
     the starting codes, the loss of the fitted codes and whether they were kept.
@@ -229,7 +267,10 @@ class GSQRefiner:
                 continue
             done.add(self.groups.index(group))
             if not set(group.targets) <= handled:
-                raise ValueError(f"a GSQ group spans pipeline stages: {group.targets}")
+                raise ValueError(
+                    f"a GSQ group spans pipeline stages, or has a target in no "
+                    f"stage: {group.targets}"
+                )
             if len(targets) < len(group.targets):
                 LOGGER.warning(
                     "GSQ %s: %s kept float by the estimator, fitting %s only",
@@ -240,7 +281,7 @@ class GSQRefiner:
             groups.append((self.groups.index(group), replace(group, targets=targets)))
         if not groups:
             return
-        home = next(block.parameters()).device
+        home = _placement(block)
         block.to(device)
         frozen = {p: p.requires_grad for p in block.parameters()}
         for p in frozen:
@@ -251,7 +292,11 @@ class GSQRefiner:
         finally:
             for p, flag in frozen.items():
                 p.requires_grad_(flag)
-            block.to(home)
+            _restore(block, home)
+
+    def start(self, name: str) -> None:
+        """Forget what an earlier, failed run of block *name* planned."""
+        self._handled[name] = set()
 
     def finish(self, name: str) -> None:
         """Refuse groups none of the block's stages planned.
@@ -270,13 +315,13 @@ class GSQRefiner:
     def _fixed_weights(
         self, block: nn.Module, plan: QuantizationPlan, exclude: set[str], device
     ) -> dict[str, torch.Tensor]:
-        """Planned weights outside *exclude*, dequantized as the adapter will see them."""
+        """Planned weights outside *exclude*, as the adapter will install them."""
         fixed = {}
         for path, qw in plan.weight_assignments.items():
-            if path in exclude or not isinstance(qw, QuantizedWeight):
+            if path in exclude:
                 continue
             weight = block.get_submodule(path).weight
-            dense = qw.dequantize()
+            dense = _dense(qw)
             fixed[f"{path}.weight"] = dense.reshape(weight.shape).to(
                 device, weight.dtype
             )

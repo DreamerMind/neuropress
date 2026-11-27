@@ -524,3 +524,92 @@ def test_a_group_no_stage_plans_is_refused():
         ValueError, match=r"no stage planned the groups \[\('up', 'down'\)\]"
     ):
         list(runner.run([("b", _Block().eval())], _batches(2)))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs two devices")
+def test_refine_puts_each_tensor_back_on_its_own_device():
+    from neuropress.gsq_refiner import _placement, _restore
+
+    block = _Block()
+    block.register_buffer("table", torch.ones(3))
+    placement = _placement(block)
+    placement["up.weight"] = torch.device("cuda", 0)
+    placement["table"] = torch.device("cuda", 0)
+    weight = block.up.weight
+    _restore(block, placement)
+    assert block.up.weight is weight and weight.device.type == "cuda"
+    assert block.table.device.type == "cuda"
+    assert block.down.weight.device.type == "cpu"
+
+
+def test_restoring_placement_keeps_parameters_and_ties():
+    from neuropress.gsq_refiner import _placement, _restore
+
+    block = _Block()
+    block.down.weight = nn.Parameter(block.up.weight.t().contiguous())
+    block.tied = nn.Linear(64, 128, bias=False)
+    block.tied.weight = block.up.weight
+    placement = _placement(block)
+    params = dict(block.named_parameters(remove_duplicate=False))
+    _restore(block, placement)
+    assert block.tied.weight is block.up.weight
+    for name, p in block.named_parameters(remove_duplicate=False):
+        assert p is params[name]
+
+
+def test_a_composite_recipe_reports_targets_in_no_stage():
+    recipe = QuantizationRecipeConfig.model_validate(
+        {
+            "estimator": {
+                "type": "composite",
+                "methods": [
+                    {"type": "gptq", "group_size": 32, "nbits": 2, "symmetric": True},
+                    {"type": "min_max_zp_weight", "target": "embedding", "nbits": 8},
+                ],
+            },
+            "kernel_lowering": None,
+        }
+    )
+    runner = BlockQuantizationPipeline(
+        recipe, input_source="sequential", stages=(STAGES[0],)
+    )
+    (result,) = runner.run([("b", _Block().eval())], _batches(2))
+    assert result.kept_float == {
+        "up": "in no explicit stage",
+        "down": "in no explicit stage",
+    }
+
+
+def test_neighbours_planned_in_other_formats_are_used_as_installed(monkeypatch):
+    import neuropress.gsq_refiner as gsq_refiner
+
+    replacement = torch.randn(4, 4)
+    assert gsq_refiner._dense(replacement) is replacement
+
+    class Packed:  # stands for a torch_to_nnef QTensor (VQ, packed trellis)
+        def decompress(self):
+            return replacement * 2
+
+    monkeypatch.setattr(gsq_refiner, "QTensor", Packed)
+    torch.testing.assert_close(gsq_refiner._dense(Packed()), replacement * 2)
+
+
+def test_a_failed_block_run_does_not_leave_its_groups_planned(monkeypatch):
+    refiner = GSQRefiner(GROUPS, GSQConfig(epochs=1, batch_size=2))
+    fit = GSQRefiner._fit
+    calls = []
+
+    def failing_fit(self, *args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:  # the MLP group, in the second stage
+            raise RuntimeError("out of memory")
+        return fit(self, *args, **kwargs)
+
+    monkeypatch.setattr(GSQRefiner, "_fit", failing_fit)
+    runner = BlockQuantizationPipeline(_recipe(), stages=STAGES, refiner=refiner)
+    with pytest.raises(RuntimeError, match="out of memory"):
+        list(runner.run([("b", _Block().eval())], _batches(2)))
+    monkeypatch.setattr(GSQRefiner, "_fit", fit)
+    runner = BlockQuantizationPipeline(_recipe(), stages=(STAGES[0],), refiner=refiner)
+    with pytest.raises(ValueError, match="no stage planned"):
+        list(runner.run([("b", _Block().eval())], _batches(2)))
