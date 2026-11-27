@@ -108,6 +108,17 @@ def _decoder(model: nn.Module) -> nn.Module:
     return decoder
 
 
+def _input_embeddings(model: nn.Module, decoder: nn.Module) -> nn.Module | None:
+    """The input embedding, as transformers finds it to tie the LM head."""
+    try:
+        embed = model.get_input_embeddings()
+    except (AttributeError, NotImplementedError):
+        embed = None
+    if not isinstance(embed, nn.Module):
+        embed = getattr(decoder, "embed_tokens", None)
+    return embed if isinstance(embed, nn.Module) else None
+
+
 def _path_of(model: nn.Module, module: nn.Module) -> str:
     for name, candidate in model.named_modules():
         if candidate is module:
@@ -176,6 +187,23 @@ def _targets_outside(
     return sorted(t for t in targets if not any(_inside(t, p) for p in prefixes))
 
 
+def _check_blocks(
+    config: QuantizationRecipeConfig, blocks: list[tuple[str, nn.Module]]
+) -> None:
+    """Prepare the estimator on every block before the model changes.
+
+    What an estimator refuses on a block (VPTQ's shared codebooks) it
+    refuses in ``prepare``; checked here, it fails before the outside pass
+    or any earlier block has quantized part of the model.
+    """
+    estimator = config.build().param_estimator
+    for name, block in blocks:
+        try:
+            estimator.prepare(block)
+        except ValueError as error:
+            raise ValueError(f"{name}: {error}") from error
+
+
 def _host_tree(value: Any, seen: dict[int, tuple[torch.Tensor, torch.Tensor]]) -> Any:
     """Host copy of a kwargs tree, one copy per distinct tensor in *seen*."""
     if isinstance(value, torch.Tensor):
@@ -199,11 +227,26 @@ _DROPPED_KWARGS = frozenset(
 )
 
 
-@torch.no_grad()
 def _capture(
     model: nn.Module, layers: nn.ModuleList, batches: Iterable[dict[str, Any]]
 ) -> tuple[list[torch.Tensor], list[list[dict[str, Any]]]]:
-    """First-layer hidden states and every layer's kwargs, per batch, on the host."""
+    """First-layer hidden states and every layer's kwargs, per batch, on the host.
+
+    In eval mode, as the blocks run: dropout in the capture would make the
+    inputs random and the block checkpoints never resume.
+    """
+    training = model.training
+    model.eval()
+    try:
+        return _capture_eval(model, layers, batches)
+    finally:
+        model.train(training)
+
+
+@torch.no_grad()
+def _capture_eval(
+    model: nn.Module, layers: nn.ModuleList, batches: Iterable[dict[str, Any]]
+) -> tuple[list[torch.Tensor], list[list[dict[str, Any]]]]:
     hidden: list[torch.Tensor] = []
     kwargs_per_layer: list[list[dict[str, Any]]] = [[] for _ in layers]
     last = len(layers) - 1
@@ -334,7 +377,7 @@ def calibrate_causal_lm_blockwise(
     head_path = _path_of(model, model.lm_head)
     norm_path = _path_of(model, _final_norm(decoder))
 
-    embed = getattr(decoder, "embed_tokens", None)
+    embed = _input_embeddings(model, decoder)
     tied = (
         embed is not None
         and getattr(embed, "weight", None) is not None
@@ -352,6 +395,11 @@ def calibrate_causal_lm_blockwise(
     head_paths = list(head._paths)
     # A tied embedding is part of the head block, not outside the blocks.
     outside = _targets_outside(model, config, [*layer_paths, *head_paths])
+    blocks = [
+        (path, BlockAtPaths(model, [path], entry=path, layout=layout))
+        for path in layer_paths
+    ]
+    _check_blocks(config, [*blocks, ("head", head)])
 
     runner = BlockQuantizationPipeline(
         config,

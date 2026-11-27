@@ -813,3 +813,51 @@ def test_block_calibration_refuses_preprocessing_before_touching_the_model():
         calibrate_causal_lm_blockwise(model, [{"input_ids": ids}], config)
     for key, value in model.state_dict().items():
         assert torch.equal(value, before[key]), key
+
+
+def test_a_pooled_vptq_codebook_is_refused_before_the_model_changes():
+    from neuropress.causal_lm_blocks import calibrate_causal_lm_blockwise
+    from neuropress.recipe_config import QuantizationRecipeConfig
+
+    model = _projected_moe_model()
+    before = {k: v.clone() for k, v in model.state_dict().items()}
+    config = QuantizationRecipeConfig.model_validate(
+        {
+            "estimator": {
+                "type": "vptq",
+                "target": "linear",
+                "vector_len": 8,
+                "num_centroids": 16,
+                "grouping": "all",
+            },
+            "kernel_lowering": None,
+        }
+    )
+    ids = torch.randint(0, 128, (1, 32), generator=torch.Generator().manual_seed(0))
+    with pytest.raises(ValueError, match="grouping='all'"):
+        calibrate_causal_lm_blockwise(model, [{"input_ids": ids}], config)
+    for key, value in model.state_dict().items():
+        assert torch.equal(value, before[key]), key
+
+
+def test_a_tied_embedding_is_found_under_another_name():
+    from neuropress.causal_lm_blocks import _decoder, _input_embeddings
+
+    model = _moe_model()
+    embed = model.model.embed_tokens
+    del model.model.embed_tokens
+    model.model.wte = embed
+    model.get_input_embeddings = lambda: model.model.wte
+    assert _input_embeddings(model, _decoder(model)) is embed
+
+
+def test_capture_runs_in_eval_mode_and_restores_the_mode():
+    model = _hybrid_model().train()
+    modes = []
+    model.model.layers[0].register_forward_pre_hook(
+        lambda m, a: modes.append(m.training)
+    )
+    ids = torch.randint(0, 128, (1, 16), generator=torch.Generator().manual_seed(0))
+    _capture(model, model.model.layers, [{"input_ids": ids}])
+    assert modes == [False]
+    assert model.training and model.model.layers[0].training
