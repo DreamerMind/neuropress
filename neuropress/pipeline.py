@@ -58,6 +58,7 @@ class QuantizationPipeline:
         estimation_device: str | torch.device | None = None,
         collection_model: nn.Module | None = None,
         target_paths: set[str] | None = None,
+        refine_plan: Callable[[QuantizationPlan], None] | None = None,
     ) -> nn.Module:
         """Run the full pipeline and return the quantized model.
 
@@ -84,6 +85,9 @@ class QuantizationPipeline:
             collection_model: Optional inference view used for graph/statistics forwards.
                 It must preserve target module paths and their unadapted weights.
             target_paths: Optional estimator selection and assignment boundary.
+            refine_plan: Called with the plan after estimation and before the
+                adapter applies it; it may change the plan in place (the model
+                is on the estimation device then, with its weights unadapted).
             example_inputs: Optional single batch for graph building.
                 If *None*, the first element of *calibration_data* is used
                 and then replayed at the start of the collection pass. Unused
@@ -197,6 +201,12 @@ class QuantizationPipeline:
                     raise ValueError(
                         f"Stage targets not handled by estimator: {target_paths - assigned}"
                     )
+
+            if refine_plan is not None:
+                # The statistics are spent; free them before the refiner
+                # takes its own memory.
+                del registry
+                refine_plan(plan)
 
             # -- Step 6: Adapt model (weight assignment + manifest + lowering) -------
             LOGGER.info("Step 6: Adapting model structure")
