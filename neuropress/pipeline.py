@@ -203,6 +203,9 @@ class QuantizationPipeline:
                     )
 
             if refine_plan is not None:
+                # The statistics are spent; free them before the refiner
+                # takes its own memory.
+                del registry
                 refine_plan(plan)
 
             # -- Step 6: Adapt model (weight assignment + manifest + lowering) -------

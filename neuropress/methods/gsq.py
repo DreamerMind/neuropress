@@ -128,17 +128,23 @@ class Lion(torch.optim.Optimizer):
         for group in self.param_groups:
             beta1, beta2 = group["betas"]
             lr, decay = group["lr"], group["weight_decay"]
+            # 0-d tensors: a compiled update sees new rates without recompiling;
+            # one copy per device and group, not per parameter
+            rates: dict[torch.device, torch.Tensor] = {}
             for p in group["params"]:
                 if p.grad is None:
                     continue
                 state = self.state[p]
                 if not state:
                     state["exp_avg"] = torch.zeros_like(p)
-                # 0-d tensors: a compiled update sees new rates without recompiling
-                rates = torch.tensor(
-                    [lr, beta1, beta2, decay], device=p.device, dtype=torch.float32
+                if p.device not in rates:
+                    rates[p.device] = torch.tensor(
+                        [lr, beta1, beta2, decay], device=p.device, dtype=torch.float32
+                    )
+                # p.detach() aliases p, so the in-place update reaches it
+                _fused(_lion_update, p)(
+                    p.detach(), p.grad, state["exp_avg"], rates[p.device]
                 )
-                _fused(_lion_update, p)(p, p.grad, state["exp_avg"], rates)
         return loss
 
 
@@ -165,7 +171,11 @@ def _fused(fn, like: torch.Tensor):
     if not like.is_cuda:
         return fn
     if fn not in _COMPILED:
-        _COMPILED[fn] = torch.compile(fn, dynamic=False, fullgraph=True)
+        # Symbolic sizes: one graph per rank and candidate count, not one per
+        # weight shape (with fullgraph, the shape past recompile_limit
+        # raised). Callers pass detached tensors, as parameters are always
+        # compiled with static shapes.
+        _COMPILED[fn] = torch.compile(fn, dynamic=True, fullgraph=True)
     return _COMPILED[fn]
 
 
@@ -247,14 +257,14 @@ class _Relax(torch.autograd.Function):
         ctx.save_for_backward(logits, uniform, init, candidates, scalars)
         ctx.grid = (qmin, qmax, shift)
         return _fused(_relaxed_level, logits)(
-            logits, uniform, init, candidates, scalars, qmin, qmax, shift
+            logits.detach(), uniform, init, candidates, scalars, qmin, qmax, shift
         )
 
     @staticmethod
     def backward(ctx, grad):
         logits, uniform, init, candidates, scalars = ctx.saved_tensors
         grad_logits = _fused(_relaxed_grad, logits)(
-            logits,
+            logits.detach(),
             uniform,
             init,
             candidates,
@@ -303,9 +313,8 @@ class GumbelCodes(nn.Module):
         self.qmin, self.qmax = int(qmin), int(qmax)
         self.group_size = cols // scale.shape[1]
         device = levels.device
-        self.register_buffer(
-            "init", levels.to(torch.int8 if qmax < 128 else torch.int16)
-        )
+        small = -128 <= qmin and qmax < 128
+        self.register_buffer("init", levels.to(torch.int8 if small else torch.int16))
         if mode == "full":
             candidates = torch.arange(
                 qmin, qmax + 1, device=device, dtype=torch.float32
@@ -330,6 +339,21 @@ class GumbelCodes(nn.Module):
         logits = config.init_std * (noise + config.init_strength * prior)
         self.logits = nn.Parameter(logits.to(config.logits_dtype))
         self.scale = nn.Parameter(scale.detach().float().clone())
+        # Lion moves scales by fixed steps, which can cross zero; a scale
+        # keeps its starting sign and at least 1e-3 of its starting size.
+        self.register_buffer("scale_floor", self.scale.detach() * 1e-3)
+
+    @torch.no_grad()
+    def clamp_scale(self) -> None:
+        """Keep each scale on its starting side of zero, away from it."""
+        floor = self.scale_floor
+        self.scale.copy_(
+            torch.where(
+                floor >= 0,
+                torch.maximum(self.scale, floor),
+                torch.minimum(self.scale, floor),
+            )
+        )
 
     def _valid(self, shifts: torch.Tensor, levels: torch.Tensor) -> torch.Tensor:
         target = levels.float()[None] + shifts[:, None, None]
@@ -413,9 +437,11 @@ def evaluate_codes(
     weights: Mapping[str, torch.Tensor], loss: LossFn, n_items: int
 ) -> float:
     """Mean loss over all items with fixed weights."""
-    return sum(float(loss(weights, i)) for i in range(n_items)) / n_items
+    total = sum(loss(weights, i).detach().double() for i in range(n_items))
+    return float(total) / n_items
 
 
+@torch.enable_grad()
 def fit_gumbel_codes(
     codes: Mapping[str, GumbelCodes],
     loss: LossFn,
@@ -469,7 +495,8 @@ def fit_gumbel_codes(
     step = 0
     for epoch in range(config.epochs):
         order = torch.randperm(n_items, generator=order_generator).tolist()
-        epoch_loss = 0.0
+        # summed on the device, read once per epoch
+        epoch_loss: torch.Tensor | float = 0.0
         for start in range(0, n_items, config.batch_size):
             items = order[start : start + config.batch_size]
             tau = _linear(config.temperature, step, total)
@@ -483,14 +510,16 @@ def fit_gumbel_codes(
             for i in items:
                 value = loss(leaves, i) / len(items)
                 value.backward()
-                epoch_loss += float(value.detach()) * len(items)
+                epoch_loss = epoch_loss + value.detach().double() * len(items)
             names = [n for n in soft if leaves[n].grad is not None]
             torch.autograd.backward(
                 [soft[n] for n in names], [leaves[n].grad for n in names]
             )
             optimizer.step()
+            for c in codes.values():
+                c.clamp_scale()
             step += 1
-        history.append(epoch_loss / n_items)
+        history.append(float(epoch_loss) / n_items)
         if log is not None:
             log(
                 f"epoch {epoch + 1}/{config.epochs} loss {history[-1]:.4e} "

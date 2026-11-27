@@ -308,3 +308,70 @@ def test_relaxation_backward_matches_autograd(shift):
     torch.testing.assert_close(level, _relaxed_level(logits, *args))
     (actual,) = torch.autograd.grad((level * grad).sum(), logits)
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_group_paths_missing_from_the_block_are_rejected():
+    refiner = GSQRefiner((GSQGroup(("attn.v", "attn.typo")),), GSQConfig(epochs=1))
+    runner = BlockQuantizationPipeline(_recipe(), stages=STAGES, refiner=refiner)
+    with pytest.raises(ValueError, match="not in the block"):
+        list(runner.run([("b", _Block().eval())], _batches(2)))
+
+
+def test_targets_kept_float_leave_the_rest_of_the_group_fitted():
+    class DropDown(GSQRefiner):
+        def refine(self, block, plan, batches, teacher, *, device, name=""):
+            if "down" in plan.weight_assignments:
+                del plan.weight_assignments["down"]
+                plan.kept_float["down"] = "test"
+            super().refine(block, plan, batches, teacher, device=device, name=name)
+
+    refiner = DropDown(GROUPS, GSQConfig(epochs=1, batch_size=2))
+    runner = BlockQuantizationPipeline(_recipe(), stages=STAGES, refiner=refiner)
+    list(runner.run([("b", _Block().eval())], _batches(2)))
+    assert [r["targets"] for r in refiner.history] == [("attn.v", "attn.o"), ("up",)]
+
+
+def test_groups_of_different_stages_draw_different_seeds():
+    refiner = GSQRefiner(GROUPS, GSQConfig(epochs=1, batch_size=2))
+    runner = BlockQuantizationPipeline(_recipe(), stages=STAGES, refiner=refiner)
+    list(runner.run([("b", _Block().eval())], _batches(2)))
+    assert len({r["seed"] for r in refiner.history}) == 2
+
+
+def test_scales_keep_their_sign():
+    levels, scale = _rtn(torch.randn(4, 64), 3, 32)
+    codes = GumbelCodes(levels, scale, -4, 3, "shift", GSQConfig())
+    with torch.no_grad():
+        codes.scale.mul_(-1.0)
+    codes.clamp_scale()
+    torch.testing.assert_close(codes.scale.detach(), scale * 1e-3)
+
+
+def test_fit_runs_inside_no_grad():
+    torch.manual_seed(1)
+    weight = torch.randn(8, 64)
+    levels, scale = _rtn(weight, 3, 32)
+    codes = {"w": GumbelCodes(levels, scale, -4, 3, "shift", GSQConfig())}
+    x = torch.randn(16, 64)
+
+    def loss(weights, i):
+        return (x @ weights["w"].t() - x @ weight.t()).square().mean()
+
+    with torch.no_grad():
+        history = fit_gumbel_codes(codes, loss, 2, GSQConfig(epochs=2, batch_size=1))
+    assert len(history) == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="compiled kernels need CUDA")
+def test_many_weight_shapes_compile_without_hitting_the_recompile_limit():
+    torch.manual_seed(2)
+    config = GSQConfig(epochs=1, batch_size=1)
+    for rows in range(4, 4 + 12):
+        weight = torch.randn(rows, 64, device="cuda")
+        levels, scale = _rtn(weight, 3, 32)
+        codes = {"w": GumbelCodes(levels, scale, -4, 3, "shift", config)}
+
+        def loss(weights, i, weight=weight):
+            return (weights["w"] - weight).square().mean()
+
+        fit_gumbel_codes(codes, loss, 1, config)

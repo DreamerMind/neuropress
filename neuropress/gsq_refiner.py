@@ -37,7 +37,7 @@ import torch
 from torch import nn
 from torch.func import functional_call
 
-from .calibration.batches import move_batch
+from .calibration.batches import call_batch, move_batch
 from .methods.gsq import (
     GSQConfig,
     GumbelCodes,
@@ -84,6 +84,8 @@ def _primary(output: Any) -> torch.Tensor:
 
 
 def _call(model: nn.Module, params: Mapping[str, torch.Tensor], batch: Any) -> Any:
+    if not params:
+        return call_batch(model, batch)
     if isinstance(batch, dict):
         return functional_call(model, params, (), batch)
     if isinstance(batch, list | tuple):
@@ -178,6 +180,14 @@ class GSQRefiner:
                 raise ValueError("GSQ groups need distinct, nonempty targets")
             seen.update(group.targets)
 
+    def _check_paths(self, block: nn.Module) -> None:
+        """Fail on a group path the block does not have, rather than skip it."""
+        modules = dict(block.named_modules())
+        for group in self.groups:
+            for path in (*group.targets, group.objective):
+                if path not in modules:
+                    raise ValueError(f"GSQ group path {path!r} is not in the block")
+
     def refine(
         self,
         block: nn.Module,
@@ -198,13 +208,26 @@ class GSQRefiner:
             device: Forward device.
             name: Block name, for logs and ``history``.
         """
+        self._check_paths(block)
         planned = set(plan.weight_assignments)
-        groups = [g for g in self.groups if set(g.targets) <= planned]
-        partial = [
-            g for g in self.groups if set(g.targets) & planned and g not in groups
-        ]
-        if partial:
-            raise ValueError(f"a GSQ group spans pipeline stages: {partial[0].targets}")
+        # Targets the estimator kept float stay float; the rest of the group
+        # is still fitted around them.
+        handled = planned | set(plan.kept_float)
+        groups = []
+        for group in self.groups:
+            targets = tuple(t for t in group.targets if t in planned)
+            if not targets:
+                continue
+            if not set(group.targets) <= handled:
+                raise ValueError(f"a GSQ group spans pipeline stages: {group.targets}")
+            if len(targets) < len(group.targets):
+                LOGGER.warning(
+                    "GSQ %s: %s kept float by the estimator, fitting %s only",
+                    name,
+                    sorted(set(group.targets) - planned),
+                    targets,
+                )
+            groups.append((self.groups.index(group), replace(group, targets=targets)))
         if not groups:
             return
         home = next(block.parameters()).device
@@ -213,7 +236,7 @@ class GSQRefiner:
         for p in frozen:
             p.requires_grad_(False)
         try:
-            for index, group in enumerate(groups):
+            for index, group in groups:
                 self._fit(block, plan, batches, teacher, group, device, name, index)
         finally:
             for p, flag in frozen.items():
@@ -229,17 +252,15 @@ class GSQRefiner:
             if path in exclude or not isinstance(qw, QuantizedWeight):
                 continue
             weight = block.get_submodule(path).weight
-            qw = qw.on_scheme_device()
-            dense = qw.scheme.dequantize(
-                qw.codes.to(qw.scheme.scale.device), torch.float32
-            )
+            dense = qw.dequantize()
             fixed[f"{path}.weight"] = dense.reshape(weight.shape).to(
                 device, weight.dtype
             )
         return fixed
 
     def _fit(self, block, plan, batches, teacher, group, device, name, index) -> None:
-        # distinct noise per block and group, reproducible across processes
+        # distinct noise per block and group (index in self.groups, so groups
+        # of different stages differ too), reproducible across processes
         offset = zlib.crc32(name.encode()) % (1 << 30) + index
         config = replace(self.config, seed=self.config.seed + offset)
         generator = torch.Generator(device).manual_seed(config.seed)
@@ -260,14 +281,17 @@ class GSQRefiner:
         }
         fixed = self._fixed_weights(block, plan, set(group.targets), device)
 
+        cache = self.cache_device or device
+        # Inputs wait where the targets wait, so a step moves nothing when
+        # both stay on the forward device.
+        inputs = [move_batch(batch, cache) for batch in batches]
         with torch.no_grad():
             reference = teacher()
-            cache = self.cache_device or device
             targets = [
                 _objective_output(
                     reference, group.objective, {}, move_batch(batch, device)
                 ).to(cache)
-                for batch in batches
+                for batch in inputs
             ]
 
         def loss(weights: Mapping[str, torch.Tensor], i: int) -> torch.Tensor:
@@ -275,7 +299,7 @@ class GSQRefiner:
             for path, w in weights.items():
                 params[f"{path}.weight"] = w.to(dtypes[path])
             out = _objective_output(
-                block, group.objective, params, move_batch(batches[i], device)
+                block, group.objective, params, move_batch(inputs[i], device)
             )
             target = targets[i].to(out.device)
             return (out.float() - target.float()).pow(2).mean()
@@ -292,6 +316,10 @@ class GSQRefiner:
             generator=generator,
             log=lambda line: LOGGER.info("GSQ %s: %s", label, line),
         )
+        # Judge the scales the plan will store, not their float32 masters.
+        for path, c in codes.items():
+            stored = plan.weight_assignments[path].scheme.scale.dtype
+            c.scale.data.copy_(c.scale.data.to(stored))
         final = evaluate_codes(
             {p: c.hard() for p, c in codes.items()}, loss, len(batches)
         )
@@ -311,6 +339,7 @@ class GSQRefiner:
                 "fitted_loss": final,
                 "train_loss": history,
                 "kept": kept,
+                "seed": config.seed,
             }
         )
         if kept:

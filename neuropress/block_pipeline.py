@@ -393,8 +393,10 @@ class BlockQuantizationPipeline:
                     target_paths=set(stage) if stage is not None else None,
                     refine_plan=(
                         partial(
+                            # the view: the raw block may hold packed weights
+                            # from earlier stages that only the view forwards
                             self.refiner.refine,
-                            model,
+                            observed,
                             batches=source,
                             teacher=place_teacher,
                             device=self.forward_device,
