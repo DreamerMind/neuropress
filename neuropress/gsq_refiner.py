@@ -270,6 +270,11 @@ class GSQRefiner:
             qw = plan.weight_assignments[path]
             if not isinstance(qw, QuantizedWeight):
                 raise ValueError(f"{path} is not planned as a scalar QuantizedWeight")
+            if block.get_submodule(path).weight.dim() != 2:
+                raise ValueError(
+                    f"GSQ fits 2-D weights; {path} has "
+                    f"{tuple(block.get_submodule(path).weight.shape)}"
+                )
             levels, scale, qmin, qmax, zp = _scalar_parts(qw.on_scheme_device())
             mode = candidate_mode(qmax - qmin + 1, config)
             codes[path] = GumbelCodes(
@@ -293,6 +298,9 @@ class GSQRefiner:
                 ).to(cache)
                 for batch in inputs
             ]
+        # Only the cached targets need the teacher; the pipeline keeps it on
+        # the host between uses, so it gives the fit its device memory back.
+        reference.cpu()
 
         def loss(weights: Mapping[str, torch.Tensor], i: int) -> torch.Tensor:
             params = dict(fixed)
@@ -323,7 +331,9 @@ class GSQRefiner:
         final = evaluate_codes(
             {p: c.hard() for p, c in codes.items()}, loss, len(batches)
         )
-        kept = final <= start or not self.keep_better
+        # On a tie the GPTQ codes stay: fitted codes that change nothing
+        # measurable are only noise.
+        kept = final < start or not self.keep_better
         LOGGER.info(
             "GSQ %s: start %.4e -> fitted %.4e (%s)",
             label,

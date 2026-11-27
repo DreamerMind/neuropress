@@ -375,3 +375,93 @@ def test_many_weight_shapes_compile_without_hitting_the_recompile_limit():
             return (weights["w"] - weight).square().mean()
 
         fit_gumbel_codes(codes, loss, 1, config)
+
+
+# "up" reaches up but not down: the case that used to pass silently.
+@pytest.mark.parametrize("objective", ["mix", "up"])
+def test_an_objective_upstream_of_its_targets_is_refused(objective):
+    refiner = GSQRefiner(
+        (GSQGroup(("up", "down"), objective=objective),), GSQConfig(epochs=1)
+    )
+    runner = BlockQuantizationPipeline(_recipe(), stages=STAGES, refiner=refiner)
+    with pytest.raises(ValueError, match="does not depend on"):
+        list(runner.run([("b", _Block().eval())], _batches(2)))
+
+
+def test_a_tie_keeps_the_gptq_codes(monkeypatch):
+    import neuropress.gsq_refiner as gsq_refiner
+
+    monkeypatch.setattr(gsq_refiner, "evaluate_codes", lambda *a, **k: 1.0)
+    group = (GSQGroup(("up", "down")),)
+    plans = {}
+
+    class Spy(GSQRefiner):
+        def refine(self, block, plan, batches, teacher, *, device, name=""):
+            before = {
+                p: plan.weight_assignments[p].codes.clone()
+                for p in plan.weight_assignments
+            }
+            super().refine(block, plan, batches, teacher, device=device, name=name)
+            plans.update(
+                {p: (before[p], plan.weight_assignments[p].codes) for p in before}
+            )
+
+    refiner = Spy(group, GSQConfig(epochs=1, batch_size=2))
+    runner = BlockQuantizationPipeline(_recipe(), stages=STAGES, refiner=refiner)
+    list(runner.run([("b", _Block().eval())], _batches(2)))
+    assert refiner.history[0]["kept"] is False
+    for before, after in plans.values():
+        assert torch.equal(before, after)
+
+
+def test_weights_that_are_not_2d_are_refused():
+    class ConvBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.Conv2d(64, 64, 3, padding=1, bias=False)
+
+        def forward(self, hidden_states, gain):
+            x = hidden_states.transpose(1, 2)[..., None]
+            return self.conv(x)[..., 0].transpose(1, 2) * gain
+
+    refiner = GSQRefiner((GSQGroup(("conv",)),), GSQConfig(epochs=1))
+    recipe = _recipe()
+    recipe = recipe.model_copy(
+        update={"estimator": recipe.estimator.model_copy(update={"target": "conv2d"})}
+    )
+    runner = BlockQuantizationPipeline(recipe, stages=(("conv",),), refiner=refiner)
+    with pytest.raises(ValueError, match="2-D weights"):
+        list(runner.run([("b", ConvBlock().eval())], _batches(2)))
+
+
+def test_the_teacher_leaves_the_device_before_the_fit(monkeypatch):
+    import neuropress.gsq_refiner as gsq_refiner
+
+    events = []
+    fit = gsq_refiner.fit_gumbel_codes
+
+    def spy_fit(*args, **kwargs):
+        events.append("fit")
+        return fit(*args, **kwargs)
+
+    monkeypatch.setattr(gsq_refiner, "fit_gumbel_codes", spy_fit)
+
+    class Spy(GSQRefiner):
+        def refine(self, block, plan, batches, teacher, *, device, name=""):
+            def placed():
+                module = teacher()
+                cpu = module.cpu
+
+                def record():
+                    events.append("teacher to host")
+                    return cpu()
+
+                module.cpu = record
+                return module
+
+            super().refine(block, plan, batches, placed, device=device, name=name)
+
+    refiner = Spy((GSQGroup(("up", "down")),), GSQConfig(epochs=1, batch_size=2))
+    runner = BlockQuantizationPipeline(_recipe(), stages=STAGES, refiner=refiner)
+    list(runner.run([("b", _Block().eval())], _batches(2)))
+    assert events[:2] == ["teacher to host", "fit"]

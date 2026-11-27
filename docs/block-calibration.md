@@ -259,6 +259,8 @@ runner = BlockQuantizationPipeline(
 output with the quantized attention in place. A group whose fitted codes do not
 lower its objective on the calibration batches keeps its starting codes
 (`keep_better=True`); `refiner.history` records the loss before and after each
-fit. Each optimizer step draws one relaxed sample and runs `GSQConfig.batch_size`
+fit. A group's objective must be downstream of every one of its targets, and
+the targets must have 2-D weights (linears); either mistake is refused rather
+than fitted. Each optimizer step draws one relaxed sample and runs `GSQConfig.batch_size`
 calibration batches with it. On CUDA the relaxation and the optimizer update are
 compiled into fused kernels, since they read every logit several times per step.

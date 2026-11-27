@@ -493,6 +493,7 @@ def fit_gumbel_codes(
     order_generator = torch.Generator().manual_seed(config.seed)
     history = []
     step = 0
+    reached: set[str] = set()
     for epoch in range(config.epochs):
         order = torch.randperm(n_items, generator=order_generator).tolist()
         # summed on the device, read once per epoch
@@ -509,9 +510,11 @@ def fit_gumbel_codes(
             leaves = {name: w.detach().requires_grad_() for name, w in soft.items()}
             for i in items:
                 value = loss(leaves, i) / len(items)
-                value.backward()
+                if value.requires_grad:  # else no code reaches it; see below
+                    value.backward()
                 epoch_loss = epoch_loss + value.detach().double() * len(items)
             names = [n for n in soft if leaves[n].grad is not None]
+            reached.update(names)
             torch.autograd.backward(
                 [soft[n] for n in names], [leaves[n].grad for n in names]
             )
@@ -519,6 +522,14 @@ def fit_gumbel_codes(
             for c in codes.values():
                 c.clamp_scale()
             step += 1
+        if epoch == 0 and reached != set(codes):
+            # Codes the loss never reaches would only take the argmax of
+            # their noisy initial logits.
+            raise ValueError(
+                "the loss does not depend on "
+                f"{sorted(set(codes) - reached)}: is the objective downstream "
+                "of every target?"
+            )
         history.append(float(epoch_loss) / n_items)
         if log is not None:
             log(
